@@ -30,14 +30,21 @@ const (
 )
 
 type libraryClientConfig struct {
-	checkFilesystem func(*os.File) error
-	now             func() time.Time
-	syncFile        func(*os.File) error
-	syncDirectory   func(string) error
-	beforeHeadCAS   func() error
-	beforeFinalize  func() error
-	beforeFlock     func()
-	afterLock       func()
+	checkFilesystem                 func(*os.File) error
+	now                             func() time.Time
+	syncFile                        func(*os.File) error
+	syncDirectory                   func(string) error
+	beforeHeadCAS                   func() error
+	beforeCheckoutMaterialize       func() error
+	beforeCheckoutTempIdentity      func() error
+	beforeCheckoutFileWrite         func(string, string) error
+	beforeCheckoutFileRename        func(string, string) error
+	beforeCheckoutDirectoryIdentity func() error
+	beforeCheckoutDirectoryRename   func(string, string) error
+	afterCheckoutInstall            func(string, string) error
+	beforeFinalize                  func() error
+	beforeFlock                     func()
+	afterLock                       func()
 }
 
 func normalizeLibraryClientConfig(config libraryClientConfig) libraryClientConfig {
@@ -61,6 +68,7 @@ type bindOptions struct {
 	base                                                *url.URL
 	token                                               []byte
 	worktreeRoot                                        *openedWorktree
+	cacheRoot                                           *os.File
 	importLocal                                         bool
 }
 
@@ -82,6 +90,11 @@ type bindIntent struct {
 	CandidateCommit, CandidateRoot                   string
 	CandidateData                                    []byte
 	ImportLocal                                      bool
+}
+
+type pendingCheckout struct {
+	ServerURL, LibraryID, Worktree, UserID, DeviceID string
+	TargetCommit, TargetRoot, HeadETag               string
 }
 
 type remoteHead struct {
@@ -148,7 +161,7 @@ func parseLibraryBind(ctx context.Context, args []string, stdin io.Reader, stder
 	if err != nil {
 		return bindOptions{}, err
 	}
-	worktreeRoot, err := openWorktree(*worktree, config.checkFilesystem, *importLocal)
+	worktreeRoot, err := openWorktreeRoot(*worktree, config.checkFilesystem)
 	if err != nil {
 		clear(token)
 		return bindOptions{}, err
@@ -162,6 +175,18 @@ func parseLibraryBind(ctx context.Context, args []string, stdin io.Reader, stder
 	if pathWithin(canonicalWorktree, canonicalClientDir) {
 		clear(token)
 		return bindOptions{}, errors.Join(errors.New("client state directory must be outside the worktree"), worktreeRoot.Close())
+	}
+	if !*importLocal {
+		if emptyErr := worktreeRoot.validateEmpty(); emptyErr != nil {
+			pending, pendingErr := pendingCheckoutExists(ctx, canonicalClientDir, canonicalWorktree)
+			if pendingErr != nil || !pending {
+				clear(token)
+				return bindOptions{}, errors.Join(emptyErr, pendingErr, worktreeRoot.Close())
+			}
+		}
+	} else if _, err := scanWorktree(worktreeRoot); err != nil {
+		clear(token)
+		return bindOptions{}, errors.Join(err, worktreeRoot.Close())
 	}
 	base.Scheme = strings.ToLower(base.Scheme)
 	base.Host = strings.ToLower(base.Host)
@@ -195,12 +220,19 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 	if config.afterLock != nil {
 		config.afterLock()
 	}
-	snapshot, err := scanWorktree(options.worktreeRoot)
+	recoveringCheckout, err := pendingCheckoutExists(ctx, options.clientDir, options.worktree)
 	if err != nil {
-		return fmt.Errorf("scan worktree: %w", err)
+		return err
 	}
-	if !options.importLocal && snapshot.root != emptyRoot {
-		return errors.New("local worktree is non-empty; rerun with --import-local to confirm import")
+	snapshot := worktreeSnapshot{root: emptyRoot}
+	if !recoveringCheckout {
+		snapshot, err = scanWorktree(options.worktreeRoot)
+		if err != nil {
+			return fmt.Errorf("scan worktree: %w", err)
+		}
+		if !options.importLocal && snapshot.root != emptyRoot {
+			return errors.New("local worktree is non-empty; rerun with --import-local to confirm import")
+		}
 	}
 	owner, err = getLibraryOwner(ctx, options.base, options.libraryID, options.token)
 	if err != nil {
@@ -222,10 +254,25 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 	if existing != nil {
 		return confirmExistingBinding(ctx, db, options, owner, existing, stdout, config)
 	}
-	if intent == nil {
-		if head.CommitID != nil {
-			return errors.New("remote library is non-empty; remote checkout requires issue #9")
+	pending, err := loadPendingCheckout(ctx, db, options.serverURL, options.libraryID, options.worktree)
+	if err != nil {
+		return err
+	}
+	if pending != nil {
+		return runInitialCheckout(ctx, db, options, owner, pending, stdout, config)
+	}
+	if head.CommitID != nil && intent == nil {
+		if snapshot.root != emptyRoot {
+			return errors.New("local and remote libraries are both non-empty; bind requires an empty worktree or empty remote library")
 		}
+		pending = &pendingCheckout{ServerURL: options.serverURL, LibraryID: options.libraryID, Worktree: options.worktree,
+			UserID: owner, DeviceID: options.deviceID, TargetCommit: *head.CommitID, HeadETag: head.ETag}
+		if err := savePendingCheckout(ctx, db, *pending); err != nil {
+			return err
+		}
+		return runInitialCheckout(ctx, db, options, owner, pending, stdout, config)
+	}
+	if intent == nil {
 		intent, err = newBindIntent(options, owner, head, emptyRoot, config.now)
 		if err != nil {
 			return err
@@ -402,9 +449,6 @@ func canonicalCommit(owner, deviceID, root string, parents []string, now func() 
 func preflightClientState(ctx context.Context, options bindOptions, owner, emptyRoot string, head remoteHead) (retErr error) {
 	databasePath := filepath.Join(options.clientDir, _clientDatabaseName)
 	if _, err := os.Stat(databasePath); errors.Is(err, os.ErrNotExist) {
-		if head.CommitID != nil {
-			return errors.New("remote library is non-empty; remote checkout requires issue #9")
-		}
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("inspect client state: %w", err)
@@ -426,9 +470,6 @@ func preflightClientState(ctx context.Context, options bindOptions, owner, empty
 	}
 	if intent != nil {
 		return verifyBindIntent(*intent, options, owner, emptyRoot)
-	}
-	if head.CommitID != nil {
-		return errors.New("remote library is non-empty; remote checkout requires issue #9")
 	}
 	return nil
 }
@@ -629,6 +670,22 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, db.Close()) }()
+	temps, err := checkoutTempNames(ctx, db, canonicalWorktree)
+	if err != nil {
+		return fmt.Errorf("read registered checkout temporary files: %w", err)
+	}
+	if len(temps) != 0 {
+		root, err := openWorktreeRoot(canonicalWorktree, config.checkFilesystem)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err == nil {
+			cleanupErr := cleanupCheckoutTemps(root, temps)
+			if closeErr := root.Close(); cleanupErr != nil || closeErr != nil {
+				return errors.Join(cleanupErr, closeErr)
+			}
+		}
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin unbind transaction: %w", err)
@@ -649,10 +706,24 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 	if err != nil {
 		return errors.Join(fmt.Errorf("count removed bind intents: %w", err), tx.Rollback())
 	}
+	result, err = tx.ExecContext(ctx, "DELETE FROM pending_checkouts WHERE worktree = ?", canonicalWorktree)
+	if err != nil {
+		return errors.Join(fmt.Errorf("remove pending checkout: %w", err), tx.Rollback())
+	}
+	checkoutsChanged, err := result.RowsAffected()
+	if err != nil {
+		return errors.Join(fmt.Errorf("count removed pending checkouts: %w", err), tx.Rollback())
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM checkout_paths WHERE worktree = ?", canonicalWorktree); err != nil {
+		return errors.Join(fmt.Errorf("remove checkout paths: %w", err), tx.Rollback())
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM path_index WHERE worktree = ?", canonicalWorktree); err != nil {
+		return errors.Join(fmt.Errorf("remove path index: %w", err), tx.Rollback())
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit unbind: %w", err)
 	}
-	if bindingsChanged+intentsChanged > 0 {
+	if bindingsChanged+intentsChanged+checkoutsChanged > 0 {
 		_, err = fmt.Fprintf(stdout, "library unbound: %s\n", canonicalWorktree)
 	} else {
 		_, err = fmt.Fprintf(stdout, "library not bound: %s\n", canonicalWorktree)
@@ -695,7 +766,8 @@ func readWorktreeScope(ctx context.Context, databasePath, worktree string) (serv
 	}
 	defer func() { retErr = errors.Join(retErr, db.Close()) }()
 	err = db.QueryRowContext(ctx, `SELECT server_url, library_id FROM bindings WHERE worktree = ?
-		UNION ALL SELECT server_url, library_id FROM bind_intents WHERE worktree = ? LIMIT 1`, worktree, worktree).Scan(&serverURL, &libraryID)
+		UNION ALL SELECT server_url, library_id FROM bind_intents WHERE worktree = ?
+		UNION ALL SELECT server_url, library_id FROM pending_checkouts WHERE worktree = ? LIMIT 1`, worktree, worktree, worktree).Scan(&serverURL, &libraryID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", nil
 	}
@@ -869,6 +941,44 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 			expected_etag, candidate_commit, candidate_root, candidate_data)
 			SELECT server_url, library_id, worktree, user_id, device_id, expected_etag, candidate_commit, candidate_root, candidate_data FROM old_bind_intents;
 			DROP TABLE old_bind_intents`); err != nil {
+			return fail(err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS pending_checkouts (
+		server_url TEXT NOT NULL, library_id TEXT NOT NULL,
+		worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+		target_commit TEXT NOT NULL, target_root TEXT NOT NULL, head_etag TEXT NOT NULL,
+		UNIQUE(server_url, library_id));
+		CREATE TABLE IF NOT EXISTS checkout_paths (
+		worktree TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, object_id TEXT NOT NULL,
+		canonical_mtime TEXT NOT NULL, actual_mtime TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0,
+		temp_name TEXT NOT NULL DEFAULT '', temp_device INTEGER NOT NULL DEFAULT 0, temp_inode INTEGER NOT NULL DEFAULT 0,
+		target_device INTEGER NOT NULL DEFAULT 0, target_inode INTEGER NOT NULL DEFAULT 0,
+		completed INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(worktree, path));
+		CREATE TABLE IF NOT EXISTS path_index (
+		worktree TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, object_id TEXT NOT NULL,
+		canonical_mtime TEXT NOT NULL, actual_mtime TEXT NOT NULL, size INTEGER NOT NULL,
+		PRIMARY KEY(worktree, path));`); err != nil {
+		return fail(err)
+	}
+	for _, column := range []string{"target_device", "target_inode"} {
+		var present int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('checkout_paths') WHERE name = ?", column).Scan(&present); err != nil {
+			return fail(err)
+		}
+		if present == 0 {
+			if _, err := tx.ExecContext(ctx, "ALTER TABLE checkout_paths ADD COLUMN "+column+" INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return fail(err)
+			}
+		}
+	}
+	var checkoutTokenColumn int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('pending_checkouts') WHERE name = 'access_token'").Scan(&checkoutTokenColumn); err != nil {
+		return fail(err)
+	}
+	if checkoutTokenColumn != 0 {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE pending_checkouts DROP COLUMN access_token"); err != nil {
 			return fail(err)
 		}
 	}
@@ -1283,18 +1393,47 @@ func canonicalExistingPath(path string) (string, error) {
 }
 
 func canonicalUnbindPath(path string) (string, error) {
+	for _, component := range strings.Split(filepath.ToSlash(path), "/") {
+		if component == ".." {
+			return "", errors.New("unbind worktree path must not contain '..'")
+		}
+	}
 	canonical, err := canonicalExistingPath(path)
 	if err == nil {
 		return canonical, nil
-	}
-	if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
-		return "", err
 	}
 	absolute, absoluteErr := filepath.Abs(path)
 	if absoluteErr != nil {
 		return "", fmt.Errorf("make worktree path absolute: %w", absoluteErr)
 	}
-	return filepath.Clean(absolute), nil
+	absolute = filepath.Clean(absolute)
+	ancestor := absolute
+	var suffix []string
+	for {
+		if _, statErr := os.Lstat(ancestor); statErr == nil {
+			break
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return "", fmt.Errorf("inspect unbind worktree ancestor: %w", statErr)
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return "", err
+		}
+		component := filepath.Base(ancestor)
+		if component == "" || component == "." || component == ".." || filepath.IsAbs(component) {
+			return "", errors.New("invalid missing worktree path suffix")
+		}
+		suffix = append([]string{component}, suffix...)
+		ancestor = parent
+	}
+	resolved, resolveErr := filepath.EvalSymlinks(ancestor)
+	if resolveErr != nil {
+		return "", fmt.Errorf("resolve unbind worktree ancestor: %w", resolveErr)
+	}
+	for _, component := range suffix {
+		resolved = filepath.Join(resolved, component)
+	}
+	return filepath.Clean(resolved), nil
 }
 
 func canonicalStateDir(path string) (string, error) {

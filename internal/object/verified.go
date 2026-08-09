@@ -16,9 +16,10 @@ type File struct {
 
 // DirectoryEntry describes one typed child reference.
 type DirectoryEntry struct {
-	ID   string
-	Name string
-	Type string
+	ID         string
+	ModifiedAt string
+	Name       string
+	Type       string
 }
 
 // Directory describes references needed while validating a persisted snapshot.
@@ -65,7 +66,7 @@ func VerifyDirectory(data []byte, id string) (Directory, error) {
 	}
 	result := Directory{Entries: make([]DirectoryEntry, len(value.Entries))}
 	for index, entry := range value.Entries {
-		result.Entries[index] = DirectoryEntry{ID: entry.ID, Name: entry.Name, Type: entry.Type}
+		result.Entries[index] = DirectoryEntry{ID: entry.ID, ModifiedAt: entry.ModifiedAt, Name: entry.Name, Type: entry.Type}
 	}
 	return result, nil
 }

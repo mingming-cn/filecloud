@@ -215,13 +215,12 @@ func TestLibraryBindRejectsUnsupportedOrNonEmptyAndBindingConflicts(t *testing.T
 	}
 
 	freshClient := filepath.Join(t.TempDir(), "fresh-client")
-	err = runTest(t.Context(), bindArgs(freshClient, environment.server.URL, testClientLibraryID, otherWorktree, testOtherDeviceID),
-		strings.NewReader(environment.token+"\n"), io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "issue #9") {
-		t.Fatalf("non-empty remote error = %v", err)
+	if err := runTest(t.Context(), bindArgs(freshClient, environment.server.URL, testClientLibraryID, otherWorktree, testOtherDeviceID),
+		strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatalf("remote checkout bind: %v", err)
 	}
-	if _, err := os.Stat(freshClient); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("remote rejection wrote client state: %v", err)
+	if binding := readTestBinding(t, freshClient, otherWorktree); binding.SyncBase == "" {
+		t.Fatal("remote checkout did not establish Sync Base")
 	}
 }
 
