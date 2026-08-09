@@ -120,7 +120,7 @@ Authorization: Bearer <opaque-token>
 
 `PUT /v1/libraries/{LibraryId}`
 
-LibraryId 由客户端生成 UUID。请求正文最大 8 KiB；Name 为 NFC UTF-8、1-128 字符且最多 512 bytes。请求：
+LibraryId 由客户端生成 UUID，并只在当前认证用户的所有者作用域内唯一；不同用户使用相同 UUID 时创建彼此隔离的资料库。请求正文最大 8 KiB；Name 为 NFC UTF-8、1-128 字符且最多 512 bytes。请求：
 
 ```json
 {
@@ -145,7 +145,7 @@ LibraryId 由客户端生成 UUID。请求正文最大 8 KiB；Name 为 NFC UTF-
 }
 ```
 
-同一所有者下 Name 唯一。错误：`InvalidArgument`、`AlreadyExists`、`ObjectConflict`。
+同一所有者下 Name 唯一。所有服务端查询、对象路径和锁都以 `(OwnerUserId, LibraryId)` 定位资料库，不能通过全局 UUID 冲突泄露其他用户资源。错误：`InvalidArgument`、`AlreadyExists`、`ObjectConflict`。
 
 ## ListLibraries
 

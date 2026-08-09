@@ -2,6 +2,7 @@ package library
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -11,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,6 +93,49 @@ func TestCreateLibraryRejectsInvalidInput(t *testing.T) {
 	assertStatusCode(t, response, 409, 3000)
 }
 
+func TestConcurrentLibraryCreatesPreserveIdempotencyAndUniqueness(t *testing.T) {
+	tests := []struct {
+		name     string
+		requests [2]createRequest
+		want     [2]createResult
+	}{
+		{
+			name: "same id and name",
+			requests: [2]createRequest{
+				{ID: "00000000-0000-4000-8000-000000000001", Name: "same"},
+				{ID: "00000000-0000-4000-8000-000000000001", Name: "same"},
+			},
+			want: [2]createResult{{Status: 200}, {Status: 201}},
+		},
+		{
+			name: "same id and different name",
+			requests: [2]createRequest{
+				{ID: "00000000-0000-4000-8000-000000000001", Name: "first"},
+				{ID: "00000000-0000-4000-8000-000000000001", Name: "second"},
+			},
+			want: [2]createResult{{Status: 201}, {Status: 409, RetCode: 3001}},
+		},
+		{
+			name: "different id and same canonical name",
+			requests: [2]createRequest{
+				{ID: "00000000-0000-4000-8000-000000000001", Name: "A\\u030A"},
+				{ID: "00000000-0000-4000-8000-000000000002", Name: "Å"},
+			},
+			want: [2]createResult{{Status: 201}, {Status: 409, RetCode: 3000}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler, store, _ := newTestHandler(t)
+			defer closeStore(t, store)
+			got := createLibrariesConcurrently(handler, test.requests)
+			if got != test.want {
+				t.Fatalf("concurrent creates = %+v, want %+v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestListLibrariesUsesStableOpaqueExpiringPagination(t *testing.T) {
 	handler, store, now := newTestHandler(t)
 	defer closeStore(t, store)
@@ -115,6 +161,15 @@ func TestListLibrariesUsesStableOpaqueExpiringPagination(t *testing.T) {
 	}
 	if bytes.Contains(decodedToken, []byte(first.Libraries[0].LibraryID)) || bytes.Contains(decodedToken, []byte("owner")) {
 		t.Fatalf("page token exposes plaintext cursor: %q", decodedToken)
+	}
+	foreignToken := serve(handler, http.MethodGet,
+		"/v1/libraries?PageToken="+first.NextPageToken, "", _otherToken)
+	assertStatusCode(t, foreignToken, 400, 1000)
+	invalidToken := serve(handler, http.MethodGet, "/v1/libraries?PageToken=invalid", "", _otherToken)
+	assertStatusCode(t, invalidToken, 400, 1000)
+	if foreignToken.Body.String() != invalidToken.Body.String() {
+		t.Fatalf("foreign and invalid page token responses differ: %q vs %q",
+			foreignToken.Body.String(), invalidToken.Body.String())
 	}
 
 	response = serve(handler, http.MethodGet, "/v1/libraries?PageSize=2&PageToken="+first.NextPageToken, "", _ownerToken)
@@ -192,6 +247,52 @@ func TestLibraryAuthenticationAndOwnerIsolationAreUniform(t *testing.T) {
 			t.Fatalf("WWW-Authenticate = %q", response.Header().Get("WWW-Authenticate"))
 		}
 	}
+}
+
+type createRequest struct {
+	ID   string
+	Name string
+}
+
+type createResult struct {
+	Status  int
+	RetCode int
+}
+
+func createLibrariesConcurrently(handler http.Handler, requests [2]createRequest) [2]createResult {
+	start := make(chan struct{})
+	results := make(chan createResult, len(requests))
+	var wait sync.WaitGroup
+	for _, request := range requests {
+		wait.Go(func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					results <- createResult{Status: 500, RetCode: -1}
+				}
+			}()
+			<-start
+			response := serve(handler, http.MethodPut, "/v1/libraries/"+request.ID,
+				`{"Name":"`+request.Name+`"}`, _ownerToken)
+			var envelope struct{ RetCode int }
+			if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+				results <- createResult{Status: response.Code, RetCode: -1}
+				return
+			}
+			results <- createResult{Status: response.Code, RetCode: envelope.RetCode}
+		})
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	got := make([]createResult, 0, len(requests))
+	for result := range results {
+		got = append(got, result)
+	}
+	slices.SortFunc(got, func(a, b createResult) int {
+		return cmp.Or(cmp.Compare(a.Status, b.Status), cmp.Compare(a.RetCode, b.RetCode))
+	})
+	return [2]createResult(got)
 }
 
 type libraryEnvelope struct {

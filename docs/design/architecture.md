@@ -112,11 +112,12 @@ Entries 必须按 NFC 规范化后 `Name` 的 UTF-8 字节升序，名称只能�
 <data>/
   metadata.db
   objects/
-    <library-id>/
-      blocks/<id[0:2]>/<id[2:]>
-      files/<id[0:2]>/<id[2:]>
-      directories/<id[0:2]>/<id[2:]>
-      commits/<id[0:2]>/<id[2:]>
+    <owner-user-id>/
+      <library-id>/
+        blocks/<id[0:2]>/<id[2:]>
+        files/<id[0:2]>/<id[2:]>
+        directories/<id[0:2]>/<id[2:]>
+        commits/<id[0:2]>/<id[2:]>
   tmp/
 ```
 
@@ -131,8 +132,10 @@ SQLite 只保存以下表；content objects 不进 SQL。
 | `schema_migrations` | `version` | 单调递增 |
 | `users` | `id`, `username`, `password_hash`, `is_admin`, `created_at` | 规范用户名唯一 |
 | `access_tokens` | `id`, `user_id`, `token_hash`, `expires_at`, `revoked_at` | token hash 唯一，级联用户 |
-| `libraries` | `id`, `owner_user_id`, `name`, `head_commit_id`, `head_version`, timestamps | `(owner_user_id,name)` 唯一 |
+| `libraries` | `id`, `owner_user_id`, `name`, `head_commit_id`, `head_version`, timestamps | `(owner_user_id,id)` 主键，`(owner_user_id,name)` 唯一 |
 | `usage_windows` | `user_id`, `window_start`, `accepted_bytes` | 用户上传安全预算 |
+
+LibraryId 只在所有者作用域内唯一；不同用户可以独立使用相同 UUID。数据库查询、对象路径、资料库锁和 GC 标记都必须使用 `(OwnerUserId, LibraryId)`，不能只用 LibraryId 定位资料库。这样创建接口不会通过全局 UUID 冲突泄露其他用户资料库的存在性。滚动上传预算仍按用户统计，不属于资料库复合键命名空间。
 
 逻辑类型固定为：UUID 使用规范小写文本，时间使用 UTC RFC3339 文本，布尔使用 0/1，ObjectId/token hash 使用定长字节或固定小写十六进制且比较必须是 binary，不依赖数据库 locale/collation。用户名和资料库名先由应用生成规范键，再对规范键建唯一约束。Head CAS 的成功条件统一为条件 UPDATE 影响恰好一行。
 

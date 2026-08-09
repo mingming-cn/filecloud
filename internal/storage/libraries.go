@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	// ErrLibraryExists reports an owner name or global ID conflict.
+	// ErrLibraryExists reports a canonical name conflict for one owner.
 	ErrLibraryExists = errors.New("library already exists")
 	// ErrLibraryObjectConflict reports an idempotent create with a different name.
 	ErrLibraryObjectConflict = errors.New("library object conflict")
