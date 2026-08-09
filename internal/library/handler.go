@@ -2,6 +2,7 @@
 package library
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -21,15 +22,21 @@ import (
 	"unicode/utf8"
 
 	"github.com/mingming-cn/filecloud/internal/auth"
+	"github.com/mingming-cn/filecloud/internal/object"
 	"github.com/mingming-cn/filecloud/internal/storage"
 )
 
 const (
-	_maxRequestBody    = 8 << 10
-	_defaultPageSize   = 100
-	_maxPageSize       = 500
-	_pageTokenLifetime = 15 * time.Minute
-	_pageTokenKeySize  = 32
+	_maxRequestBody      = 8 << 10
+	_defaultPageSize     = 100
+	_maxPageSize         = 500
+	_pageTokenLifetime   = 15 * time.Minute
+	_pageTokenKeySize    = 32
+	_maxObjectCheckBody  = 1 << 20
+	_maxObjectCheckCount = 1000
+	_maxCommitBody       = 64 << 10
+	_maxFileBody         = 20 << 20
+	_maxDirectoryBody    = 32 << 20
 )
 
 // Config contains deterministic pagination seams.
@@ -78,6 +85,11 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}", h.create)
 	mux.HandleFunc("GET /v1/libraries/{LibraryId}", h.get)
 	mux.HandleFunc("GET /v1/libraries", h.list)
+	mux.HandleFunc("POST /v1/libraries/{LibraryId}/object-checks", h.checkObjects)
+	mux.HandleFunc("PUT /v1/libraries/{LibraryId}/objects/{ObjectType}/{ObjectId}", h.putMetadataObject)
+	mux.HandleFunc("GET /v1/libraries/{LibraryId}/objects/{ObjectType}/{ObjectId}", h.getMetadataObject)
+	mux.HandleFunc("PUT /v1/libraries/{LibraryId}/blocks/{ObjectId}", h.putBlock)
+	mux.HandleFunc("GET /v1/libraries/{LibraryId}/blocks/{ObjectId}", h.getBlock)
 	return auth.RequireSession(store, config.Now, logger, mux), nil
 }
 
@@ -207,6 +219,358 @@ func (h *handler) list(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, listResponse{
 		RetCode: 0, Message: "success", Libraries: responses, NextPageToken: nextPageToken,
 	})
+}
+
+type objectReference struct {
+	ObjectID   string `json:"ObjectId"`
+	ObjectType string `json:"ObjectType"`
+}
+
+func (h *handler) checkObjects(w http.ResponseWriter, r *http.Request) {
+	owner, libraryID, ok := h.objectLibrary(w, r)
+	if !ok {
+		return
+	}
+	data, ok := h.readJSONBody(w, r, _maxObjectCheckBody)
+	if !ok {
+		return
+	}
+	references, err := decodeObjectChecks(data)
+	if errors.Is(err, object.ErrPayloadTooLarge) {
+		h.writeError(w, http.StatusRequestEntityTooLarge, 3005, "too many objects")
+		return
+	}
+	if err != nil {
+		h.invalid(w)
+		return
+	}
+	missing := make([]objectReference, 0)
+	for _, reference := range references {
+		kind, valid := objectKind(reference.ObjectType)
+		if !valid || !object.ValidID(reference.ObjectID) {
+			h.invalid(w)
+			return
+		}
+		exists, err := h.store.HasObject(r.Context(), owner, libraryID, kind, reference.ObjectID)
+		if err != nil {
+			h.internal(w, "check object", err)
+			return
+		}
+		if !exists {
+			missing = append(missing, reference)
+		}
+	}
+	h.writeJSON(w, http.StatusOK, struct {
+		RetCode        int
+		Message        string
+		MissingObjects []objectReference
+	}{RetCode: 0, Message: "success", MissingObjects: missing})
+}
+
+func decodeObjectChecks(data []byte) ([]objectReference, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return nil, errors.New("object checks must be an object")
+	}
+	var references []objectReference
+	seenObjects := false
+	for decoder.More() {
+		field, err := decoder.Token()
+		if err != nil || field != "Objects" || seenObjects {
+			return nil, errors.New("invalid object checks field")
+		}
+		seenObjects = true
+		if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
+			return nil, errors.New("objects must be an array")
+		}
+		references = make([]objectReference, 0)
+		for decoder.More() {
+			if len(references) == _maxObjectCheckCount {
+				return nil, object.ErrPayloadTooLarge
+			}
+			reference, err := decodeObjectReference(decoder)
+			if err != nil {
+				return nil, err
+			}
+			references = append(references, reference)
+		}
+		if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
+			return nil, errors.New("invalid objects array")
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') || !seenObjects {
+		return nil, errors.New("invalid object checks")
+	}
+	if token, err := decoder.Token(); !errors.Is(err, io.EOF) || token != nil {
+		return nil, errors.New("trailing object checks data")
+	}
+	return references, nil
+}
+
+func decodeObjectReference(decoder *json.Decoder) (objectReference, error) {
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return objectReference{}, errors.New("object reference must be an object")
+	}
+	var reference objectReference
+	seenID := false
+	seenType := false
+	for decoder.More() {
+		field, err := decoder.Token()
+		if err != nil {
+			return objectReference{}, fmt.Errorf("decode object reference field: %w", err)
+		}
+		switch field {
+		case "ObjectId":
+			if seenID {
+				return objectReference{}, errors.New("duplicate object id")
+			}
+			seenID = true
+			if err := decoder.Decode(&reference.ObjectID); err != nil {
+				return objectReference{}, fmt.Errorf("decode object id: %w", err)
+			}
+		case "ObjectType":
+			if seenType {
+				return objectReference{}, errors.New("duplicate object type")
+			}
+			seenType = true
+			if err := decoder.Decode(&reference.ObjectType); err != nil {
+				return objectReference{}, fmt.Errorf("decode object type: %w", err)
+			}
+		default:
+			return objectReference{}, errors.New("unknown object reference field")
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') || !seenID || !seenType {
+		return objectReference{}, errors.New("invalid object reference")
+	}
+	return reference, nil
+}
+
+func (h *handler) putMetadataObject(w http.ResponseWriter, r *http.Request) {
+	owner, libraryID, ok := h.objectLibrary(w, r)
+	if !ok {
+		return
+	}
+	kind := r.PathValue("ObjectType")
+	objectID := r.PathValue("ObjectId")
+	maximum, typeName, valid := metadataType(kind)
+	if !valid || !object.ValidID(objectID) {
+		h.invalid(w)
+		return
+	}
+	data, ok := h.readJSONBody(w, r, maximum)
+	if !ok {
+		return
+	}
+	canonical, actualID, err := object.Canonicalize(kind, data)
+	if errors.Is(err, object.ErrPayloadTooLarge) {
+		h.writeError(w, http.StatusRequestEntityTooLarge, 3005, "object too large")
+		return
+	}
+	if err != nil {
+		h.invalid(w)
+		return
+	}
+	if actualID != objectID {
+		h.writeError(w, http.StatusUnprocessableEntity, 3004, "object hash mismatch")
+		return
+	}
+	created, err := h.store.PutObject(r.Context(), owner, libraryID, kind, objectID, bytes.NewReader(canonical))
+	if !h.handlePutError(w, err) {
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	h.writeJSON(w, status, struct {
+		RetCode int
+		Message string
+		Object  struct {
+			ObjectID   string `json:"ObjectId"`
+			ObjectType string `json:"ObjectType"`
+			Created    bool
+		}
+	}{RetCode: 0, Message: "success", Object: struct {
+		ObjectID   string `json:"ObjectId"`
+		ObjectType string `json:"ObjectType"`
+		Created    bool
+	}{ObjectID: objectID, ObjectType: typeName, Created: created}})
+}
+
+func (h *handler) getMetadataObject(w http.ResponseWriter, r *http.Request) {
+	owner, libraryID, ok := h.objectLibrary(w, r)
+	if !ok {
+		return
+	}
+	kind := r.PathValue("ObjectType")
+	objectID := r.PathValue("ObjectId")
+	if _, _, valid := metadataType(kind); !valid || !object.ValidID(objectID) {
+		h.invalid(w)
+		return
+	}
+	h.getObject(w, r, owner, libraryID, kind, objectID, "application/json")
+}
+
+func (h *handler) putBlock(w http.ResponseWriter, r *http.Request) {
+	owner, libraryID, ok := h.objectLibrary(w, r)
+	if !ok {
+		return
+	}
+	objectID := r.PathValue("ObjectId")
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if !object.ValidID(objectID) || err != nil || contentType != "application/octet-stream" || r.ContentLength <= 0 {
+		h.invalid(w)
+		return
+	}
+	if r.ContentLength > object.MaxBlockSize {
+		h.writeError(w, http.StatusRequestEntityTooLarge, 3005, "block too large")
+		return
+	}
+	created, err := h.store.PutObjectSized(r.Context(), owner, libraryID, "blocks", objectID, r.Body, r.ContentLength)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		h.invalid(w)
+		return
+	}
+	if !h.handlePutError(w, err) {
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	h.writeJSON(w, status, struct {
+		RetCode int
+		Message string
+		Block   struct {
+			ObjectID string `json:"ObjectId"`
+			Size     string
+			Created  bool
+		}
+	}{RetCode: 0, Message: "success", Block: struct {
+		ObjectID string `json:"ObjectId"`
+		Size     string
+		Created  bool
+	}{ObjectID: objectID, Size: strconv.FormatInt(r.ContentLength, 10), Created: created}})
+}
+
+func (h *handler) getBlock(w http.ResponseWriter, r *http.Request) {
+	owner, libraryID, ok := h.objectLibrary(w, r)
+	if !ok {
+		return
+	}
+	objectID := r.PathValue("ObjectId")
+	if !object.ValidID(objectID) {
+		h.invalid(w)
+		return
+	}
+	h.getObject(w, r, owner, libraryID, "blocks", objectID, "application/octet-stream")
+}
+
+func (h *handler) objectLibrary(w http.ResponseWriter, r *http.Request) (string, string, bool) {
+	libraryID := r.PathValue("LibraryId")
+	owner, authenticated := auth.UserID(r.Context())
+	if !validUUID(libraryID) || !authenticated {
+		h.invalid(w)
+		return "", "", false
+	}
+	if _, err := h.store.GetLibrary(r.Context(), owner, libraryID); errors.Is(err, storage.ErrLibraryNotFound) {
+		h.writeError(w, http.StatusNotFound, 2000, "library not found")
+		return "", "", false
+	} else if err != nil {
+		h.internal(w, "get object library", err)
+		return "", "", false
+	}
+	return owner, libraryID, true
+}
+
+func (h *handler) readJSONBody(w http.ResponseWriter, r *http.Request, maximum int64) ([]byte, bool) {
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		h.invalid(w)
+		return nil, false
+	}
+	if r.ContentLength > maximum {
+		h.writeError(w, http.StatusRequestEntityTooLarge, 3005, "request body too large")
+		return nil, false
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, maximum+1))
+	if err != nil {
+		h.internal(w, "read object request", err)
+		return nil, false
+	}
+	if int64(len(data)) > maximum {
+		h.writeError(w, http.StatusRequestEntityTooLarge, 3005, "request body too large")
+		return nil, false
+	}
+	return data, true
+}
+
+func (h *handler) getObject(w http.ResponseWriter, r *http.Request, owner, libraryID, kind, objectID, contentType string) {
+	file, size, err := h.store.GetObject(r.Context(), owner, libraryID, kind, objectID)
+	if errors.Is(err, storage.ErrObjectNotFound) {
+		h.writeError(w, http.StatusNotFound, 2000, "object not found")
+		return
+	}
+	if err != nil {
+		h.internal(w, "get object", err)
+		return
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			h.logger.Printf("close object: %v", err)
+		}
+	}()
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	w.Header().Set("ETag", `"`+objectID+`"`)
+	w.Header().Set("Cache-Control", "private, immutable")
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, file); err != nil {
+		h.logger.Printf("write object response: %v", err)
+	}
+}
+
+func (h *handler) handlePutError(w http.ResponseWriter, err error) bool {
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, storage.ErrObjectHashMismatch):
+		h.writeError(w, http.StatusUnprocessableEntity, 3004, "object hash mismatch")
+	case errors.Is(err, storage.ErrObjectConflict):
+		h.writeError(w, http.StatusConflict, 3001, "object conflicts with existing id")
+	default:
+		h.internal(w, "put object", err)
+	}
+	return false
+}
+
+func metadataType(kind string) (int64, string, bool) {
+	switch kind {
+	case "files":
+		return _maxFileBody, "File", true
+	case "directories":
+		return _maxDirectoryBody, "Directory", true
+	case "commits":
+		return _maxCommitBody, "Commit", true
+	default:
+		return 0, "", false
+	}
+}
+
+func objectKind(typeName string) (string, bool) {
+	switch typeName {
+	case "Block":
+		return "blocks", true
+	case "File":
+		return "files", true
+	case "Directory":
+		return "directories", true
+	case "Commit":
+		return "commits", true
+	default:
+		return "", false
+	}
 }
 
 type libraryResponse struct {

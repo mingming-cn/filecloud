@@ -16,6 +16,29 @@ func TestMetadataMigrationsReturnsFreshData(t *testing.T) {
 	}
 }
 
+func TestEnsureLayoutSyncsDataDirectoryAfterCreatingObjectRoot(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dataDir, 0o700); err != nil {
+		t.Fatalf("Mkdir data: %v", err)
+	}
+	var synced []string
+	syncDir := func(path string) error {
+		if _, err := os.Stat(filepath.Join(dataDir, _objectsName)); err != nil {
+			t.Fatalf("objects directory did not exist before sync: %v", err)
+		}
+		synced = append(synced, path)
+		return nil
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := ensureLayout(dataDir, syncDir); err != nil {
+			t.Fatalf("ensureLayout attempt %d: %v", attempt, err)
+		}
+	}
+	if len(synced) != 2 || synced[0] != dataDir || synced[1] != dataDir {
+		t.Fatalf("synced paths = %v, want data directory twice", synced)
+	}
+}
+
 func TestInitCreatesLayoutAndSchemaIdempotently(t *testing.T) {
 	ctx := t.Context()
 	dataDir := filepath.Join(t.TempDir(), "data")

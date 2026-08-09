@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -66,9 +67,13 @@ func metadataMigrations() []migration {
 
 // Store is an open metadata database protected by the data-directory lock.
 type Store struct {
-	db         *sql.DB
-	objectsDir string
-	lock       *dataLock
+	db                  *sql.DB
+	objectsDir          string
+	lock                *dataLock
+	objectLocksMu       sync.Mutex
+	objectLocks         map[string]*objectPublication
+	objectLockQueued    func(string)
+	syncObjectDirectory func(string) error
 }
 
 // Init creates a usable data directory and applies all metadata migrations.
@@ -94,7 +99,7 @@ func Init(ctx context.Context, dataDir string) (retErr error) {
 		return fmt.Errorf("secure data-directory lock: %w", err)
 	}
 
-	if err := ensureLayout(dataDir); err != nil {
+	if err := ensureLayout(dataDir, syncDirectory); err != nil {
 		return err
 	}
 	databasePath := filepath.Join(dataDir, _databaseName)
@@ -144,7 +149,7 @@ func openForServe(ctx context.Context, dataDir string, migrations []migration) (
 		return nil, errors.Join(err, lock.Close())
 	}
 
-	if err := ensureLayout(dataDir); err != nil {
+	if err := ensureLayout(dataDir, syncDirectory); err != nil {
 		return nil, errors.Join(err, lock.Close())
 	}
 	db, err := openDB(filepath.Join(dataDir, _databaseName))
@@ -159,9 +164,11 @@ func openForServe(ctx context.Context, dataDir string, migrations []migration) (
 	}
 
 	return &Store{
-		db:         db,
-		objectsDir: filepath.Join(dataDir, _objectsName),
-		lock:       lock,
+		db:                  db,
+		objectsDir:          filepath.Join(dataDir, _objectsName),
+		lock:                lock,
+		objectLocks:         make(map[string]*objectPublication),
+		syncObjectDirectory: syncDirectory,
 	}, nil
 }
 
@@ -180,7 +187,7 @@ func (s *Store) Close() error {
 	return errors.Join(s.db.Close(), s.lock.Close())
 }
 
-func ensureLayout(dataDir string) error {
+func ensureLayout(dataDir string, syncDir func(string) error) error {
 	for _, name := range []string{_objectsName, _tmpName} {
 		path := filepath.Join(dataDir, name)
 		if err := os.MkdirAll(path, 0o700); err != nil {
@@ -189,6 +196,9 @@ func ensureLayout(dataDir string) error {
 		if err := os.Chmod(path, 0o700); err != nil {
 			return fmt.Errorf("secure %s directory: %w", name, err)
 		}
+	}
+	if err := syncDir(dataDir); err != nil {
+		return fmt.Errorf("sync data directory layout: %w", err)
 	}
 	return nil
 }

@@ -233,7 +233,7 @@ HTTP 同时返回 `ETag`。客户端可发送 `If-None-Match`；未变化返回 
 
 ## 资源预算
 
-- Commit JSON 最大 64 KiB；File JSON 最大 20 MiB；Directory JSON 最大 32 MiB。
+- Commit JSON 最大 64 KiB；File JSON 最大 20 MiB；Directory JSON 最大 32 MiB；元数据 JSON 最多嵌套 256 层（顶层容器计为第一层）。
 - 一个 File 最多 262144 个 blocks，最大逻辑大小 1 TiB。
 - 一个 Directory 最多 100000 个 entries；快照树深最多 256。
 - 一次 Head 验证的共享总预算为 2000000 个去重对象，包含当前 Root 和第二 parent 首次引入的全部对象；首次引入的 Commit 最多 1024 个，parent 遍历深度最多 1024。
