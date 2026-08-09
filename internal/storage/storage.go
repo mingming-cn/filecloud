@@ -46,6 +46,21 @@ func metadataMigrations() []migration {
 			)`,
 			`CREATE INDEX access_tokens_user_id ON access_tokens(user_id)`,
 		}},
+		{version: 3, statements: []string{
+			`CREATE TABLE libraries (
+				id TEXT NOT NULL,
+				owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+				name TEXT NOT NULL,
+				name_key TEXT NOT NULL,
+				head_commit_id TEXT,
+				head_version INTEGER NOT NULL DEFAULT 0 CHECK(head_version >= 0),
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY(owner_user_id, id),
+				UNIQUE(owner_user_id, name_key)
+			)`,
+			`CREATE INDEX libraries_owner_page ON libraries(owner_user_id, created_at, id)`,
+		}},
 	}
 }
 

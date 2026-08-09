@@ -76,16 +76,16 @@ func TestInitCreatesLayoutAndSchemaIdempotently(t *testing.T) {
 	if err := rows.Close(); err != nil {
 		t.Fatalf("close table rows: %v", err)
 	}
-	if got := strings.Join(tables, ","); got != "access_tokens,schema_migrations,users" {
-		t.Fatalf("tables = %q, want account schema", got)
+	if got := strings.Join(tables, ","); got != "access_tokens,libraries,schema_migrations,users" {
+		t.Fatalf("tables = %q, want library schema", got)
 	}
 
 	var count, version int
 	if err := db.QueryRow("SELECT COUNT(*), MAX(version) FROM schema_migrations").Scan(&count, &version); err != nil {
 		t.Fatalf("query schema version: %v", err)
 	}
-	if count != 2 || version != 2 {
-		t.Fatalf("migration rows = %d, version = %d; want 2, 2", count, version)
+	if count != 3 || version != 3 {
+		t.Fatalf("migration rows = %d, version = %d; want 3, 3", count, version)
 	}
 }
 
@@ -200,7 +200,7 @@ func TestMigrateRejectsNewerSchemaWithoutMutation(t *testing.T) {
 		t.Fatalf("create newer schema: %v", err)
 	}
 	if _, err := db.ExecContext(ctx,
-		"INSERT INTO schema_migrations(version, applied_at) VALUES (3, 'test')"); err != nil {
+		"INSERT INTO schema_migrations(version, applied_at) VALUES (4, 'test')"); err != nil {
 		t.Fatalf("record newer schema: %v", err)
 	}
 	before := schemaSnapshot(t, db)
@@ -215,8 +215,8 @@ func TestMigrateRejectsNewerSchemaWithoutMutation(t *testing.T) {
 		"SELECT COUNT(*), MAX(version) FROM schema_migrations").Scan(&count, &version); err != nil {
 		t.Fatalf("query schema version: %v", err)
 	}
-	if count != 3 || version != 3 {
-		t.Fatalf("migration rows = %d, version = %d; want 3, 3", count, version)
+	if count != 4 || version != 4 {
+		t.Fatalf("migration rows = %d, version = %d; want 4, 4", count, version)
 	}
 	if after := schemaSnapshot(t, db); after != before {
 		t.Fatalf("schema changed after rejection:\nbefore: %s\nafter:  %s", before, after)
@@ -269,7 +269,7 @@ func TestOpenForServeAppliesPendingMigration(t *testing.T) {
 	}
 
 	migrations := append(metadataMigrations(), migration{
-		version:    3,
+		version:    4,
 		statements: []string{"CREATE TABLE migrated_on_serve (id INTEGER PRIMARY KEY)"},
 	})
 	store, err := openForServe(ctx, dataDir, migrations)
@@ -289,8 +289,8 @@ func TestOpenForServeAppliesPendingMigration(t *testing.T) {
 	if err := store.DB().QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
 		t.Fatalf("query schema version: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("schema version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("schema version = %d, want 4", version)
 	}
 }
 

@@ -2,6 +2,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -328,6 +329,62 @@ type handler struct {
 	logger    *log.Logger
 	config    HandlerConfig
 	dummyHash string
+}
+
+type userIDContextKey struct{}
+
+// RequireSession authenticates bearer tokens before invoking next.
+func RequireSession(store *storage.Store, now func() time.Time, logger *log.Logger, next http.Handler) http.Handler {
+	if now == nil {
+		now = time.Now
+	}
+	if logger == nil {
+		logger = log.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !ok || scheme != "Bearer" || !validAccessToken(token) {
+			writeAuthenticationError(w, logger)
+			return
+		}
+		userID, err := store.FindActiveSession(r.Context(), sha256.Sum256([]byte(token)), now().UTC())
+		if errors.Is(err, storage.ErrSessionNotFound) {
+			writeAuthenticationError(w, logger)
+			return
+		}
+		if err != nil {
+			logger.Printf("authenticate session: %v", err)
+			writeAuthenticationJSON(w, http.StatusInternalServerError, 5000, "internal error", logger)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userIDContextKey{}, userID)))
+	})
+}
+
+// UserID returns the authenticated user ID installed by RequireSession.
+func UserID(ctx context.Context) (string, bool) {
+	userID, ok := ctx.Value(userIDContextKey{}).(string)
+	return userID, ok && userID != ""
+}
+
+func writeAuthenticationError(w http.ResponseWriter, logger *log.Logger) {
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	writeAuthenticationJSON(w, http.StatusUnauthorized, 1001, "authentication failed", logger)
+}
+
+func writeAuthenticationJSON(w http.ResponseWriter, status, code int, message string, logger *log.Logger) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(struct {
+		RetCode int
+		Message string
+	}{RetCode: code, Message: message}); err != nil {
+		logger.Printf("write JSON response: %v", err)
+	}
 }
 
 type createSessionRequest struct {

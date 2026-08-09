@@ -21,6 +21,7 @@ import (
 
 	"github.com/mingming-cn/filecloud/internal/auth"
 	"github.com/mingming-cn/filecloud/internal/health"
+	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/storage"
 )
 
@@ -30,6 +31,7 @@ const (
 	_defaultSourceIPKDFCapacity = 1
 	_defaultUsernameKDFCapacity = 1
 	_shutdownPeriod             = 5 * time.Second
+	_requestReadPeriod          = 30 * time.Second
 )
 
 func main() {
@@ -320,10 +322,21 @@ func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Write
 	if err != nil {
 		return errors.Join(err, listener.Close())
 	}
+	libraries, err := libraryapi.NewHandler(store, logger, libraryapi.Config{})
+	if err != nil {
+		return errors.Join(err, listener.Close())
+	}
 	mux := http.NewServeMux()
-	mux.Handle("/v1/", sessions)
+	mux.Handle("/v1/sessions", sessions)
+	mux.Handle("/v1/sessions/current", sessions)
+	mux.Handle("/v1/libraries", libraries)
+	mux.Handle("/v1/libraries/", libraries)
 	mux.Handle("/", health.NewHandler(store.DB(), store.ObjectsDir(), logger))
-	server := &http.Server{Handler: mux, ErrorLog: logger, ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{
+		Handler: mux, ErrorLog: logger,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       _requestReadPeriod,
+	}
 	if _, err := fmt.Fprintf(stdout, "listening on %s\n", listener.Addr()); err != nil {
 		return errors.Join(fmt.Errorf("write listen address: %w", err), listener.Close())
 	}

@@ -19,6 +19,8 @@ var (
 	ErrUsernameExists = errors.New("username already exists")
 	// ErrUserNotFound reports that no canonical username matches.
 	ErrUserNotFound = errors.New("user not found")
+	// ErrSessionNotFound reports that a token does not identify an active session.
+	ErrSessionNotFound = errors.New("session not found")
 )
 
 // User is the authentication data for one canonical username.
@@ -115,6 +117,22 @@ func (s *Store) CreateSession(ctx context.Context, userID string, tokenHash [sha
 		return fmt.Errorf("create session: %w", err)
 	}
 	return nil
+}
+
+// FindActiveSession returns the user owning an active, unexpired token hash.
+func (s *Store) FindActiveSession(ctx context.Context, tokenHash [sha256.Size]byte, now time.Time) (string, error) {
+	var userID string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT user_id FROM access_tokens
+		WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?`,
+		tokenHash[:], formatTime(now)).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrSessionNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("find active session: %w", err)
+	}
+	return userID, nil
 }
 
 // RevokeSession revokes an active, unexpired token. It returns false uniformly otherwise.
