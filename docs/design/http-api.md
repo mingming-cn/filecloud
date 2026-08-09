@@ -136,6 +136,7 @@ LibraryId 由客户端生成 UUID，并只在当前认证用户的所有者作�
   "Message": "success",
   "Library": {
     "LibraryId": "<UUID>",
+    "OwnerUserId": "<UUID>",
     "Name": "Documents",
     "HeadCommitId": null,
     "ETag": "\"head-version-0\"",
@@ -145,7 +146,7 @@ LibraryId 由客户端生成 UUID，并只在当前认证用户的所有者作�
 }
 ```
 
-同一所有者下 Name 唯一。所有服务端查询、对象路径和锁都以 `(OwnerUserId, LibraryId)` 定位资料库，不能通过全局 UUID 冲突泄露其他用户资源。错误：`InvalidArgument`、`AlreadyExists`、`ObjectConflict`。
+`OwnerUserId` 是 library bind 客户端所需的响应字段，服务端必须返回；旧客户端可以忽略该字段。新客户端用它把访问 token 与提交作者绑定，不接受用户手填身份；缺失或无效时客户端将服务端视为不兼容且不得上传对象或发布 Head。同一所有者下 Name 唯一。所有服务端查询、对象路径和锁都以 `(OwnerUserId, LibraryId)` 定位资料库，不能通过全局 UUID 冲突泄露其他用户资源。错误：`InvalidArgument`、`AlreadyExists`、`ObjectConflict`。
 
 ## ListLibraries
 

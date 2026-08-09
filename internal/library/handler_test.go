@@ -39,7 +39,7 @@ func TestCreateReplayAndReadLibrary(t *testing.T) {
 	assertStatusCode(t, response, http.StatusCreated, 0)
 	var created libraryEnvelope
 	decode(t, response, &created)
-	if created.Library.LibraryID != id || created.Library.Name != "Ångstrom" || created.Library.HeadCommitID != nil ||
+	if created.Library.LibraryID != id || created.Library.OwnerUserID != _ownerID || created.Library.Name != "Ångstrom" || created.Library.HeadCommitID != nil ||
 		created.Library.ETag != `"head-version-0"` || created.Library.CreatedAt != now.Truncate(time.Second).Format(time.RFC3339) ||
 		response.Header().Get("ETag") != `"head-version-0"` {
 		t.Fatalf("created library = %+v, headers = %v", created.Library, response.Header())

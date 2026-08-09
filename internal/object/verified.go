@@ -29,6 +29,9 @@ type Directory struct {
 // Commit describes publication fields from a persisted commit.
 type Commit struct {
 	AuthorUserID string
+	CreatedAt    string
+	DeviceID     string
+	Message      string
 	Parents      []string
 	Root         string
 }
@@ -77,5 +80,12 @@ func VerifyCommit(data []byte, id string) (Commit, error) {
 	if err != nil {
 		return Commit{}, ErrInvalidPersistedObject
 	}
-	return Commit{AuthorUserID: value.AuthorUserID, Parents: value.Parents, Root: value.Root}, nil
+	return Commit{
+		AuthorUserID: value.AuthorUserID,
+		CreatedAt:    value.CreatedAt,
+		DeviceID:     value.DeviceID,
+		Message:      *value.Message,
+		Parents:      value.Parents,
+		Root:         value.Root,
+	}, nil
 }

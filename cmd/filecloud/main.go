@@ -52,7 +52,7 @@ func mainCode() int {
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: filecloud <init|serve|user|login|logout> [options]")
+		return errors.New("usage: filecloud <init|serve|user|login|logout|library> [options]")
 	}
 	switch args[0] {
 	case "init":
@@ -94,6 +94,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runLogin(ctx, args[1:], stdin, stdout, stderr)
 	case "logout":
 		return runLogout(ctx, args[1:], stdin, stderr)
+	case "library":
+		return runLibrary(ctx, args[1:], stdin, stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}

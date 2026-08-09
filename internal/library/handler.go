@@ -584,6 +584,7 @@ func objectKind(typeName string) (string, bool) {
 
 type libraryResponse struct {
 	LibraryID    string `json:"LibraryId"`
+	OwnerUserID  string `json:"OwnerUserId,omitempty"`
 	Name         string
 	HeadCommitID *string `json:"HeadCommitId"`
 	ETag         string
@@ -600,7 +601,7 @@ type listResponse struct {
 
 func responseFromLibrary(library storage.Library) libraryResponse {
 	return libraryResponse{
-		LibraryID: library.ID, Name: library.Name, HeadCommitID: library.HeadCommitID,
+		LibraryID: library.ID, OwnerUserID: library.OwnerUserID, Name: library.Name, HeadCommitID: library.HeadCommitID,
 		ETag: headETag(library.HeadVersion), CreatedAt: library.CreatedAt.Format(time.RFC3339),
 		UpdatedAt: library.UpdatedAt.Format(time.RFC3339),
 	}
