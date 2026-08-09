@@ -23,7 +23,30 @@ const (
 )
 
 func metadataMigrations() []migration {
-	return []migration{{version: 1}}
+	return []migration{
+		{version: 1},
+		{version: 2, statements: []string{
+			`CREATE TABLE users (
+				id TEXT PRIMARY KEY NOT NULL,
+				username TEXT NOT NULL,
+				username_key TEXT NOT NULL UNIQUE,
+				password_hash TEXT NOT NULL,
+				is_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_admin IN (0, 1)),
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			)`,
+			`CREATE TABLE access_tokens (
+				id INTEGER PRIMARY KEY NOT NULL,
+				user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+				token_hash BLOB NOT NULL UNIQUE CHECK(length(token_hash) = 32),
+				device_name TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				revoked_at TEXT
+			)`,
+			`CREATE INDEX access_tokens_user_id ON access_tokens(user_id)`,
+		}},
+	}
 }
 
 // Store is an open metadata database protected by the data-directory lock.
@@ -81,6 +104,11 @@ func Init(ctx context.Context, dataDir string) (retErr error) {
 
 // OpenForServe migrates an initialized data directory and retains its lock.
 func OpenForServe(ctx context.Context, dataDir string) (*Store, error) {
+	return openForServe(ctx, dataDir, metadataMigrations())
+}
+
+// OpenForAdmin opens an initialized data directory for local user management.
+func OpenForAdmin(ctx context.Context, dataDir string) (*Store, error) {
 	return openForServe(ctx, dataDir, metadataMigrations())
 }
 

@@ -1,8 +1,10 @@
-// Command filecloud initializes and serves a single-node filecloud data directory.
+// Command filecloud initializes, administers, and serves a single-node filecloud data directory.
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,18 +12,24 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/mingming-cn/filecloud/internal/auth"
 	"github.com/mingming-cn/filecloud/internal/health"
 	"github.com/mingming-cn/filecloud/internal/storage"
 )
 
 const (
-	_defaultListen  = "127.0.0.1:8080"
-	_shutdownPeriod = 5 * time.Second
+	_defaultListen              = "127.0.0.1:8080"
+	_defaultGlobalKDFCapacity   = 2
+	_defaultSourceIPKDFCapacity = 1
+	_defaultUsernameKDFCapacity = 1
+	_shutdownPeriod             = 5 * time.Second
 )
 
 func main() {
@@ -31,7 +39,7 @@ func main() {
 func mainCode() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
+	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		if _, writeErr := fmt.Fprintln(os.Stderr, "filecloud:", err); writeErr != nil {
 			return 1
 		}
@@ -40,9 +48,9 @@ func mainCode() int {
 	return 0
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: filecloud <init|serve> [options]")
+		return errors.New("usage: filecloud <init|serve|user|login|logout> [options]")
 	}
 	switch args[0] {
 	case "init":
@@ -53,7 +61,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		if *dataDir == "" || flags.NArg() != 0 {
-			return errors.New("usage: filecloud init --data-dir PATH")
+			return errors.New("usage: filecloud init --data-dir path")
 		}
 		return storage.Init(ctx, *dataDir)
 	case "serve":
@@ -61,37 +69,261 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		flags.SetOutput(stderr)
 		dataDir := flags.String("data-dir", "", "Filecloud data directory")
 		listen := flags.String("listen", _defaultListen, "HTTP listen address")
+		globalKDFCapacity := flags.Int("kdf-global-capacity", _defaultGlobalKDFCapacity, "Global concurrent password KDF capacity")
+		sourceIPKDFCapacity := flags.Int("kdf-source-ip-capacity", _defaultSourceIPKDFCapacity, "Concurrent password KDF capacity per direct source IP")
+		usernameKDFCapacity := flags.Int("kdf-username-capacity", _defaultUsernameKDFCapacity, "Concurrent password KDF capacity per canonical username")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
 		if *dataDir == "" || flags.NArg() != 0 {
-			return errors.New("usage: filecloud serve --data-dir PATH [--listen ADDRESS]")
+			return errors.New("usage: filecloud serve --data-dir path [--listen address] [--kdf-global-capacity n] [--kdf-source-ip-capacity n] [--kdf-username-capacity n]")
 		}
-		return serve(ctx, *dataDir, *listen, stdout, stderr)
+		if *globalKDFCapacity < 1 || *sourceIPKDFCapacity < 1 || *usernameKDFCapacity < 1 {
+			return errors.New("kdf concurrency limits must be positive")
+		}
+		return serve(ctx, *dataDir, *listen, stdout, stderr, auth.HandlerConfig{
+			GlobalKDFLimit:   *globalKDFCapacity,
+			SourceIPKDFLimit: *sourceIPKDFCapacity,
+			UsernameKDFLimit: *usernameKDFCapacity,
+		})
+	case "user":
+		return runUser(ctx, args[1:], stdin, stdout, stderr)
+	case "login":
+		return runLogin(ctx, args[1:], stdin, stdout, stderr)
+	case "logout":
+		return runLogout(ctx, args[1:], stdin, stderr)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
-func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Writer) (retErr error) {
+func runUser(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
+	if len(args) == 0 || (args[0] != "add" && args[0] != "reset-password") {
+		return errors.New("usage: filecloud user <add|reset-password> --data-dir path --username name --password-stdin")
+	}
+	operation := args[0]
+	flags := flag.NewFlagSet("user "+operation, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dataDir := flags.String("data-dir", "", "Filecloud data directory")
+	username := flags.String("username", "", "Username")
+	passwordStdin := flags.Bool("password-stdin", false, "Read password from standard input")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *dataDir == "" || *username == "" || !*passwordStdin || flags.NArg() != 0 {
+		return fmt.Errorf("usage: filecloud user %s --data-dir path --username name --password-stdin", operation)
+	}
+	display, err := auth.ValidateUsername(*username)
+	if err != nil {
+		return err
+	}
+	password, err := readPassword(stdin)
+	if err != nil {
+		return err
+	}
+	defer clear(password)
+	hash, err := auth.HashPassword(password, auth.DefaultParams(), nil)
+	if err != nil {
+		return err
+	}
+	store, err := storage.OpenForAdmin(ctx, *dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, store.Close()) }()
+	now := time.Now().UTC()
+	if operation == "add" {
+		id, err := auth.NewUserID(nil)
+		if err != nil {
+			return err
+		}
+		if err := store.CreateUser(ctx, storage.User{ID: id, Username: display, PasswordHash: hash}, now); err != nil {
+			return err
+		}
+	} else if err := store.ResetPassword(ctx, display, hash, now); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "user %s: %s\n", operation, display)
+	return err
+}
+
+func runLogin(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("login", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	server := flags.String("server", "", "Filecloud server URL")
+	username := flags.String("username", "", "Username")
+	deviceName := flags.String("device-name", "", "Device name")
+	passwordStdin := flags.Bool("password-stdin", false, "Read password from standard input")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *server == "" || *username == "" || *deviceName == "" || !*passwordStdin || flags.NArg() != 0 {
+		return errors.New("usage: filecloud login --server url --username name --device-name name --password-stdin")
+	}
+	base, err := validateServerURL(*server)
+	if err != nil {
+		return err
+	}
+	password, err := readPassword(stdin)
+	if err != nil {
+		return err
+	}
+	defer clear(password)
+	body, err := json.Marshal(struct {
+		Username   string
+		Password   string
+		DeviceName string
+	}{Username: *username, Password: string(password), DeviceName: *deviceName})
+	if err != nil {
+		return fmt.Errorf("encode login request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, base.JoinPath("v1/sessions").String(), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create login request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := noRedirectClient().Do(request)
+	if err != nil {
+		return fmt.Errorf("login request: %w", err)
+	}
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	closeErr := response.Body.Close()
+	if readErr != nil {
+		return errors.Join(fmt.Errorf("read login response: %w", readErr), closeResponseError("login", closeErr))
+	}
+	if closeErr != nil {
+		return closeResponseError("login", closeErr)
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("login failed: server returned %s", response.Status)
+	}
+	if _, err := stdout.Write(responseBody); err != nil {
+		return fmt.Errorf("write login response: %w", err)
+	}
+	return nil
+}
+
+func runLogout(ctx context.Context, args []string, stdin io.Reader, stderr io.Writer) error {
+	flags := flag.NewFlagSet("logout", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	server := flags.String("server", "", "Filecloud server URL")
+	tokenStdin := flags.Bool("token-stdin", false, "Read token from standard input")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *server == "" || !*tokenStdin || flags.NArg() != 0 {
+		return errors.New("usage: filecloud logout --server url --token-stdin")
+	}
+	base, err := validateServerURL(*server)
+	if err != nil {
+		return err
+	}
+	token, err := readLineSecret(stdin, 4096, "token")
+	if err != nil {
+		return err
+	}
+	defer clear(token)
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, base.JoinPath("v1/sessions/current").String(), nil)
+	if err != nil {
+		return fmt.Errorf("create logout request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+string(token))
+	response, err := noRedirectClient().Do(request)
+	if err != nil {
+		return fmt.Errorf("logout request: %w", err)
+	}
+	_, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+	closeErr := response.Body.Close()
+	if readErr != nil {
+		return errors.Join(fmt.Errorf("read logout response: %w", readErr), closeResponseError("logout", closeErr))
+	}
+	if closeErr != nil {
+		return closeResponseError("logout", closeErr)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("logout failed: server returned %s", response.Status)
+	}
+	return nil
+}
+
+func closeResponseError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("close %s response: %w", operation, err)
+}
+
+func readPassword(reader io.Reader) ([]byte, error) {
+	password, err := readLineSecret(reader, 1024, "password")
+	if err != nil {
+		return nil, err
+	}
+	if err := auth.ValidatePassword(password); err != nil {
+		return nil, err
+	}
+	return password, nil
+}
+
+func readLineSecret(reader io.Reader, maximum int, name string) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, int64(maximum+3)))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", name, err)
+	}
+	data = bytes.TrimSuffix(data, []byte("\r\n"))
+	data = bytes.TrimSuffix(data, []byte("\n"))
+	if len(data) > maximum {
+		return nil, fmt.Errorf("%s is too long", name)
+	}
+	if bytes.ContainsAny(data, "\r\n") {
+		return nil, fmt.Errorf("%s must be one line", name)
+	}
+	return data, nil
+}
+
+func validateServerURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("server must be an absolute url without credentials, path, query, or fragment")
+	}
+	if parsed.Scheme != "https" {
+		host := strings.ToLower(parsed.Hostname())
+		ip := net.ParseIP(host)
+		if parsed.Scheme != "http" || (host != "localhost" && (ip == nil || !ip.IsLoopback())) {
+			return nil, errors.New("server must use https unless it is a loopback url")
+		}
+	}
+	return parsed, nil
+}
+
+func noRedirectClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Writer, authConfig auth.HandlerConfig) (retErr error) {
 	store, err := storage.OpenForServe(ctx, dataDir)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		retErr = errors.Join(retErr, store.Close())
-	}()
+	defer func() { retErr = errors.Join(retErr, store.Close()) }()
 
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
 	logger := log.New(stderr, "filecloud: ", log.LstdFlags)
-	server := &http.Server{
-		Handler:           health.NewHandler(store.DB(), store.ObjectsDir(), logger),
-		ErrorLog:          logger,
-		ReadHeaderTimeout: 5 * time.Second,
+	sessions, err := auth.NewHandler(store, logger, authConfig)
+	if err != nil {
+		return errors.Join(err, listener.Close())
 	}
+	mux := http.NewServeMux()
+	mux.Handle("/v1/", sessions)
+	mux.Handle("/", health.NewHandler(store.DB(), store.ObjectsDir(), logger))
+	server := &http.Server{Handler: mux, ErrorLog: logger, ReadHeaderTimeout: 5 * time.Second}
 	if _, err := fmt.Fprintf(stdout, "listening on %s\n", listener.Addr()); err != nil {
 		return errors.Join(fmt.Errorf("write listen address: %w", err), listener.Close())
 	}
@@ -109,13 +341,13 @@ func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Write
 	})
 	serveErr := server.Serve(listener)
 	if stopShutdown() {
-		return fmt.Errorf("serve HTTP: %w", serveErr)
+		return fmt.Errorf("serve http: %w", serveErr)
 	}
 	if err := <-shutdownErr; err != nil {
-		return fmt.Errorf("shutdown HTTP: %w", err)
+		return fmt.Errorf("shutdown http: %w", err)
 	}
 	if !errors.Is(serveErr, http.ErrServerClosed) {
-		return fmt.Errorf("serve HTTP: %w", serveErr)
+		return fmt.Errorf("serve http: %w", serveErr)
 	}
 	return nil
 }
