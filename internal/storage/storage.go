@@ -62,6 +62,18 @@ func metadataMigrations() []migration {
 			)`,
 			`CREATE INDEX libraries_owner_page ON libraries(owner_user_id, created_at, id)`,
 		}},
+		{version: 4, statements: []string{
+			`CREATE TABLE published_commits (
+				owner_user_id TEXT NOT NULL,
+				library_id TEXT NOT NULL,
+				commit_id TEXT NOT NULL,
+				PRIMARY KEY(owner_user_id, library_id, commit_id),
+				FOREIGN KEY(owner_user_id, library_id)
+					REFERENCES libraries(owner_user_id, id) ON DELETE CASCADE
+			)`,
+			`INSERT INTO published_commits(owner_user_id, library_id, commit_id)
+			 SELECT owner_user_id, id, head_commit_id FROM libraries WHERE head_commit_id IS NOT NULL`,
+		}},
 	}
 }
 

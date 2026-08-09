@@ -39,17 +39,21 @@ const (
 	_maxDirectoryBody    = 32 << 20
 )
 
-// Config contains deterministic pagination seams.
+// Config contains deterministic handler seams.
 type Config struct {
-	Now          func() time.Time
-	PageTokenKey []byte
+	Now              func() time.Time
+	PageTokenKey     []byte
+	BeforeHeadUpdate func() error
+	AfterHeadUpdate  func() error
 }
 
 type handler struct {
-	store         *storage.Store
-	logger        *log.Logger
-	now           func() time.Time
-	pageTokenAEAD cipher.AEAD
+	store            *storage.Store
+	logger           *log.Logger
+	now              func() time.Time
+	pageTokenAEAD    cipher.AEAD
+	beforeHeadUpdate func() error
+	afterHeadUpdate  func() error
 }
 
 // NewHandler constructs authenticated create, list, and get library endpoints.
@@ -80,10 +84,15 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 	if err != nil {
 		return nil, fmt.Errorf("create page token aead: %w", err)
 	}
-	h := &handler{store: store, logger: logger, now: config.Now, pageTokenAEAD: pageTokenAEAD}
+	h := &handler{
+		store: store, logger: logger, now: config.Now, pageTokenAEAD: pageTokenAEAD,
+		beforeHeadUpdate: config.BeforeHeadUpdate, afterHeadUpdate: config.AfterHeadUpdate,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}", h.create)
 	mux.HandleFunc("GET /v1/libraries/{LibraryId}", h.get)
+	mux.HandleFunc("GET /v1/libraries/{LibraryId}/head", h.getHead)
+	mux.HandleFunc("PUT /v1/libraries/{LibraryId}/head", h.updateHead)
 	mux.HandleFunc("GET /v1/libraries", h.list)
 	mux.HandleFunc("POST /v1/libraries/{LibraryId}/object-checks", h.checkObjects)
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}/objects/{ObjectType}/{ObjectId}", h.putMetadataObject)

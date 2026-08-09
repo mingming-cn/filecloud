@@ -22,6 +22,8 @@ import (
 )
 
 const (
+	_ownerID      = "12345678-9abc-4def-8123-456789abcdef"
+	_otherID      = "22345678-9abc-4def-8123-456789abcdef"
 	_ownerToken   = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
 	_otherToken   = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
 	_expiredToken = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
@@ -230,11 +232,11 @@ func TestLibraryAuthenticationAndOwnerIsolationAreUniform(t *testing.T) {
 	}
 
 	expiredHash := sha256.Sum256([]byte(_expiredToken))
-	if err := store.CreateSession(t.Context(), "owner", expiredHash, "expired", now.Add(-2*time.Hour), now.Add(-time.Hour)); err != nil {
+	if err := store.CreateSession(t.Context(), _ownerID, expiredHash, "expired", now.Add(-2*time.Hour), now.Add(-time.Hour)); err != nil {
 		t.Fatalf("CreateSession expired: %v", err)
 	}
 	revokedHash := sha256.Sum256([]byte(_revokedToken))
-	if err := store.CreateSession(t.Context(), "owner", revokedHash, "revoked", now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
+	if err := store.CreateSession(t.Context(), _ownerID, revokedHash, "revoked", now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
 		t.Fatalf("CreateSession revoked: %v", err)
 	}
 	if revoked, err := store.RevokeSession(t.Context(), revokedHash, now); err != nil || !revoked {
@@ -320,14 +322,14 @@ func newTestHandler(t *testing.T) (http.Handler, *storage.Store, time.Time) {
 	}
 	now := time.Date(2026, 2, 3, 4, 5, 6, 789, time.UTC)
 	for _, user := range []storage.User{
-		{ID: "owner", Username: "alice", PasswordHash: "hash"},
-		{ID: "other", Username: "bob", PasswordHash: "hash"},
+		{ID: _ownerID, Username: "alice", PasswordHash: "hash"},
+		{ID: _otherID, Username: "bob", PasswordHash: "hash"},
 	} {
 		if err := store.CreateUser(t.Context(), user, now); err != nil {
 			t.Fatalf("CreateUser: %v", err)
 		}
 	}
-	for token, userID := range map[string]string{_ownerToken: "owner", _otherToken: "other"} {
+	for token, userID := range map[string]string{_ownerToken: _ownerID, _otherToken: _otherID} {
 		digest := sha256.Sum256([]byte(token))
 		if err := store.CreateSession(t.Context(), userID, digest, "device", now, now.Add(time.Hour)); err != nil {
 			t.Fatalf("CreateSession: %v", err)

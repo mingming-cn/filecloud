@@ -17,6 +17,8 @@ var (
 	ErrLibraryObjectConflict = errors.New("library object conflict")
 	// ErrLibraryNotFound reports no library visible to the owner.
 	ErrLibraryNotFound = errors.New("library not found")
+	// ErrHeadConflict reports that a conditional Head update lost a race.
+	ErrHeadConflict = errors.New("library head conflict")
 )
 
 // Library is one owner-isolated library control-plane record.
@@ -97,6 +99,70 @@ func (s *Store) GetLibrary(ctx context.Context, ownerUserID, libraryID string) (
 	return scanLibrary(s.db.QueryRowContext(ctx, `
 		SELECT id, owner_user_id, name, head_commit_id, head_version, created_at, updated_at
 		FROM libraries WHERE owner_user_id = ? AND id = ?`, ownerUserID, libraryID))
+}
+
+// IsCommitPublished reports whether commitID is reachable from a successfully published Head.
+func (s *Store) IsCommitPublished(ctx context.Context, ownerUserID, libraryID, commitID string) (bool, error) {
+	var published bool
+	err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM published_commits
+			WHERE owner_user_id = ? AND library_id = ? AND commit_id = ?
+		)`, ownerUserID, libraryID, commitID).Scan(&published)
+	if err != nil {
+		return false, fmt.Errorf("query published commit: %w", err)
+	}
+	return published, nil
+}
+
+// UpdateLibraryHead atomically advances Head and records its newly published ancestry.
+func (s *Store) UpdateLibraryHead(ctx context.Context, ownerUserID, libraryID string, expectedHead *string, expectedVersion int64, commitID string, introducedCommitIDs []string, now time.Time) (ret Library, retErr error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Library{}, fmt.Errorf("begin update library head: %w", err)
+	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if rollbackErr := tx.Rollback(); !errors.Is(rollbackErr, sql.ErrTxDone) {
+			retErr = errors.Join(retErr, rollbackErr)
+		}
+	}()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE libraries
+		SET head_commit_id = ?, head_version = head_version + 1, updated_at = ?
+		WHERE owner_user_id = ? AND id = ? AND head_version = ?
+		  AND ((? IS NULL AND head_commit_id IS NULL) OR head_commit_id = ?)`,
+		commitID, formatTime(now), ownerUserID, libraryID, expectedVersion, expectedHead, expectedHead)
+	if err != nil {
+		return Library{}, fmt.Errorf("update library head: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return Library{}, fmt.Errorf("read update library head result: %w", err)
+	}
+	if changed != 1 {
+		return Library{}, ErrHeadConflict
+	}
+	for _, publishedCommitID := range append([]string{commitID}, introducedCommitIDs...) {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO published_commits(owner_user_id, library_id, commit_id)
+			VALUES (?, ?, ?)`, ownerUserID, libraryID, publishedCommitID); err != nil {
+			return Library{}, fmt.Errorf("record published commit: %w", err)
+		}
+	}
+	ret, err = scanLibrary(tx.QueryRowContext(ctx, `
+		SELECT id, owner_user_id, name, head_commit_id, head_version, created_at, updated_at
+		FROM libraries WHERE owner_user_id = ? AND id = ?`, ownerUserID, libraryID))
+	if err != nil {
+		return Library{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Library{}, fmt.Errorf("commit update library head: %w", err)
+	}
+	return ret, nil
 }
 
 // ListLibraries returns libraries after the exclusive cursor in stable order.

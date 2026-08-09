@@ -316,8 +316,8 @@ Header：`Content-Type: application/octet-stream`、`Content-Length` 必填。�
 1. 鉴权并读取当前 Head/ETag。
 2. 比较 `If-Match`。
 3. 在对象存储共享锁下读取 Commit，验证 `AuthorUserId` 等于认证用户，并验证其第一个 Parent 与当前 Head 一致；初始提交 Parents 为空。
-4. 遍历并校验当前 Root 的完整可达图、对象类型、摘要、block 总大小和路径规则。若存在第二 parent，同时验证它首次引入发布历史的子图。
-5. 用短数据库事务再次比较 Head/ETag，并原子更新 Head 和 head version。第一阶段 GC 必须离线取得独占锁，因此第 4、5 步之间对象不会消失。
+4. 遍历并校验当前 Root 的完整可达图、对象类型、摘要、block 总大小和路径规则。若存在第二 parent，只沿尚未发布的分支验证它首次引入发布历史的子图，遇到已发布 Commit 边界即停止。
+5. 用短数据库事务再次比较 Head/ETag，并原子更新 Head、head version 和发布 reachability 索引。第一阶段 GC 必须离线取得独占锁，因此第 4、5 步之间对象不会消失。
 
 响应 `200`：
 

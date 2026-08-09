@@ -133,11 +133,12 @@ SQLite 只保存以下表；content objects 不进 SQL。
 | `users` | `id`, `username`, `password_hash`, `is_admin`, `created_at` | 规范用户名唯一 |
 | `access_tokens` | `id`, `user_id`, `token_hash`, `expires_at`, `revoked_at` | token hash 唯一，级联用户 |
 | `libraries` | `id`, `owner_user_id`, `name`, `head_commit_id`, `head_version`, timestamps | `(owner_user_id,id)` 主键，`(owner_user_id,name)` 唯一 |
+| `published_commits` | `owner_user_id`, `library_id`, `commit_id` | 发布 reachability 索引，随 Head CAS 同事务维护，级联资料库 |
 | `usage_windows` | `user_id`, `window_start`, `accepted_bytes` | 用户上传安全预算 |
 
 LibraryId 只在所有者作用域内唯一；不同用户可以独立使用相同 UUID。数据库查询、对象路径、资料库锁和 GC 标记都必须使用 `(OwnerUserId, LibraryId)`，不能只用 LibraryId 定位资料库。这样创建接口不会通过全局 UUID 冲突泄露其他用户资料库的存在性。滚动上传预算仍按用户统计，不属于资料库复合键命名空间。
 
-逻辑类型固定为：UUID 使用规范小写文本，时间使用 UTC RFC3339 文本，布尔使用 0/1，ObjectId/token hash 使用定长字节或固定小写十六进制且比较必须是 binary，不依赖数据库 locale/collation。用户名和资料库名先由应用生成规范键，再对规范键建唯一约束。Head CAS 的成功条件统一为条件 UPDATE 影响恰好一行。
+逻辑类型固定为：UUID 使用规范小写文本，时间使用 UTC RFC3339 文本，布尔使用 0/1，ObjectId/token hash 使用定长字节或固定小写十六进制且比较必须是 binary，不依赖数据库 locale/collation。用户名和资料库名先由应用生成规范键，再对规范键建唯一约束。Head CAS 的成功条件统一为条件 UPDATE 影响恰好一行；成功后在同一事务把候选及本次引入的 Commit 写入 `published_commits`。该表只记录发布可达性，不存储或替代 content objects。
 
 `serve` 整个生命周期持有数据目录共享锁。Head 发布先在该锁下验证新 Commit 的完整可达图，再用短事务读取当前 `head_commit_id/head_version`、比较 Expected Head并带当前版本条件更新。服务运行期间对象不可删除；GC 必须取得数据目录独占锁并要求服务停止，因此验证与 CAS 之间对象不会消失。
 
