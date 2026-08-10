@@ -27,13 +27,13 @@ const (
 )
 
 type pendingPublication struct {
-	BaseCommit, BaseRoot, ExpectedETag string
-	CandidateCommit, CandidateRoot     string
-	CandidateData                      []byte
-	DeletionCount, TrackedCount        int64
-	RequiresDeleteConfirmation         bool
-	DeleteConfirmed                    bool
-	LegacyRevalidationRequired         bool
+	BaseCommit, BaseRoot, ExpectedHead, ExpectedETag string
+	CandidateCommit, CandidateRoot                   string
+	CandidateData                                    []byte
+	DeletionCount, TrackedCount                      int64
+	RequiresDeleteConfirmation                       bool
+	DeleteConfirmed                                  bool
+	LegacyRevalidationRequired                       bool
 }
 
 type deleteConfirmationRequiredError struct {
@@ -113,8 +113,9 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 		}
 		deleted, tracked := deletionStats(options.scanConfig.trackedPaths, snapshot.paths)
 		protected := protectedDeletion(deleted, tracked)
-		pending = &pendingPublication{BaseCommit: binding.SyncBase, BaseRoot: binding.SyncBaseRoot, ExpectedETag: head.ETag,
-			CandidateCommit: id, CandidateRoot: snapshot.root, CandidateData: data, DeletionCount: deleted,
+		pending = &pendingPublication{BaseCommit: binding.SyncBase, BaseRoot: binding.SyncBaseRoot,
+			ExpectedHead: *head.CommitID, ExpectedETag: head.ETag, CandidateCommit: id, CandidateRoot: snapshot.root,
+			CandidateData: data, DeletionCount: deleted,
 			TrackedCount: tracked, RequiresDeleteConfirmation: protected}
 		if err := savePendingPublication(ctx, db, binding.Worktree, *pending); err != nil {
 			return err
@@ -128,10 +129,10 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 
 func loadPendingPublication(ctx context.Context, db *sql.DB, worktree string) (*pendingPublication, error) {
 	var value pendingPublication
-	err := db.QueryRowContext(ctx, `SELECT base_commit, base_root, expected_etag, candidate_commit, candidate_root, candidate_data,
-		deletion_count, tracked_count, requires_delete_confirmation, delete_confirmed, legacy_revalidation_required
-		FROM pending_publications WHERE worktree = ?`, worktree).Scan(&value.BaseCommit, &value.BaseRoot, &value.ExpectedETag,
-		&value.CandidateCommit, &value.CandidateRoot, &value.CandidateData, &value.DeletionCount, &value.TrackedCount,
+	err := db.QueryRowContext(ctx, `SELECT base_commit, base_root, expected_head, expected_etag, candidate_commit, candidate_root,
+		candidate_data, deletion_count, tracked_count, requires_delete_confirmation, delete_confirmed, legacy_revalidation_required
+		FROM pending_publications WHERE worktree = ?`, worktree).Scan(&value.BaseCommit, &value.BaseRoot, &value.ExpectedHead,
+		&value.ExpectedETag, &value.CandidateCommit, &value.CandidateRoot, &value.CandidateData, &value.DeletionCount, &value.TrackedCount,
 		&value.RequiresDeleteConfirmation, &value.DeleteConfirmed, &value.LegacyRevalidationRequired)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -143,12 +144,13 @@ func loadPendingPublication(ctx context.Context, db *sql.DB, worktree string) (*
 }
 
 func savePendingPublication(ctx context.Context, db *sql.DB, worktree string, value pendingPublication) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO pending_publications(worktree, base_commit, base_root, expected_etag,
-		candidate_commit, candidate_root, candidate_data, deletion_count, tracked_count, requires_delete_confirmation,
-		delete_confirmed, legacy_revalidation_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, worktree,
-		value.BaseCommit, value.BaseRoot, value.ExpectedETag, value.CandidateCommit, value.CandidateRoot,
-		value.CandidateData, value.DeletionCount, value.TrackedCount, value.RequiresDeleteConfirmation,
-		value.DeleteConfirmed, value.LegacyRevalidationRequired)
+	_, err := db.ExecContext(ctx, `INSERT INTO pending_publications(worktree, base_commit, base_root, expected_head,
+		expected_etag, candidate_commit, candidate_root, candidate_data, deletion_count, tracked_count,
+		requires_delete_confirmation, delete_confirmed, legacy_revalidation_required)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, worktree, value.BaseCommit, value.BaseRoot,
+		value.ExpectedHead, value.ExpectedETag, value.CandidateCommit, value.CandidateRoot, value.CandidateData,
+		value.DeletionCount, value.TrackedCount, value.RequiresDeleteConfirmation, value.DeleteConfirmed,
+		value.LegacyRevalidationRequired)
 	if err != nil {
 		return fmt.Errorf("save pending publication: %w", err)
 	}
@@ -157,9 +159,11 @@ func savePendingPublication(ctx context.Context, db *sql.DB, worktree string, va
 
 func verifyPendingPublication(value pendingPublication, binding clientBinding) error {
 	commit, err := object.VerifyCommit(value.CandidateData, value.CandidateCommit)
-	if err != nil || value.BaseCommit != binding.SyncBase || value.BaseRoot != binding.SyncBaseRoot ||
-		commit.Root != value.CandidateRoot || commit.AuthorUserID != binding.UserID || commit.DeviceID != binding.DeviceID ||
-		len(commit.Parents) != 1 || commit.Parents[0] != value.BaseCommit || value.DeletionCount < 0 ||
+	initial := len(commit.Parents) == 1 && value.BaseCommit == binding.SyncBase && value.BaseRoot == binding.SyncBaseRoot &&
+		value.ExpectedHead == value.BaseCommit && commit.Parents[0] == value.BaseCommit
+	merge := len(commit.Parents) == 2 && commit.Parents[0] == value.ExpectedHead
+	if err != nil || (!initial && !merge) || commit.Root != value.CandidateRoot ||
+		commit.AuthorUserID != binding.UserID || commit.DeviceID != binding.DeviceID || value.DeletionCount < 0 ||
 		value.TrackedCount < value.DeletionCount || value.DeleteConfirmed && !value.RequiresDeleteConfirmation ||
 		(value.LegacyRevalidationRequired && (value.DeletionCount != 0 || value.TrackedCount != 0 ||
 			value.RequiresDeleteConfirmation || value.DeleteConfirmed)) ||
@@ -169,9 +173,36 @@ func verifyPendingPublication(value pendingPublication, binding clientBinding) e
 	return nil
 }
 
+func verifyPendingPublicationChain(ctx context.Context, options bindOptions, value pendingPublication, binding clientBinding) error {
+	commit, _ := object.VerifyCommit(value.CandidateData, value.CandidateCommit)
+	expected, err := getRemoteCommit(ctx, options.base, options.libraryID, options.token, value.ExpectedHead)
+	if err != nil || expected.AuthorUserID != binding.UserID {
+		return errors.Join(errors.New("pending publication expected Head metadata is invalid"), err)
+	}
+	if value.BaseCommit == value.ExpectedHead && expected.Root != value.BaseRoot {
+		return errors.New("pending publication expected Head root does not match its Base root")
+	}
+	if value.BaseCommit != binding.SyncBase {
+		base, err := getRemoteCommit(ctx, options.base, options.libraryID, options.token, value.BaseCommit)
+		if err != nil || base.AuthorUserID != binding.UserID || base.Root != value.BaseRoot {
+			return errors.Join(errors.New("pending publication Base metadata is invalid"), err)
+		}
+	}
+	if len(commit.Parents) == 2 {
+		linked, err := remoteCommitDescendsFrom(ctx, options, commit.Parents[1], binding.SyncBase, binding.UserID)
+		if err != nil || !linked {
+			return errors.Join(errors.New("pending publication candidate chain is not linked to the binding Sync Base"), err)
+		}
+	}
+	return nil
+}
+
 func resumePublication(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding, snapshot worktreeSnapshot,
 	head remoteHead, pending pendingPublication, stdout io.Writer, config libraryClientConfig) error {
 	if err := verifyPendingPublication(pending, binding); err != nil {
+		return err
+	}
+	if err := verifyPendingPublicationChain(ctx, options, pending, binding); err != nil {
 		return err
 	}
 	if *head.CommitID == pending.CandidateCommit {
@@ -180,15 +211,23 @@ func resumePublication(ctx context.Context, db *sql.DB, options bindOptions, bin
 		}
 		return recoverPublishedCandidate(ctx, db, options, binding, head, pending)
 	}
-	if *head.CommitID != pending.BaseCommit || head.ETag != pending.ExpectedETag {
-		ancestor, err := remoteCommitDescendsFrom(ctx, options, *head.CommitID, pending.CandidateCommit, binding.UserID)
-		if err != nil {
+	ancestor, err := remoteCommitDescendsFrom(ctx, options, *head.CommitID, pending.CandidateCommit, binding.UserID)
+	if err != nil {
+		return err
+	}
+	if ancestor {
+		if snapshot.root == pending.CandidateRoot {
+			return transitionPublishedSuccessor(ctx, db, options, binding, snapshot, head, pending, stdout, config)
+		}
+		return recoverPublishedCandidate(ctx, db, options, binding, head, pending)
+	}
+	if *head.CommitID != pending.ExpectedHead {
+		return replacePendingForTrivialMerge(ctx, db, options, binding, snapshot, head, pending, stdout, config)
+	}
+	if head.ETag != pending.ExpectedETag {
+		if err := refreshPendingETag(ctx, db, binding.Worktree, &pending, head.ETag); err != nil {
 			return err
 		}
-		if !ancestor || snapshot.root != pending.CandidateRoot {
-			return errors.New("local and remote libraries both changed; merge is not supported yet")
-		}
-		return transitionPublishedSuccessor(ctx, db, options, binding, snapshot, head, pending, stdout, config)
 	}
 	if pending.LegacyRevalidationRequired {
 		if snapshot.root != pending.CandidateRoot {
@@ -243,11 +282,90 @@ func resumePublication(ctx context.Context, db *sql.DB, options bindOptions, bin
 	return uploadAndPublishPending(ctx, db, options, binding, snapshot, pending, stdout, config)
 }
 
+func refreshPendingETag(ctx context.Context, db *sql.DB, worktree string, pending *pendingPublication, etag string) error {
+	result, err := db.ExecContext(ctx, `UPDATE pending_publications SET expected_etag = ? WHERE worktree = ?
+		AND base_commit = ? AND base_root = ? AND expected_head = ? AND expected_etag = ? AND candidate_commit = ?
+		AND candidate_root = ? AND candidate_data = ? AND deletion_count = ? AND tracked_count = ?
+		AND requires_delete_confirmation = ? AND delete_confirmed = ? AND legacy_revalidation_required = ?`,
+		etag, worktree, pending.BaseCommit, pending.BaseRoot, pending.ExpectedHead, pending.ExpectedETag,
+		pending.CandidateCommit, pending.CandidateRoot, pending.CandidateData, pending.DeletionCount, pending.TrackedCount,
+		pending.RequiresDeleteConfirmation, pending.DeleteConfirmed, pending.LegacyRevalidationRequired)
+	if err != nil {
+		return fmt.Errorf("refresh pending publication ETag: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.Join(errors.New("pending publication changed before ETag refresh"), err)
+	}
+	pending.ExpectedETag = etag
+	return nil
+}
+
+func replacePendingForTrivialMerge(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding,
+	snapshot worktreeSnapshot, head remoteHead, old pendingPublication, stdout io.Writer, config libraryClientConfig) error {
+	if head.CommitID == nil {
+		return errors.New("remote merge Head is empty")
+	}
+	base, err := getRemoteCommit(ctx, options.base, options.libraryID, options.token, old.ExpectedHead)
+	if err != nil || base.AuthorUserID != binding.UserID {
+		return errors.Join(errors.New("verify previous expected Head for merge"), err)
+	}
+	remote, err := getRemoteCommit(ctx, options.base, options.libraryID, options.token, *head.CommitID)
+	if err != nil || remote.AuthorUserID != binding.UserID {
+		return errors.Join(errors.New("verify latest Head for merge"), err)
+	}
+	if remote.Root != base.Root && remote.Root != old.CandidateRoot {
+		return errors.New("local and remote roots both changed; recursive merge is unavailable until Issue #16")
+	}
+	data, id, err := canonicalCommit(binding.UserID, binding.DeviceID, old.CandidateRoot,
+		[]string{*head.CommitID, old.CandidateCommit}, config.now)
+	if err != nil {
+		return err
+	}
+	if err := putMetadata(ctx, options.base, options.libraryID, options.token, "commits", old.CandidateCommit, old.CandidateData); err != nil {
+		return err
+	}
+	if err := putMetadata(ctx, options.base, options.libraryID, options.token, "commits", id, data); err != nil {
+		return err
+	}
+	next := pendingPublication{BaseCommit: old.ExpectedHead, BaseRoot: base.Root, ExpectedHead: *head.CommitID,
+		ExpectedETag: head.ETag, CandidateCommit: id, CandidateRoot: old.CandidateRoot, CandidateData: data}
+	if base.Root == old.BaseRoot {
+		next.DeletionCount, next.TrackedCount = old.DeletionCount, old.TrackedCount
+		next.RequiresDeleteConfirmation = old.RequiresDeleteConfirmation
+	}
+	result, err := db.ExecContext(ctx, `UPDATE pending_publications SET base_commit = ?, base_root = ?, expected_head = ?,
+		expected_etag = ?, candidate_commit = ?, candidate_root = ?, candidate_data = ?, deletion_count = ?,
+		tracked_count = ?, requires_delete_confirmation = ?, delete_confirmed = 0, legacy_revalidation_required = 0
+		WHERE worktree = ? AND base_commit = ? AND base_root = ? AND expected_head = ? AND expected_etag = ?
+		AND candidate_commit = ? AND candidate_root = ? AND candidate_data = ? AND deletion_count = ? AND tracked_count = ?
+		AND requires_delete_confirmation = ? AND delete_confirmed = ? AND legacy_revalidation_required = ?`,
+		next.BaseCommit, next.BaseRoot, next.ExpectedHead, next.ExpectedETag, next.CandidateCommit, next.CandidateRoot,
+		next.CandidateData, next.DeletionCount, next.TrackedCount, next.RequiresDeleteConfirmation, binding.Worktree,
+		old.BaseCommit, old.BaseRoot, old.ExpectedHead, old.ExpectedETag, old.CandidateCommit, old.CandidateRoot,
+		old.CandidateData, old.DeletionCount, old.TrackedCount, old.RequiresDeleteConfirmation, old.DeleteConfirmed,
+		old.LegacyRevalidationRequired)
+	if err != nil {
+		return fmt.Errorf("replace pending publication after Head conflict: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.Join(errors.New("pending publication changed before conflict replacement"), err)
+	}
+	if config.afterPendingReplacement != nil {
+		if err := config.afterPendingReplacement(); err != nil {
+			return fmt.Errorf("after pending publication replacement: %w", err)
+		}
+	}
+	if next.RequiresDeleteConfirmation {
+		return deletionConfirmationError(next)
+	}
+	return uploadAndPublishPending(ctx, db, options, binding, snapshot, next, stdout, config)
+}
+
 func discardPendingPublication(ctx context.Context, db *sql.DB, worktree string, pending pendingPublication) error {
 	result, err := db.ExecContext(ctx, `DELETE FROM pending_publications WHERE worktree = ? AND base_commit = ?
-		AND base_root = ? AND expected_etag = ? AND candidate_commit = ? AND candidate_root = ? AND candidate_data = ?`,
-		worktree, pending.BaseCommit, pending.BaseRoot, pending.ExpectedETag, pending.CandidateCommit,
-		pending.CandidateRoot, pending.CandidateData)
+		AND base_root = ? AND expected_head = ? AND expected_etag = ? AND candidate_commit = ?
+		AND candidate_root = ? AND candidate_data = ?`, worktree, pending.BaseCommit, pending.BaseRoot,
+		pending.ExpectedHead, pending.ExpectedETag, pending.CandidateCommit, pending.CandidateRoot, pending.CandidateData)
 	if err != nil {
 		return fmt.Errorf("discard changed pending publication: %w", err)
 	}
@@ -282,7 +400,7 @@ func recoverPublishedCandidate(ctx context.Context, db *sql.DB, options bindOpti
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE bindings SET sync_base_commit = ?, sync_base_root = ?, head_etag = ?
 		WHERE worktree = ? AND sync_base_commit = ? AND sync_base_root = ?`, pending.CandidateCommit,
-		pending.CandidateRoot, head.ETag, binding.Worktree, pending.BaseCommit, pending.BaseRoot)
+		pending.CandidateRoot, head.ETag, binding.Worktree, binding.SyncBase, binding.SyncBaseRoot)
 	if err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
@@ -299,8 +417,9 @@ func recoverPublishedCandidate(ctx context.Context, db *sql.DB, options bindOpti
 		}
 	}
 	result, err = tx.ExecContext(ctx, `DELETE FROM pending_publications WHERE worktree = ? AND base_commit = ?
-		AND candidate_commit = ? AND candidate_root = ?`, binding.Worktree, pending.BaseCommit,
-		pending.CandidateCommit, pending.CandidateRoot)
+		AND base_root = ? AND expected_head = ? AND expected_etag = ? AND candidate_commit = ?
+		AND candidate_root = ? AND candidate_data = ?`, binding.Worktree, pending.BaseCommit, pending.BaseRoot,
+		pending.ExpectedHead, pending.ExpectedETag, pending.CandidateCommit, pending.CandidateRoot, pending.CandidateData)
 	if err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
@@ -427,25 +546,45 @@ func publishPending(ctx context.Context, db *sql.DB, options bindOptions, bindin
 	if err != nil || verified.root != pending.CandidateRoot {
 		return errors.New("worktree changed before Head publication")
 	}
+	current, err := getRemoteHead(ctx, options.base, options.libraryID, options.token)
+	if err != nil {
+		return err
+	}
+	if current.CommitID == nil {
+		return errors.New("library Head is empty before publication")
+	}
+	if *current.CommitID != pending.ExpectedHead {
+		return resumePublication(ctx, db, options, binding, snapshot, current, pending, stdout, config)
+	}
+	if current.ETag != pending.ExpectedETag {
+		if err := refreshPendingETag(ctx, db, binding.Worktree, &pending, current.ETag); err != nil {
+			return err
+		}
+	}
 	_, _, publishErr := updateRemoteHead(ctx, options.base, options.libraryID, options.token, pending.ExpectedETag, pending.CandidateCommit)
 	published, getErr := getRemoteHead(ctx, options.base, options.libraryID, options.token)
 	if getErr != nil {
 		return errors.Join(publishErr, fmt.Errorf("resolve library Head after publish: %w", getErr))
 	}
-	if published.CommitID == nil || *published.CommitID != pending.CandidateCommit {
-		if published.CommitID != nil && *published.CommitID != pending.BaseCommit {
-			ancestor, err := remoteCommitDescendsFrom(ctx, options, *published.CommitID, pending.CandidateCommit, binding.UserID)
-			if err != nil {
+	if published.CommitID != nil && *published.CommitID == pending.CandidateCommit {
+		return finalizePublished(ctx, db, binding, snapshot, published, pending, stdout)
+	}
+	if published.CommitID != nil && *published.CommitID == pending.ExpectedHead {
+		if published.ETag != pending.ExpectedETag {
+			if err := refreshPendingETag(ctx, db, binding.Worktree, &pending, published.ETag); err != nil {
 				return errors.Join(publishErr, err)
 			}
-			if ancestor {
-				return transitionPublishedSuccessor(ctx, db, options, binding, snapshot, published, pending, stdout, config)
-			}
-			return errors.Join(publishErr, errors.New("local and remote libraries both changed; merge is not supported yet"))
 		}
 		return errors.Join(publishErr, errors.New("library Head publication did not complete; rerun sync"))
 	}
-	return finalizePublished(ctx, db, binding, snapshot, published, pending, stdout)
+	if published.CommitID == nil {
+		return errors.Join(publishErr, errors.New("library Head became empty during publication"))
+	}
+	resumeErr := resumePublication(ctx, db, options, binding, snapshot, published, pending, stdout, config)
+	if resumeErr != nil {
+		return errors.Join(publishErr, resumeErr)
+	}
+	return nil
 }
 
 func finalizePublished(ctx context.Context, db *sql.DB, binding clientBinding, snapshot worktreeSnapshot, head remoteHead,

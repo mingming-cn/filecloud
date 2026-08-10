@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -340,7 +341,7 @@ func TestFSActionV15ProvenanceMigration(t *testing.T) {
 	})
 }
 
-func TestClientV19PendingPublicationFingerprintBeforeDDL(t *testing.T) {
+func TestClientV20PendingPublicationFingerprint(t *testing.T) {
 	rebuild := func(db *sql.DB, createSQL string) error {
 		_, err := db.Exec(`ALTER TABLE pending_publications RENAME TO old_pending_publications`)
 		if err != nil {
@@ -358,22 +359,22 @@ func TestClientV19PendingPublicationFingerprintBeforeDDL(t *testing.T) {
 		mutate func(*sql.DB) error
 	}{
 		{"removed check", func(db *sql.DB) error {
-			return rebuild(db, strings.Replace(clientV19PendingSQL,
+			return rebuild(db, strings.Replace(clientV20PendingSQL,
 				"CHECK(deletion_count >= 0 AND tracked_count >= deletion_count)", "CHECK(deletion_count >= 0)", 1))
 		}},
 		{"altered check", func(db *sql.DB) error {
-			return rebuild(db, strings.Replace(clientV19PendingSQL, "deletion_count > 100", "deletion_count > 101", 1))
+			return rebuild(db, strings.Replace(clientV20PendingSQL, "deletion_count > 100", "deletion_count > 101", 1))
 		}},
 		{"altered default", func(db *sql.DB) error {
-			return rebuild(db, strings.Replace(clientV19PendingSQL,
+			return rebuild(db, strings.Replace(clientV20PendingSQL,
 				"deletion_count INTEGER NOT NULL DEFAULT 0", "deletion_count INTEGER NOT NULL DEFAULT 1", 1))
 		}},
 		{"altered notnull", func(db *sql.DB) error {
-			return rebuild(db, strings.Replace(clientV19PendingSQL,
+			return rebuild(db, strings.Replace(clientV20PendingSQL,
 				"tracked_count INTEGER NOT NULL DEFAULT 0", "tracked_count INTEGER DEFAULT 0", 1))
 		}},
 		{"altered type", func(db *sql.DB) error {
-			return rebuild(db, strings.Replace(clientV19PendingSQL,
+			return rebuild(db, strings.Replace(clientV20PendingSQL,
 				"tracked_count INTEGER NOT NULL DEFAULT 0", "tracked_count TEXT NOT NULL DEFAULT 0", 1))
 		}},
 		{"extra trigger", func(db *sql.DB) error {
@@ -399,7 +400,7 @@ func TestClientV19PendingPublicationFingerprintBeforeDDL(t *testing.T) {
 			}
 			defer db.Close()
 			if _, err := db.Exec(`INSERT INTO pending_publications VALUES
-				('/work','base','root','etag','candidate','candidate-root',X'0102',101,101,1,0,0)`); err != nil {
+				('/work','base','root','base','etag','candidate','candidate-root',X'0102',101,101,1,0,0)`); err != nil {
 				t.Fatal(err)
 			}
 			if err := test.mutate(db); err != nil {
@@ -425,7 +426,7 @@ func TestClientV19PendingPublicationFingerprintBeforeDDL(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := initializeClientSchema(t.Context(), db); err == nil {
-				t.Fatal("invalid v19 schema was accepted")
+				t.Fatal("invalid v20 schema was accepted")
 			}
 			var afterSchema, afterData string
 			if err := db.QueryRow(`SELECT group_concat(type || ':' || name || ':' || COALESCE(sql,''), char(10))
@@ -441,7 +442,7 @@ func TestClientV19PendingPublicationFingerprintBeforeDDL(t *testing.T) {
 				t.Fatal(err)
 			}
 			if beforeSchema != afterSchema || beforeData != afterData || !bytes.Equal(beforeBytes, afterBytes) {
-				t.Fatal("v19 rejection changed schema, data, or database bytes")
+				t.Fatal("v20 rejection changed schema, data, or database bytes")
 			}
 			if test.name == "extra trigger" && afterData != "'/work'|'candidate'|0" {
 				t.Fatalf("trigger confirmed candidate: %s", afterData)
@@ -458,6 +459,73 @@ func TestClientV19PendingPublicationFingerprintBeforeDDL(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestPendingPublicationV18AndV19ExpectedHeadMigration(t *testing.T) {
+	for _, version := range []int{18, 19} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			createSQL := legacyClientV18PendingSQL
+			values := "'/work','base','root','etag','candidate','candidate-root',X'0102',0,0,0,0"
+			if version == 19 {
+				createSQL = clientV19PendingSQL
+				values += ",0"
+			}
+			if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO new_pending_publications`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(createSQL); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec("INSERT INTO pending_publications VALUES(" + values + ")"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`DROP TABLE new_pending_publications;
+				DELETE FROM client_schema_migrations WHERE version > ?`, version); err != nil {
+				t.Fatal(err)
+			}
+			if err := initializeClientSchema(t.Context(), db); err != nil {
+				t.Fatal(err)
+			}
+			var expected, base string
+			if err := db.QueryRow(`SELECT expected_head,base_commit FROM pending_publications WHERE worktree='/work'`).Scan(&expected, &base); err != nil {
+				t.Fatal(err)
+			}
+			if expected != base || expected != "base" {
+				t.Fatalf("v%d migration expected=%q base=%q", version, expected, base)
+			}
+		})
+	}
+}
+
+func TestClientV19PendingPublicationFingerprintBeforeMigration(t *testing.T) {
+	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO new_pending_publications`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(clientV19PendingSQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE new_pending_publications;
+		DELETE FROM client_schema_migrations WHERE version >= 20;
+		CREATE VIEW pending_candidates AS SELECT worktree,candidate_commit FROM pending_publications`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeClientSchema(t.Context(), db); err == nil || !strings.Contains(err.Error(), "unexpected trigger or view") {
+		t.Fatalf("invalid v19 pre-migration schema error=%v", err)
+	}
+	var version int
+	if err := db.QueryRow("SELECT MAX(version) FROM client_schema_migrations").Scan(&version); err != nil || version != 19 {
+		t.Fatalf("failed validation changed migration version=%d err=%v", version, err)
+	}
 }
 
 func TestPendingPublicationV17DeletionConfirmationMigration(t *testing.T) {
@@ -480,24 +548,24 @@ func TestPendingPublicationV17DeletionConfirmationMigration(t *testing.T) {
 	}
 	var columns, version, rows int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pending_publications') WHERE name IN
-		('deletion_count','tracked_count','requires_delete_confirmation','delete_confirmed',
+		('expected_head','deletion_count','tracked_count','requires_delete_confirmation','delete_confirmed',
 		'legacy_revalidation_required')`).Scan(&columns); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow("SELECT MAX(version) FROM client_schema_migrations").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pending_publications WHERE worktree='/work' AND deletion_count=0
-		AND tracked_count=0 AND requires_delete_confirmation=0 AND delete_confirmed=0
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pending_publications WHERE worktree='/work' AND expected_head=base_commit
+		AND deletion_count=0 AND tracked_count=0 AND requires_delete_confirmation=0 AND delete_confirmed=0
 		AND legacy_revalidation_required=1`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if columns != 5 || version != clientSchemaVersion || rows != 1 {
+	if columns != 6 || version != clientSchemaVersion || rows != 1 {
 		t.Fatalf("columns=%d version=%d preserved_rows=%d", columns, version, rows)
 	}
 	for _, values := range []string{
-		"'/bad','base','root','etag','candidate','root',X'00',1,20,0,0,1",
-		"'/bad','base','root','etag','candidate','root',X'00',1,20,0,1,0",
+		"'/bad','base','root','base','etag','candidate','root',X'00',1,20,0,0,1",
+		"'/bad','base','root','base','etag','candidate','root',X'00',1,20,0,1,0",
 	} {
 		if _, err := db.Exec("INSERT INTO pending_publications VALUES(" + values + ")"); err == nil {
 			t.Fatal("pending publication CHECK accepted inconsistent legacy or confirmation state")

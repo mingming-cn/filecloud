@@ -35,6 +35,7 @@ type libraryClientConfig struct {
 	syncFile                        func(*os.File) error
 	syncDirectory                   func(string) error
 	beforeHeadCAS                   func() error
+	afterPendingReplacement         func() error
 	beforeCheckoutMaterialize       func() error
 	beforeCheckoutBaseCommit        func() error
 	afterCheckoutBaseCommit         func() error
@@ -1134,7 +1135,7 @@ func initializeClientDB(ctx context.Context, clientDir string, syncDir func(stri
 	return db, nil
 }
 
-const clientSchemaVersion = 19
+const clientSchemaVersion = 20
 
 var legacyClientV12Columns = map[string][]string{
 	"bindings":             {"server_url|TEXT|1||0", "library_id|TEXT|1||0", "worktree|TEXT|1||1", "user_id|TEXT|1||0", "device_id|TEXT|1||0", "sync_base_commit|TEXT|1||0", "sync_base_root|TEXT|1||0", "head_etag|TEXT|1||0", "access_token|BLOB|1||0"},
@@ -1183,12 +1184,35 @@ const clientV19PendingSQL = `CREATE TABLE pending_publications (
 		requires_delete_confirmation = (deletion_count > 100 OR (tracked_count > 0 AND
 		deletion_count >= tracked_count / 10 + CASE WHEN tracked_count % 10 = 0 THEN 0 ELSE 1 END)))))`
 
+const clientV20PendingSQL = `CREATE TABLE pending_publications (
+	worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL, base_root TEXT NOT NULL,
+	expected_head TEXT NOT NULL, expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL,
+	candidate_root TEXT NOT NULL, candidate_data BLOB NOT NULL, deletion_count INTEGER NOT NULL DEFAULT 0,
+	tracked_count INTEGER NOT NULL DEFAULT 0, requires_delete_confirmation INTEGER NOT NULL DEFAULT 0,
+	delete_confirmed INTEGER NOT NULL DEFAULT 0, legacy_revalidation_required INTEGER NOT NULL DEFAULT 0,
+	CHECK(deletion_count >= 0 AND tracked_count >= deletion_count),
+	CHECK(requires_delete_confirmation IN (0, 1) AND delete_confirmed IN (0, 1)
+		AND legacy_revalidation_required IN (0, 1)),
+	CHECK((legacy_revalidation_required = 1 AND deletion_count = 0 AND tracked_count = 0
+		AND requires_delete_confirmation = 0 AND delete_confirmed = 0) OR
+		(legacy_revalidation_required = 0 AND delete_confirmed <= requires_delete_confirmation AND
+		requires_delete_confirmation = (deletion_count > 100 OR (tracked_count > 0 AND
+		deletion_count >= tracked_count / 10 + CASE WHEN tracked_count % 10 = 0 THEN 0 ELSE 1 END)))))`
+
 var clientV19PendingColumns = []string{
 	"0|worktree|TEXT|1||1", "1|base_commit|TEXT|1||0", "2|base_root|TEXT|1||0",
 	"3|expected_etag|TEXT|1||0", "4|candidate_commit|TEXT|1||0", "5|candidate_root|TEXT|1||0",
 	"6|candidate_data|BLOB|1||0", "7|deletion_count|INTEGER|1|0|0", "8|tracked_count|INTEGER|1|0|0",
 	"9|requires_delete_confirmation|INTEGER|1|0|0", "10|delete_confirmed|INTEGER|1|0|0",
 	"11|legacy_revalidation_required|INTEGER|1|0|0",
+}
+
+var clientV20PendingColumns = []string{
+	"0|worktree|TEXT|1||1", "1|base_commit|TEXT|1||0", "2|base_root|TEXT|1||0",
+	"3|expected_head|TEXT|1||0", "4|expected_etag|TEXT|1||0", "5|candidate_commit|TEXT|1||0",
+	"6|candidate_root|TEXT|1||0", "7|candidate_data|BLOB|1||0", "8|deletion_count|INTEGER|1|0|0",
+	"9|tracked_count|INTEGER|1|0|0", "10|requires_delete_confirmation|INTEGER|1|0|0",
+	"11|delete_confirmed|INTEGER|1|0|0", "12|legacy_revalidation_required|INTEGER|1|0|0",
 }
 
 var legacyClientV12Indexes = map[string][]string{
@@ -1234,13 +1258,21 @@ type clientSchemaQuerier interface {
 }
 
 func validateClientV19Schema(ctx context.Context, db clientSchemaQuerier) error {
+	return validatePendingPublicationSchema(ctx, db, 19, clientV19PendingSQL, clientV19PendingColumns)
+}
+
+func validateClientV20Schema(ctx context.Context, db clientSchemaQuerier) error {
+	return validatePendingPublicationSchema(ctx, db, 20, clientV20PendingSQL, clientV20PendingColumns)
+}
+
+func validatePendingPublicationSchema(ctx context.Context, db clientSchemaQuerier, version int, expectedSQL string, expectedColumns []string) error {
 	var createSQL string
 	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema
 		WHERE type='table' AND name='pending_publications'`).Scan(&createSQL); err != nil {
-		return fmt.Errorf("read v19 pending publication schema: %w", err)
+		return fmt.Errorf("read v%d pending publication schema: %w", version, err)
 	}
-	if canonicalSQLiteSQL(createSQL) != canonicalSQLiteSQL(clientV19PendingSQL) {
-		return errors.New("v19 pending publication canonical SQL changed")
+	if canonicalSQLiteSQL(createSQL) != canonicalSQLiteSQL(expectedSQL) {
+		return fmt.Errorf("v%d pending publication canonical SQL changed", version)
 	}
 	rows, err := db.QueryContext(ctx, `SELECT cid,name,type,[notnull],COALESCE(dflt_value,''),pk
 		FROM pragma_table_info('pending_publications') ORDER BY cid`)
@@ -1260,13 +1292,13 @@ func validateClientV19Schema(ctx context.Context, db clientSchemaQuerier) error 
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return err
 	}
-	if strings.Join(columns, "\n") != strings.Join(clientV19PendingColumns, "\n") {
-		return errors.New("v19 pending publication column fingerprint changed")
+	if strings.Join(columns, "\n") != strings.Join(expectedColumns, "\n") {
+		return fmt.Errorf("v%d pending publication column fingerprint changed", version)
 	}
 	var indexes int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('pending_publications')
 		WHERE [unique]=1 AND origin='pk' AND partial=0`).Scan(&indexes); err != nil || indexes != 1 {
-		return errors.Join(errors.New("v19 pending publication primary index fingerprint changed"), err)
+		return errors.Join(fmt.Errorf("v%d pending publication primary index fingerprint changed", version), err)
 	}
 	var allIndexes, worktreeIndexes int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('pending_publications')`).Scan(&allIndexes); err != nil {
@@ -1279,7 +1311,7 @@ func validateClientV19Schema(ctx context.Context, db clientSchemaQuerier) error 
 		return err
 	}
 	if allIndexes != 1 || worktreeIndexes != 1 {
-		return errors.New("v19 pending publication index fingerprint changed")
+		return fmt.Errorf("v%d pending publication index fingerprint changed", version)
 	}
 	var unsafeObjects int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema
@@ -1445,6 +1477,9 @@ func validateClientSchemaVersion(ctx context.Context, db *sql.DB) error {
 	}
 	version := versions[len(versions)-1]
 	if version == clientSchemaVersion {
+		return validateClientV20Schema(ctx, db)
+	}
+	if version == 19 {
 		return validateClientV19Schema(ctx, db)
 	}
 	if version == 17 || version == 18 {
@@ -1683,7 +1718,7 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		return fail(err)
 	}
 	if pendingPublications == 0 {
-		if _, err := tx.ExecContext(ctx, clientV19PendingSQL); err != nil {
+		if _, err := tx.ExecContext(ctx, clientV20PendingSQL); err != nil {
 			return fail(err)
 		}
 	}
@@ -1777,16 +1812,39 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 	} else if pendingDeletionColumns != 5 {
 		return fail(errors.New("pending publication deletion schema is incomplete"))
 	}
+	var expectedHeadColumn int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('pending_publications')
+		WHERE name='expected_head'`).Scan(&expectedHeadColumn); err != nil {
+		return fail(err)
+	}
+	if expectedHeadColumn == 0 {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE pending_publications RENAME TO old_pending_publications`); err != nil {
+			return fail(err)
+		}
+		if _, err := tx.ExecContext(ctx, clientV20PendingSQL); err != nil {
+			return fail(err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO pending_publications(worktree,base_commit,base_root,expected_head,
+			expected_etag,candidate_commit,candidate_root,candidate_data,deletion_count,tracked_count,
+			requires_delete_confirmation,delete_confirmed,legacy_revalidation_required)
+			SELECT worktree,base_commit,base_root,base_commit,expected_etag,candidate_commit,candidate_root,candidate_data,
+			deletion_count,tracked_count,requires_delete_confirmation,delete_confirmed,legacy_revalidation_required
+			FROM old_pending_publications;
+			DROP TABLE old_pending_publications`); err != nil {
+			return fail(err)
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (13);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (14);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (15);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (16);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (17);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (18);
-		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (19)`); err != nil {
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (19);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (20)`); err != nil {
 		return fail(err)
 	}
-	if err := validateClientV19Schema(ctx, tx); err != nil {
+	if err := validateClientV20Schema(ctx, tx); err != nil {
 		return fail(fmt.Errorf("validate migrated client schema: %w", err))
 	}
 	if err := tx.Commit(); err != nil {

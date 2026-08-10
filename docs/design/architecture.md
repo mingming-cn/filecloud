@@ -198,7 +198,7 @@ stateDiagram-v2
 
 恢复 pending publication 时先读取远端 Head，再根据工作树变化决定是否丢弃候选：若等于 CommitId 且工作树仍等于候选 root，直接完成发布；若工作树已变化，则从远端候选 Commit/Directory 元数据重建 Sync Base 和路径索引、清除 pending，但不修改工作树，并要求重跑同步以把当前本地变化发布为后继提交。若 CommitId 是当前 Head 的可达祖先，说明它已发布且被后继提交包含，继续现有后继处理；若远端仍等于 ExpectedHead，才允许按候选状态重试 CAS；否则进入三方合并。祖先检查沿 parent 图执行并受与 Head 验证相同的深度和工作量预算约束。
 
-每次 `HeadConflict` 都以前一次请求的 ExpectedHead 作为新 Base、以上一次候选作为 Local、以最新 Head 作为 Remote 重新合并；上传新对象后，在下一次 CAS 前原子替换 pending publication。不得一直使用最初 Sync Base 重放合并。只有 Sync Base 推进后才能清除 pending 状态。
+每次 `HeadConflict` 都以前一次请求的 ExpectedHead 作为新 Base、以上一次候选作为 Local、以最新 Head 作为 Remote 重新合并；替换后的 `Base/BaseRoot` 精确记录旧 `ExpectedHead` 及其已验证根，`ExpectedHead/ExpectedETag` 精确记录最新 Head CAS 对，合并 Commit 的 parents 固定为 `[最新 Head, 旧 Candidate]`。上传新对象后，在下一次 CAS 前原子替换 pending publication。不得一直使用最初 Sync Base 重放合并。只有 Sync Base 推进后才能清除 pending 状态。
 
 ### 下载与 checkout
 
