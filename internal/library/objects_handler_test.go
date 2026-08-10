@@ -29,8 +29,17 @@ func TestMetadataObjectHTTPContract(t *testing.T) {
 	path := "/v1/libraries/" + libraryID + "/objects/files/" + id
 	response := serve(handler, http.MethodPut, path, `{"Version":1,"Type":"File","Size":"0","Blocks":[]}`, _ownerToken)
 	assertStatusCode(t, response, 201, 0)
+	var metadataPut struct{ Object struct{ Created bool } }
+	decode(t, response, &metadataPut)
+	if !metadataPut.Object.Created {
+		t.Fatal("first metadata PUT returned Created:false")
+	}
 	response = serve(handler, http.MethodPut, path, canonical, _ownerToken)
 	assertStatusCode(t, response, 200, 0)
+	decode(t, response, &metadataPut)
+	if metadataPut.Object.Created {
+		t.Fatal("replayed metadata PUT returned Created:true")
+	}
 
 	response = serve(handler, http.MethodGet, path, "", _ownerToken)
 	if response.Code != 200 || response.Body.String() != canonical || response.Header().Get("Content-Type") != "application/json" ||
@@ -84,8 +93,17 @@ func TestBlockHTTPContract(t *testing.T) {
 
 	response := serveBlock(handler, http.MethodPut, path, data, int64(len(data)), _ownerToken)
 	assertStatusCode(t, response, 201, 0)
+	var blockPut struct{ Block struct{ Created bool } }
+	decode(t, response, &blockPut)
+	if !blockPut.Block.Created {
+		t.Fatal("first block PUT returned Created:false")
+	}
 	response = serveBlock(handler, http.MethodPut, path, data, int64(len(data)), _ownerToken)
 	assertStatusCode(t, response, 200, 0)
+	decode(t, response, &blockPut)
+	if blockPut.Block.Created {
+		t.Fatal("replayed block PUT returned Created:true")
+	}
 	response = serveBlock(handler, http.MethodGet, path, nil, 0, _ownerToken)
 	if response.Code != 200 || !bytes.Equal(response.Body.Bytes(), data) || response.Header().Get("Content-Type") != "application/octet-stream" ||
 		response.Header().Get("Content-Length") != "1" || response.Header().Get("ETag") != `"`+id+`"` ||
@@ -112,6 +130,75 @@ func TestBlockHTTPContract(t *testing.T) {
 	assertStatusCode(t, serveBlock(handler, http.MethodGet, "/v1/libraries/"+libraryID+"/blocks/"+extraID, nil, 0, _ownerToken), 404, 2000)
 	assertStatusCode(t, serveBlock(handler, http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+strings.Repeat("c", 64), nil, (4<<20)+1, _ownerToken), 413, 3005)
 	assertStatusCode(t, serveBlock(handler, http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+strings.Repeat("d", 64), []byte("x"), 1, _ownerToken), 422, 3004)
+}
+
+func TestBlockResponseLossReplayReturnsCreatedFalse(t *testing.T) {
+	handler, store, _ := newTestHandler(t)
+	defer closeStore(t, store)
+	libraryID := "01234567-89ab-4def-8123-456789abcdef"
+	assertStatusCode(t, serve(handler, http.MethodPut, "/v1/libraries/"+libraryID, `{"Name":"response loss"}`, _ownerToken), 201, 0)
+	data := []byte("durable replay")
+	id := digestBytes(data)
+	lost := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && !lost {
+			lost = true
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, r)
+			connection, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack response-loss PUT: %v", err)
+				return
+			}
+			_ = connection.Close()
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	path := server.URL + "/v1/libraries/" + libraryID + "/blocks/" + id
+	request, err := http.NewRequest(http.MethodPut, path, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set("Authorization", "Bearer "+_ownerToken)
+	if response, err := server.Client().Do(request); err == nil {
+		response.Body.Close()
+		t.Fatal("lost PUT response was received")
+	}
+	request, err = http.NewRequest(http.MethodPut, path, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set("Authorization", "Bearer "+_ownerToken)
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var replay struct {
+		RetCode int
+		Block   struct{ Created bool }
+	}
+	if err := json.NewDecoder(response.Body).Decode(&replay); err != nil || response.StatusCode != http.StatusOK || replay.RetCode != 0 || replay.Block.Created {
+		t.Fatalf("replay response=%d %+v err=%v", response.StatusCode, replay, err)
+	}
+	get := serveBlock(handler, http.MethodGet, "/v1/libraries/"+libraryID+"/blocks/"+id, nil, 0, _ownerToken)
+	if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), data) {
+		t.Fatalf("replayed object bytes=%q status=%d", get.Body.Bytes(), get.Code)
+	}
+	head := serve(handler, http.MethodGet, "/v1/libraries/"+libraryID+"/head", "", _ownerToken)
+	var headEnvelope struct {
+		Head struct {
+			CommitID *string `json:"CommitId"`
+		}
+	}
+	decode(t, head, &headEnvelope)
+	if head.Code != http.StatusOK || headEnvelope.Head.CommitID != nil {
+		t.Fatalf("response-loss object PUT changed Head: %d %+v", head.Code, headEnvelope.Head)
+	}
 }
 
 func TestObjectHTTPWireContract(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -170,6 +171,103 @@ func TestLibrarySyncRetriesPersistedCandidateAfterCASFailure(t *testing.T) {
 	if binding.SyncBase != candidate {
 		t.Fatalf("retry replaced candidate: got=%s want=%s", binding.SyncBase, candidate)
 	}
+}
+
+func TestLibrarySyncInterrupted100MiBUploadSendsOnlyMissingBlocks(t *testing.T) {
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	var mu sync.Mutex
+	attempts := make(map[string]int)
+	persisted := make(map[string]bool)
+	var interrupt atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/blocks/") {
+			id := filepath.Base(r.URL.Path)
+			mu.Lock()
+			attempts[id]++
+			completed := len(persisted)
+			mu.Unlock()
+			if interrupt.Load() && completed == 10 {
+				http.Error(w, "interrupted", http.StatusServiceUnavailable)
+				interrupt.Store(false)
+				return
+			}
+			environment.handler.ServeHTTP(w, r)
+			mu.Lock()
+			persisted[id] = true
+			mu.Unlock()
+			return
+		}
+		environment.handler.ServeHTTP(w, r)
+	}))
+	defer proxy.Close()
+
+	clientDir, worktree := newClientPaths(t)
+	args := append(bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testClientDeviceID), "--import-local")
+	if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	before := readTestBinding(t, clientDir, worktree)
+	mu.Lock()
+	clear(attempts)
+	clear(persisted)
+	mu.Unlock()
+	file, err := os.Create(filepath.Join(worktree, "large.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := make(map[string]bool, 25)
+	for index := range 25 {
+		block := bytes.Repeat([]byte{byte(index)}, object.MaxBlockSize)
+		expected[object.ID(block)] = true
+		if _, err := file.Write(block); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	interrupt.Store(true)
+	if err := syncTestWorktree(t, clientDir, worktree); err == nil {
+		t.Fatal("interrupted upload succeeded")
+	}
+	if after := readTestBinding(t, clientDir, worktree); after != before {
+		t.Fatalf("interrupted upload changed Base: before=%+v after=%+v", before, after)
+	}
+	head, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	if err != nil || head.CommitID == nil || *head.CommitID != before.SyncBase {
+		t.Fatalf("interrupted upload changed Head: head=%+v err=%v", head, err)
+	}
+	mu.Lock()
+	firstPersisted := make(map[string]bool, len(persisted))
+	for id := range persisted {
+		if expected[id] {
+			firstPersisted[id] = true
+		}
+	}
+	mu.Unlock()
+	if len(firstPersisted) != 10 {
+		t.Fatalf("persisted blocks=%d, want 10", len(firstPersisted))
+	}
+	if err := syncTestWorktree(t, clientDir, worktree); err != nil {
+		t.Fatalf("resume interrupted upload: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for id := range firstPersisted {
+		if attempts[id] != 1 {
+			t.Fatalf("persisted block %s PUT count=%d, want 1", id, attempts[id])
+		}
+	}
+	for id := range expected {
+		if !persisted[id] {
+			t.Fatalf("block %s was not persisted", id)
+		}
+	}
+	if len(expected) != 25 {
+		t.Fatalf("distinct block count=%d, want 25", len(expected))
+	}
+	assertTestConverged(t, environment, clientDir, worktree)
 }
 
 func TestLibrarySyncResolvesLostCASResponse(t *testing.T) {

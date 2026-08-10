@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -151,7 +152,18 @@ func TestLibraryBindCheckoutDownloadAndDiskFailuresRetryFixedTarget(t *testing.T
 			if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blocks/") {
 				count := blockGets.Add(1)
 				if count == 2 && failed.CompareAndSwap(false, true) {
-					http.Error(w, "retry", http.StatusServiceUnavailable)
+					response := httptest.NewRecorder()
+					environment.handler.ServeHTTP(response, r)
+					connection, stream, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Errorf("hijack truncated block response: %v", err)
+						return
+					}
+					body := response.Body.Bytes()
+					_, _ = fmt.Fprintf(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(body))
+					_, _ = stream.Write(body[:len(body)/2])
+					_ = stream.Flush()
+					_ = connection.Close()
 					return
 				}
 			}
@@ -175,6 +187,48 @@ func TestLibraryBindCheckoutDownloadAndDiskFailuresRetryFixedTarget(t *testing.T
 		}
 		if binding := readTestBinding(t, clientDir, worktree); binding.SyncBase != target {
 			t.Fatalf("retry target drifted: %+v target=%s", binding, target)
+		}
+	})
+
+	t.Run("wrong digest", func(t *testing.T) {
+		environment, target, _, _ := importedRemoteCheckout(t)
+		var blockGets atomic.Int32
+		var corrupted atomic.Bool
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blocks/") {
+				blockGets.Add(1)
+				if corrupted.CompareAndSwap(false, true) {
+					response := httptest.NewRecorder()
+					environment.handler.ServeHTTP(response, r)
+					body := response.Body.Bytes()
+					if len(body) != 0 {
+						body[0] ^= 0xff
+					}
+					for key, values := range response.Header() {
+						for _, value := range values {
+							w.Header().Add(key, value)
+						}
+					}
+					w.WriteHeader(response.Code)
+					_, _ = w.Write(body)
+					return
+				}
+			}
+			environment.handler.ServeHTTP(w, r)
+		}))
+		defer proxy.Close()
+		clientDir, worktree := newClientPaths(t)
+		args := bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testOtherDeviceID)
+		if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err == nil {
+			t.Fatal("checkout accepted wrong-digest block")
+		}
+		assertPendingCheckout(t, clientDir, target)
+		assertNoBinding(t, clientDir, worktree)
+		if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+			t.Fatalf("retry wrong-digest block: %v", err)
+		}
+		if blockGets.Load() < 2 {
+			t.Fatalf("wrong-digest block was cached: GET count=%d", blockGets.Load())
 		}
 	})
 
@@ -1288,13 +1342,18 @@ func TestLibraryBindCheckoutPinsHeadAndRejectsSymlinkParent(t *testing.T) {
 		defer proxy.Close()
 		clientDir, worktree := newClientPaths(t)
 		args := bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testOtherDeviceID)
-		if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
-			t.Fatal(err)
+		err = runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "Head advanced") {
+			t.Fatalf("advanced Head checkout error=%v", err)
 		}
 		binding := readTestBinding(t, clientDir, worktree)
 		if !advanced.Load() || binding.SyncBase != target || binding.SyncBaseRoot != targetRoot {
 			t.Fatalf("checkout drifted after Head change: advanced=%v binding=%+v", advanced.Load(), binding)
 		}
+		if err := syncTestWorktree(t, clientDir, worktree); err != nil {
+			t.Fatalf("sync after initial checkout Head advance: %v", err)
+		}
+		assertTestConverged(t, environment, clientDir, worktree)
 	})
 
 	t.Run("symlink parent", func(t *testing.T) {

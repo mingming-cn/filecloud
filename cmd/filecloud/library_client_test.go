@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -33,6 +35,58 @@ const (
 	testClientDeviceID  = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 	testOtherDeviceID   = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
 )
+
+func TestCheckRemoteObjectsRejectsInvalidResponses(t *testing.T) {
+	requestedID := object.ID([]byte("requested"))
+	unexpectedID := object.ID([]byte("unexpected"))
+	tests := []struct {
+		name, response string
+	}{
+		{"missing structure", `{"RetCode":0,"Message":"success"}`},
+		{"wrong field type", `{"RetCode":0,"Message":"success","MissingObjects":"bad"}`},
+		{"unexpected id", `{"RetCode":0,"Message":"success","MissingObjects":[{"ObjectId":"` + unexpectedID + `","ObjectType":"Block"}]}`},
+		{"unexpected type", `{"RetCode":0,"Message":"success","MissingObjects":[{"ObjectId":"` + requestedID + `","ObjectType":"File"}]}`},
+		{"duplicate", `{"RetCode":0,"Message":"success","MissingObjects":[{"ObjectId":"` + requestedID + `","ObjectType":"Block"},{"ObjectId":"` + requestedID + `","ObjectType":"Block"}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, test.response)
+			}))
+			defer server.Close()
+			options := bindOptions{base: mustServerURL(t, server.URL), libraryID: testClientLibraryID, token: []byte("token")}
+			_, err := checkRemoteObjects(t.Context(), options, []clientObjectReference{{ObjectID: requestedID, ObjectType: "Block"}})
+			if err == nil || !strings.Contains(err.Error(), "invalid object checks response") {
+				t.Fatalf("invalid response error=%v", err)
+			}
+		})
+	}
+}
+
+func TestCheckRemoteObjectsBatchesAt1000(t *testing.T) {
+	var batchSizes []int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct{ Objects []clientObjectReference }
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode object checks request: %v", err)
+			return
+		}
+		batchSizes = append(batchSizes, len(request.Objects))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"RetCode":0,"Message":"success","MissingObjects":[],"OptionalFutureField":true}`)
+	}))
+	defer server.Close()
+	references := make([]clientObjectReference, 1001)
+	for index := range references {
+		references[index] = clientObjectReference{ObjectID: object.ID([]byte(fmt.Sprintf("object-%d", index))), ObjectType: "Block"}
+	}
+	options := bindOptions{base: mustServerURL(t, server.URL), libraryID: testClientLibraryID, token: []byte("token")}
+	missing, err := checkRemoteObjects(t.Context(), options, references)
+	if err != nil || len(missing) != 0 || len(batchSizes) != 2 || batchSizes[0] != 1000 || batchSizes[1] != 1 {
+		t.Fatalf("object check batches=%v missing=%v err=%v", batchSizes, missing, err)
+	}
+}
 
 func TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly(t *testing.T) {
 	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})

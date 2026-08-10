@@ -394,13 +394,46 @@ func rescanRoot(options bindOptions, expected string) (worktreeSnapshot, error) 
 	return snapshot, nil
 }
 
+type clientObjectReference struct {
+	ObjectID   string `json:"ObjectId"`
+	ObjectType string `json:"ObjectType"`
+}
+
 func uploadSnapshot(ctx context.Context, options bindOptions, snapshot worktreeSnapshot) error {
+	references := make([]clientObjectReference, 0, len(snapshot.blocks)+len(snapshot.objects))
+	seen := make(map[string]bool, cap(references))
+	add := func(kind, id string) {
+		key := kind + "\x00" + id
+		if !seen[key] {
+			seen[key] = true
+			references = append(references, clientObjectReference{ObjectID: id, ObjectType: clientObjectType(kind)})
+		}
+	}
+	for id := range snapshot.blocks {
+		add("blocks", id)
+	}
+	for _, value := range snapshot.objects {
+		add(value.kind, value.id)
+	}
+	sort.Slice(references, func(i, j int) bool {
+		if references[i].ObjectType != references[j].ObjectType {
+			return references[i].ObjectType < references[j].ObjectType
+		}
+		return references[i].ObjectID < references[j].ObjectID
+	})
+	missing, err := checkRemoteObjects(ctx, options, references)
+	if err != nil {
+		return err
+	}
 	ids := make([]string, 0, len(snapshot.blocks))
 	for id := range snapshot.blocks {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
+		if !missing["blocks\x00"+id] {
+			continue
+		}
 		data, err := options.worktreeRoot.readBlock(snapshot.blocks[id], id)
 		if err != nil {
 			return err
@@ -410,11 +443,93 @@ func uploadSnapshot(ctx context.Context, options bindOptions, snapshot worktreeS
 		}
 	}
 	for _, value := range snapshot.objects {
+		key := value.kind + "\x00" + value.id
+		if !missing[key] {
+			continue
+		}
 		if err := putMetadata(ctx, options.base, options.libraryID, options.token, value.kind, value.id, value.data); err != nil {
 			return err
 		}
+		delete(missing, key)
 	}
 	return nil
+}
+
+func clientObjectType(kind string) string {
+	switch kind {
+	case "blocks":
+		return "Block"
+	case "files":
+		return "File"
+	case "directories":
+		return "Directory"
+	case "commits":
+		return "Commit"
+	default:
+		return ""
+	}
+}
+
+func clientObjectKind(typeName string) string {
+	switch typeName {
+	case "Block":
+		return "blocks"
+	case "File":
+		return "files"
+	case "Directory":
+		return "directories"
+	case "Commit":
+		return "commits"
+	default:
+		return ""
+	}
+}
+
+func checkRemoteObjects(ctx context.Context, options bindOptions, references []clientObjectReference) (map[string]bool, error) {
+	missing := make(map[string]bool)
+	for start := 0; start < len(references); start += 1000 {
+		end := min(start+1000, len(references))
+		body, err := json.Marshal(struct {
+			Objects []clientObjectReference
+		}{Objects: references[start:end]})
+		if err != nil {
+			return nil, fmt.Errorf("encode object checks: %w", err)
+		}
+		request, err := authenticatedRequest(ctx, http.MethodPost, options.base.JoinPath("v1/libraries", options.libraryID, "object-checks").String(), options.token, body)
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		status, data, _, err := doClientRequest(request)
+		if err != nil {
+			return nil, fmt.Errorf("check remote objects: %w", err)
+		}
+		if status != http.StatusOK {
+			return nil, fmt.Errorf("check remote objects failed: server returned %s", http.StatusText(status))
+		}
+		var response struct {
+			RetCode        *int
+			Message        *string
+			MissingObjects *[]clientObjectReference
+		}
+		if err := json.Unmarshal(data, &response); err != nil || response.RetCode == nil || *response.RetCode != 0 ||
+			response.Message == nil || response.MissingObjects == nil {
+			return nil, errors.New("invalid object checks response")
+		}
+		requested := make(map[string]bool, end-start)
+		for _, reference := range references[start:end] {
+			requested[clientObjectKind(reference.ObjectType)+"\x00"+reference.ObjectID] = true
+		}
+		for _, reference := range *response.MissingObjects {
+			kind := clientObjectKind(reference.ObjectType)
+			key := kind + "\x00" + reference.ObjectID
+			if kind == "" || !object.ValidID(reference.ObjectID) || !requested[key] || missing[key] {
+				return nil, errors.New("invalid object checks response")
+			}
+			missing[key] = true
+		}
+	}
+	return missing, nil
 }
 
 func newImportIntent(options bindOptions, owner string, head remoteHead, root string, now func() time.Time) (*bindIntent, error) {

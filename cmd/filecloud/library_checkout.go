@@ -140,6 +140,13 @@ func runInitialCheckout(ctx context.Context, db *sql.DB, options bindOptions, ow
 	if err := finalizeCheckout(ctx, db, options, *pending); err != nil {
 		return err
 	}
+	latest, err := getRemoteHead(ctx, options.base, options.libraryID, options.token)
+	if err != nil {
+		return fmt.Errorf("verify library Head after checkout: %w", err)
+	}
+	if latest.CommitID == nil || *latest.CommitID != pending.TargetCommit {
+		return errors.New("library Head advanced during checkout; rerun sync")
+	}
 	_, err = fmt.Fprintf(stdout, "library bound: %s\n", options.worktree)
 	return err
 }
