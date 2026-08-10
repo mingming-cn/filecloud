@@ -80,15 +80,16 @@
 
 对每个 checkout 文件系统动作，在以下位置强制终止客户端并重启：
 
-1. journal Intent 提交前。
-2. Intent 提交后、WAL 同步前。
-3. WAL 同步后、rename 前。
-4. rename 后、父目录同步前。
+1. journal Intent 已 INSERT、事务 COMMIT 前（非持久边界）。
+2. Intent COMMIT 返回后、文件系统动作前（持久边界）。
+3. create 的 `mkdir/open(O_EXCL)` 成功后、identity UPDATE 前（`between_create_identity`）；重启必须把未知 inode 自动移到可见 recovery leaf，禁止收养或删除。预建 file/directory 可见名碰撞并在每次 successor Intent 提交后 `SIGKILL`，恢复必须递增有界后缀且保持所有碰撞内容不变。
+4. 动作后、父目录同步前。
 5. 父目录同步后、Completed 提交前。
-6. 全部文件完成后、Sync Base 事务前。
-7. Sync Base 事务后、内部恢复路径清理前。
+6. Completed 提交后。
+7. 全部文件完成后、Sync Base 事务提交前后。
+8. 内部恢复路径完成后、cleanup metadata 事务提交前后。
 
-重启必须仅依据 journal 和路径存在组合幂等完成或回滚；不得误删用户路径、提前推进 Sync Base 或遗留未登记内部文件。
+SQLite WAL 与 `synchronous=FULL` 的同步发生在 COMMIT 内部；SQLite 不提供受支持的 intra-COMMIT 故障 hook，因此测试只在 COMMIT 调用前和成功返回后夹住非持久/持久边界，不宣称覆盖“WAL 同步中途”。重启必须仅依据 journal 和路径存在组合幂等完成或回滚；不得误删用户路径、提前推进 Sync Base 或遗留未登记内部文件。子进程故障注入统一使用 `SIGKILL`，只证明进程崩溃恢复；断电持久性仍需外部电源切断与 ext4 硬件测试，不能由进程测试宣称已经证明。
 
 服务端对象写入在临时文件写入、文件同步、no-replace、父目录同步和 Head 条件 UPDATE 前后执行同类故障注入。旧 Head 必须始终可读；新 Head 一旦可见，其当前快照必须完整。
 

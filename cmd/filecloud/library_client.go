@@ -36,6 +36,8 @@ type libraryClientConfig struct {
 	syncDirectory                   func(string) error
 	beforeHeadCAS                   func() error
 	beforeCheckoutMaterialize       func() error
+	beforeCheckoutBaseCommit        func() error
+	afterCheckoutBaseCommit         func() error
 	beforeCheckoutTempIdentity      func() error
 	beforeCheckoutFileWrite         func(string, string) error
 	beforeCheckoutFileRename        func(string, string) error
@@ -54,6 +56,8 @@ type libraryClientConfig struct {
 	beforeFlock                     func()
 	afterLock                       func()
 	scanFault                       func(scanFault) error
+	fsActionFault                   fsActionFault
+	fsTransactionFault              func(string) error
 }
 
 func normalizeLibraryClientConfig(config libraryClientConfig) libraryClientConfig {
@@ -188,10 +192,10 @@ func parseLibraryBind(ctx context.Context, args []string, stdin io.Reader, stder
 	}
 	if !*importLocal {
 		if emptyErr := worktreeRoot.validateEmpty(); emptyErr != nil {
-			pending, pendingErr := pendingCheckoutExists(ctx, canonicalClientDir, canonicalWorktree)
-			if pendingErr != nil || !pending {
+			resumable, stateErr := resumableBindExists(ctx, canonicalClientDir, canonicalWorktree)
+			if stateErr != nil || !resumable {
 				clear(token)
-				return bindOptions{}, errors.Join(emptyErr, pendingErr, worktreeRoot.Close())
+				return bindOptions{}, errors.Join(emptyErr, stateErr, worktreeRoot.Close())
 			}
 		}
 	} else if _, err := scanWorktreeWithConfig(worktreeRoot, worktreeScanConfig{fault: config.scanFault}); err != nil {
@@ -231,12 +235,12 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 	if config.afterLock != nil {
 		config.afterLock()
 	}
-	recoveringCheckout, err := pendingCheckoutExists(ctx, options.clientDir, options.worktree)
+	recoveringBind, err := resumableBindExists(ctx, options.clientDir, options.worktree)
 	if err != nil {
 		return err
 	}
 	snapshot := worktreeSnapshot{root: emptyRoot}
-	if !recoveringCheckout {
+	if !recoveringBind {
 		snapshot, err = scanWorktreeWithConfig(options.worktreeRoot, options.scanConfig)
 		if err != nil {
 			return fmt.Errorf("scan worktree: %w", err)
@@ -258,6 +262,9 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, db.Close()) }()
+	if err := recoverFSActions(ctx, db, options.worktree, options.worktreeRoot, config.fsActionFault); err != nil {
+		return fmt.Errorf("recover checkout filesystem actions: %w", err)
+	}
 	existing, intent, err := inspectBinding(ctx, db, options.serverURL, options.libraryID, options.worktree)
 	if err != nil {
 		return err
@@ -745,6 +752,9 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, root.Close()) }()
+	if err := recoverFSActions(ctx, db, binding.Worktree, root, config.fsActionFault); err != nil {
+		return fmt.Errorf("recover checkout filesystem actions: %w", err)
+	}
 	tracked, err := loadTrackedPaths(ctx, db, binding.Worktree)
 	if err != nil {
 		return err
@@ -833,7 +843,10 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 			return err
 		}
 		if err == nil {
-			cleanupErr := cleanupCheckoutTemps(root, temps)
+			cleanupErr := recoverFSActions(ctx, db, canonicalWorktree, root, config.fsActionFault)
+			if cleanupErr == nil {
+				cleanupErr = cleanupCheckoutTemps(ctx, db, root, canonicalWorktree, fsPhaseRollback, temps, config.fsActionFault)
+			}
 			if closeErr := root.Close(); cleanupErr != nil || closeErr != nil {
 				return errors.Join(cleanupErr, closeErr)
 			}
@@ -844,22 +857,32 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 	if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
 		return stateErr
 	}
-	if stateErr == nil && (applyState == "applying" || applyState == "rolling_back" || applyState == "finalized") {
-		root, err := openWorktreeRoot(canonicalWorktree, config.checkFilesystem)
-		if err != nil {
-			return err
+	if stateErr == nil && (applyState == "pending" || applyState == "applying" || applyState == "rolling_back" || applyState == "finalized") {
+		_, pathErr := os.Lstat(canonicalWorktree)
+		if pathErr != nil && !errors.Is(pathErr, os.ErrNotExist) {
+			return pathErr
 		}
-		var recoveryErr error
-		if applyState == "finalized" {
-			recoveryErr = cleanupSyncRecoveries(ctx, db, root, canonicalWorktree, config)
-		} else {
-			recoveryErr = beginSyncRollback(ctx, db, canonicalWorktree)
-			if recoveryErr == nil {
-				recoveryErr = rollbackSyncApply(ctx, db, root, canonicalClientDir, canonicalWorktree, config)
+		if pathErr == nil {
+			root, err := openWorktreeRoot(canonicalWorktree, config.checkFilesystem)
+			if err != nil {
+				return err
 			}
-		}
-		if closeErr := root.Close(); recoveryErr != nil || closeErr != nil {
-			return errors.Join(recoveryErr, closeErr)
+			var recoveryErr error
+			if err := recoverFSActions(ctx, db, canonicalWorktree, root, config.fsActionFault); err != nil {
+				recoveryErr = err
+			} else if applyState == "finalized" {
+				recoveryErr = cleanupSyncRecoveries(ctx, db, root, canonicalWorktree, config)
+			} else {
+				if applyState == "applying" || applyState == "rolling_back" {
+					recoveryErr = beginSyncRollback(ctx, db, canonicalWorktree)
+				}
+				if recoveryErr == nil {
+					recoveryErr = rollbackSyncApply(ctx, db, root, canonicalClientDir, canonicalWorktree, config)
+				}
+			}
+			if closeErr := root.Close(); recoveryErr != nil || closeErr != nil {
+				return errors.Join(recoveryErr, closeErr)
+			}
 		}
 	}
 	tx, err := db.BeginTx(ctx, nil)
@@ -901,6 +924,20 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM path_index WHERE worktree = ?", canonicalWorktree); err != nil {
 		return errors.Join(fmt.Errorf("remove path index: %w", err), tx.Rollback())
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM fs_actions WHERE worktree = ? AND state = 'completed' AND origin_action_id IS NOT NULL", canonicalWorktree); err != nil {
+		return errors.Join(fmt.Errorf("remove completed filesystem preserve journal: %w", err), tx.Rollback())
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM fs_actions WHERE worktree = ? AND state = 'completed'", canonicalWorktree); err != nil {
+		return errors.Join(fmt.Errorf("remove completed filesystem journal: %w", err), tx.Rollback())
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM fs_journal_bindings WHERE worktree = ?
+		AND NOT EXISTS (SELECT 1 FROM fs_actions WHERE fs_actions.worktree = fs_journal_bindings.worktree)`, canonicalWorktree); err != nil {
+		return errors.Join(fmt.Errorf("remove filesystem journal root: %w", err), tx.Rollback())
+	}
+	var incompleteActions int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM fs_actions WHERE worktree = ?", canonicalWorktree).Scan(&incompleteActions); err != nil || incompleteActions != 0 {
+		return errors.Join(errors.New("cannot unbind with incomplete filesystem actions"), err, tx.Rollback())
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit unbind: %w", err)
@@ -1062,11 +1099,24 @@ func initializeClientDB(ctx context.Context, clientDir string, syncDir func(stri
 	if err := file.Close(); err != nil {
 		return nil, fmt.Errorf("close new client database: %w", err)
 	}
+	locks, err := lockClientKeys(ctx, clientDir, []string{lockName("client-database")}, libraryClientConfig{
+		syncDirectory: func(string) error { return nil },
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer locks.Close()
 	db, err := openClientDB(path, false)
 	if err != nil {
 		return nil, err
 	}
+	if err := enableClientDBWAL(ctx, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
 	if err := initializeClientSchema(ctx, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+	if err := assertClientDBDurability(ctx, db); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
 	if err := syncFile(path); err != nil {
@@ -1078,7 +1128,336 @@ func initializeClientDB(ctx context.Context, clientDir string, syncDir func(stri
 	return db, nil
 }
 
+const clientSchemaVersion = 17
+
+var legacyClientV12Columns = map[string][]string{
+	"bindings":             {"server_url|TEXT|1||0", "library_id|TEXT|1||0", "worktree|TEXT|1||1", "user_id|TEXT|1||0", "device_id|TEXT|1||0", "sync_base_commit|TEXT|1||0", "sync_base_root|TEXT|1||0", "head_etag|TEXT|1||0", "access_token|BLOB|1||0"},
+	"bind_intents":         {"server_url|TEXT|1||0", "library_id|TEXT|1||0", "worktree|TEXT|1||1", "user_id|TEXT|1||0", "device_id|TEXT|1||0", "expected_etag|TEXT|1||0", "candidate_commit|TEXT|1||0", "candidate_root|TEXT|1||0", "candidate_data|BLOB|1||0", "import_local|INTEGER|1|0|0"},
+	"pending_checkouts":    {"server_url|TEXT|1||0", "library_id|TEXT|1||0", "worktree|TEXT|1||1", "user_id|TEXT|1||0", "device_id|TEXT|1||0", "target_commit|TEXT|1||0", "target_root|TEXT|1||0", "head_etag|TEXT|1||0", "apply_state|TEXT|1|'pending'|0"},
+	"pending_publications": {"worktree|TEXT|1||1", "base_commit|TEXT|1||0", "base_root|TEXT|1||0", "expected_etag|TEXT|1||0", "candidate_commit|TEXT|1||0", "candidate_root|TEXT|1||0", "candidate_data|BLOB|1||0"},
+	"sync_recoveries":      {"worktree|TEXT|1||1", "path|TEXT|1||2", "recovery_name|TEXT|1||0", "type|TEXT|1||0", "object_id|TEXT|1|''|0", "canonical_mtime|TEXT|1|''|0", "size|INTEGER|1|0|0", "device|INTEGER|1|0|0", "inode|INTEGER|1|0|0", "completed|INTEGER|1|0|0", "tombstone_name|TEXT|1|''|0"},
+	"checkout_paths":       {"worktree|TEXT|1||1", "path|TEXT|1||2", "type|TEXT|1||0", "object_id|TEXT|1||0", "canonical_mtime|TEXT|1||0", "actual_mtime|TEXT|1|''|0", "size|INTEGER|1|0|0", "temp_name|TEXT|1|''|0", "temp_device|INTEGER|1|0|0", "temp_inode|INTEGER|1|0|0", "target_device|INTEGER|1|0|0", "target_inode|INTEGER|1|0|0", "completed|INTEGER|1|0|0", "rollback_name|TEXT|1|''|0"},
+	"path_index":           {"worktree|TEXT|1||1", "path|TEXT|1||2", "type|TEXT|1||0", "object_id|TEXT|1||0", "canonical_mtime|TEXT|1||0", "actual_mtime|TEXT|1||0", "size|INTEGER|1||0"},
+}
+
+var legacyClientV12SQL = map[string]string{
+	"bindings":             `CREATE TABLE bindings (server_url TEXT NOT NULL, library_id TEXT NOT NULL, worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL, sync_base_commit TEXT NOT NULL, sync_base_root TEXT NOT NULL, head_etag TEXT NOT NULL, access_token BLOB NOT NULL, UNIQUE(server_url, library_id))`,
+	"bind_intents":         `CREATE TABLE bind_intents (server_url TEXT NOT NULL, library_id TEXT NOT NULL, worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL, expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL, candidate_root TEXT NOT NULL, candidate_data BLOB NOT NULL, import_local INTEGER NOT NULL DEFAULT 0, UNIQUE(server_url, library_id))`,
+	"pending_checkouts":    `CREATE TABLE pending_checkouts (server_url TEXT NOT NULL, library_id TEXT NOT NULL, worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL, target_commit TEXT NOT NULL, target_root TEXT NOT NULL, head_etag TEXT NOT NULL, apply_state TEXT NOT NULL DEFAULT 'pending', UNIQUE(server_url, library_id))`,
+	"pending_publications": `CREATE TABLE pending_publications (worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL, base_root TEXT NOT NULL, expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL, candidate_root TEXT NOT NULL, candidate_data BLOB NOT NULL)`,
+	"sync_recoveries":      `CREATE TABLE sync_recoveries (worktree TEXT NOT NULL, path TEXT NOT NULL, recovery_name TEXT NOT NULL, type TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '', canonical_mtime TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, device INTEGER NOT NULL DEFAULT 0, inode INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0, tombstone_name TEXT NOT NULL DEFAULT '', PRIMARY KEY(worktree, path))`,
+	"checkout_paths":       `CREATE TABLE checkout_paths (worktree TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, object_id TEXT NOT NULL, canonical_mtime TEXT NOT NULL, actual_mtime TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, temp_name TEXT NOT NULL DEFAULT '', temp_device INTEGER NOT NULL DEFAULT 0, temp_inode INTEGER NOT NULL DEFAULT 0, target_device INTEGER NOT NULL DEFAULT 0, target_inode INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0, rollback_name TEXT NOT NULL DEFAULT '', PRIMARY KEY(worktree, path))`,
+	"path_index":           `CREATE TABLE path_index (worktree TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, object_id TEXT NOT NULL, canonical_mtime TEXT NOT NULL, actual_mtime TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(worktree, path))`,
+}
+
+var legacyClientV12Indexes = map[string][]string{
+	"bindings": {"server_url,library_id", "worktree"}, "bind_intents": {"server_url,library_id", "worktree"},
+	"pending_checkouts": {"server_url,library_id", "worktree"}, "pending_publications": {"worktree"},
+	"sync_recoveries": {"worktree,path"}, "checkout_paths": {"worktree,path"}, "path_index": {"worktree,path"},
+}
+
+func canonicalSQLiteSQL(value string) string {
+	var result strings.Builder
+	var quote byte
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		if quote != 0 {
+			result.WriteByte(char)
+			if (quote == '[' && char == ']') || (quote != '[' && char == quote) {
+				quote = 0
+			}
+			continue
+		}
+		if char == '\'' || char == '"' || char == '`' || char == '[' {
+			quote = char
+			result.WriteByte(char)
+			continue
+		}
+		if char == ' ' || char == '\n' || char == '\r' || char == '\t' {
+			continue
+		}
+		if char >= 'a' && char <= 'z' {
+			char -= 'a' - 'A'
+		}
+		result.WriteByte(char)
+	}
+	return result.String()
+}
+
+func validateLegacyClientV12(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT type, name, COALESCE(sql, '') FROM sqlite_schema
+		WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`)
+	if err != nil {
+		return err
+	}
+	var tables []string
+	for rows.Next() {
+		var objectType, table, createSQL string
+		if err := rows.Scan(&objectType, &table, &createSQL); err != nil {
+			rows.Close()
+			return err
+		}
+		if objectType != "table" {
+			rows.Close()
+			return fmt.Errorf("legacy client schema has unexpected %s %q", objectType, table)
+		}
+		expectedSQL, ok := legacyClientV12SQL[table]
+		if !ok || canonicalSQLiteSQL(createSQL) != canonicalSQLiteSQL(expectedSQL) {
+			rows.Close()
+			return fmt.Errorf("legacy client table %q canonical SQL changed", table)
+		}
+		tables = append(tables, table)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(tables) != len(legacyClientV12Columns) {
+		return errors.New("legacy client schema has an unexpected table set")
+	}
+	for _, table := range tables {
+		expected, ok := legacyClientV12Columns[table]
+		if !ok {
+			return errors.New("legacy client schema has an unknown table")
+		}
+		columnRows, err := db.QueryContext(ctx, "SELECT name, type, [notnull], COALESCE(dflt_value, ''), pk FROM pragma_table_info(?) ORDER BY cid", table)
+		if err != nil {
+			return err
+		}
+		var actual []string
+		for columnRows.Next() {
+			var name, kind, defaultValue string
+			var notnull, primary int
+			if err := columnRows.Scan(&name, &kind, &notnull, &defaultValue, &primary); err != nil {
+				columnRows.Close()
+				return err
+			}
+			actual = append(actual, fmt.Sprintf("%s|%s|%d|%s|%d", name, kind, notnull, defaultValue, primary))
+		}
+		if err := columnRows.Close(); err != nil {
+			return err
+		}
+		if strings.Join(actual, "\n") != strings.Join(expected, "\n") {
+			return fmt.Errorf("legacy client table %q column fingerprint changed", table)
+		}
+		var foreignKeys int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_foreign_key_list(?)", table).Scan(&foreignKeys); err != nil || foreignKeys != 0 {
+			return errors.Join(fmt.Errorf("legacy client table %q foreign-key fingerprint changed", table), err)
+		}
+		indexRows, err := db.QueryContext(ctx, "SELECT name, [unique] FROM pragma_index_list(?) ORDER BY name", table)
+		if err != nil {
+			return err
+		}
+		var indexNames []string
+		for indexRows.Next() {
+			var index string
+			var unique int
+			if err := indexRows.Scan(&index, &unique); err != nil {
+				indexRows.Close()
+				return err
+			}
+			if unique != 1 {
+				indexRows.Close()
+				return fmt.Errorf("legacy client table %q has an unexpected non-unique index", table)
+			}
+			indexNames = append(indexNames, index)
+		}
+		if err := indexRows.Close(); err != nil {
+			return err
+		}
+		var indexes []string
+		for _, index := range indexNames {
+			info, err := db.QueryContext(ctx, "SELECT name FROM pragma_index_info(?) ORDER BY seqno", index)
+			if err != nil {
+				return err
+			}
+			var columns []string
+			for info.Next() {
+				var column string
+				if err := info.Scan(&column); err != nil {
+					info.Close()
+					return err
+				}
+				columns = append(columns, column)
+			}
+			if err := info.Close(); err != nil {
+				return err
+			}
+			indexes = append(indexes, strings.Join(columns, ","))
+		}
+		sort.Strings(indexes)
+		expectedIndexes := append([]string(nil), legacyClientV12Indexes[table]...)
+		sort.Strings(expectedIndexes)
+		if strings.Join(indexes, "\n") != strings.Join(expectedIndexes, "\n") {
+			return fmt.Errorf("legacy client table %q index fingerprint changed", table)
+		}
+	}
+	return nil
+}
+
+func validateClientSchemaVersion(ctx context.Context, db *sql.DB) error {
+	var migrations int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'client_schema_migrations'`).Scan(&migrations); err != nil {
+		return err
+	}
+	if migrations == 0 {
+		var tables int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
+			WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`).Scan(&tables); err != nil {
+			return err
+		}
+		if tables == 0 {
+			return nil
+		}
+		return validateLegacyClientV12(ctx, db)
+	}
+	rows, err := db.QueryContext(ctx, "SELECT version FROM client_schema_migrations ORDER BY version")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var versions []int
+	for rows.Next() {
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			return err
+		}
+		versions = append(versions, version)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(versions) == 0 || versions[0] != 13 {
+		return errors.New("client schema migration history has an unknown baseline or gap")
+	}
+	for index, version := range versions {
+		if version != 13+index || version > clientSchemaVersion {
+			return errors.New("client schema migration history is unknown, gapped, or newer than this client")
+		}
+	}
+	return nil
+}
+
+func migrateFSActionProvenance(ctx context.Context, tx *sql.Tx) error {
+	var hasOrigin int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('fs_actions') WHERE name='origin_action_id'").Scan(&hasOrigin); err != nil {
+		return err
+	}
+	if hasOrigin == 0 {
+		var ambiguous int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM fs_actions
+			WHERE action_outcome IN ('preserve_unknown', 'collision', 'rolled_back')`).Scan(&ambiguous); err != nil {
+			return err
+		}
+		if ambiguous != 0 {
+			return errors.New("legacy filesystem journal contains ambiguous preserve actions")
+		}
+		if _, err := tx.ExecContext(ctx, `DROP INDEX IF EXISTS fs_actions_pending;
+			ALTER TABLE fs_actions RENAME TO old_fs_actions;
+			CREATE TABLE fs_actions (
+				worktree TEXT NOT NULL, action_id TEXT NOT NULL, origin_action_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+				action_order INTEGER NOT NULL, phase TEXT NOT NULL, op TEXT NOT NULL, parent_path TEXT NOT NULL,
+				parent_device INTEGER NOT NULL, parent_inode INTEGER NOT NULL, source_name TEXT NOT NULL,
+				target_name TEXT NOT NULL, expected_kind TEXT NOT NULL, expected_device INTEGER NOT NULL,
+				expected_inode INTEGER NOT NULL, expected_object TEXT NOT NULL DEFAULT '', expected_size INTEGER NOT NULL DEFAULT 0,
+				expected_mtime TEXT NOT NULL DEFAULT '', internal_name TEXT NOT NULL DEFAULT '',
+				internal_source TEXT NOT NULL DEFAULT '', internal_target TEXT NOT NULL DEFAULT '',
+				action_outcome TEXT NOT NULL DEFAULT '', state TEXT NOT NULL,
+				PRIMARY KEY(worktree, action_id), FOREIGN KEY(worktree) REFERENCES fs_journal_bindings(worktree),
+				FOREIGN KEY(worktree, origin_action_id) REFERENCES fs_actions(worktree, action_id),
+				CHECK((origin_action_id IS NOT NULL AND attempt >= 1) OR (origin_action_id IS NULL AND attempt = 0)),
+				CHECK(phase IN ('pre_base', 'rollback', 'post_base')),
+				CHECK(op IN ('create_file', 'create_directory', 'rename', 'unlink', 'rmdir', 'mtime')),
+				CHECK(state IN ('intent', 'completed')), UNIQUE(worktree, action_order));
+			INSERT INTO fs_actions(worktree, action_id, action_order, phase, op, parent_path, parent_device, parent_inode,
+				source_name, target_name, expected_kind, expected_device, expected_inode, expected_object, expected_size,
+				expected_mtime, internal_name, internal_source, internal_target, action_outcome, state)
+			SELECT worktree, action_id, action_order, phase, op, parent_path, parent_device, parent_inode, source_name,
+				target_name, expected_kind, expected_device, expected_inode, expected_object, expected_size, expected_mtime,
+				internal_name, internal_source, internal_target, action_outcome, state FROM old_fs_actions;
+			DROP TABLE old_fs_actions`); err != nil {
+			return fmt.Errorf("migrate filesystem action provenance: %w", err)
+		}
+	}
+	_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS fs_actions_pending ON fs_actions(worktree, phase, state, action_order);
+		CREATE UNIQUE INDEX IF NOT EXISTS fs_actions_preserve_attempt ON fs_actions(worktree, origin_action_id, attempt)
+			WHERE origin_action_id IS NOT NULL`)
+	return err
+}
+
+func migrateCheckoutCreateOrigins(ctx context.Context, tx *sql.Tx) error {
+	type checkoutOrigin struct{ worktree, path, kind, temp string }
+	rows, err := tx.QueryContext(ctx, `SELECT worktree,path,type,temp_name FROM checkout_paths WHERE temp_name<>''`)
+	if err != nil {
+		return err
+	}
+	var paths []checkoutOrigin
+	for rows.Next() {
+		var value checkoutOrigin
+		if err := rows.Scan(&value.worktree, &value.path, &value.kind, &value.temp); err != nil {
+			rows.Close()
+			return err
+		}
+		paths = append(paths, value)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	assigned := make(map[string]string)
+	for _, value := range paths {
+		parent, _ := splitFSActionPath(value.path)
+		op := fsOpCreateFile
+		if value.kind == "Directory" {
+			op = fsOpCreateDirectory
+		}
+		candidates, err := tx.QueryContext(ctx, `SELECT action_id FROM fs_actions WHERE worktree=? AND origin_action_id IS NULL
+			AND parent_path=? AND source_name=? AND expected_kind=? AND op=?`, value.worktree, parent, value.temp, value.kind, op)
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for candidates.Next() {
+			var id string
+			if err := candidates.Scan(&id); err != nil {
+				candidates.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		if err := errors.Join(candidates.Err(), candidates.Close()); err != nil {
+			return err
+		}
+		if len(ids) > 1 {
+			return errors.New("legacy checkout path has ambiguous filesystem creation origins")
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		key := value.worktree + "\x00" + ids[0]
+		if previous, exists := assigned[key]; exists && previous != value.path {
+			return errors.New("legacy filesystem creation origin maps to multiple checkout paths")
+		}
+		assigned[key] = value.path
+		result, err := tx.ExecContext(ctx, `UPDATE checkout_paths SET create_action_id=?
+			WHERE worktree=? AND path=? AND temp_name=? AND type=? AND create_action_id=''`,
+			ids[0], value.worktree, value.path, value.temp, value.kind)
+		if err != nil {
+			return err
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return errors.Join(errors.New("migrate checkout filesystem creation origin"), err)
+		}
+	}
+	return nil
+}
+
 func initializeClientSchema(ctx context.Context, db *sql.DB) error {
+	if err := validateClientSchemaVersion(ctx, db); err != nil {
+		return fmt.Errorf("validate client schema before migration: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		return fmt.Errorf("enable client foreign keys: %w", err)
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("initialize client state: %w", err)
@@ -1086,7 +1465,9 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 	fail := func(err error) error {
 		return errors.Join(fmt.Errorf("initialize client state: %w", err), tx.Rollback())
 	}
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS bindings (
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS client_schema_migrations (
+		version INTEGER PRIMARY KEY NOT NULL);
+	CREATE TABLE IF NOT EXISTS bindings (
 		server_url TEXT NOT NULL, library_id TEXT NOT NULL,
 		worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
 		sync_base_commit TEXT NOT NULL, sync_base_root TEXT NOT NULL, head_etag TEXT NOT NULL,
@@ -1126,7 +1507,29 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 			return fail(err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS pending_checkouts (
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS fs_journal_bindings (
+		worktree TEXT PRIMARY KEY NOT NULL, root_device INTEGER NOT NULL, root_inode INTEGER NOT NULL,
+		journal_format INTEGER NOT NULL);
+	CREATE TABLE IF NOT EXISTS fs_actions (
+		worktree TEXT NOT NULL, action_id TEXT NOT NULL, origin_action_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+		action_order INTEGER NOT NULL,
+		phase TEXT NOT NULL, op TEXT NOT NULL, parent_path TEXT NOT NULL,
+		parent_device INTEGER NOT NULL, parent_inode INTEGER NOT NULL,
+		source_name TEXT NOT NULL, target_name TEXT NOT NULL, expected_kind TEXT NOT NULL,
+		expected_device INTEGER NOT NULL, expected_inode INTEGER NOT NULL,
+		expected_object TEXT NOT NULL DEFAULT '', expected_size INTEGER NOT NULL DEFAULT 0,
+		expected_mtime TEXT NOT NULL DEFAULT '', internal_name TEXT NOT NULL DEFAULT '',
+		internal_source TEXT NOT NULL DEFAULT '', internal_target TEXT NOT NULL DEFAULT '',
+		action_outcome TEXT NOT NULL DEFAULT '', state TEXT NOT NULL,
+		PRIMARY KEY(worktree, action_id), FOREIGN KEY(worktree) REFERENCES fs_journal_bindings(worktree),
+		FOREIGN KEY(worktree, origin_action_id) REFERENCES fs_actions(worktree, action_id),
+		CHECK((origin_action_id IS NOT NULL AND attempt >= 1) OR (origin_action_id IS NULL AND attempt = 0)),
+		CHECK(phase IN ('pre_base', 'rollback', 'post_base')),
+		CHECK(op IN ('create_file', 'create_directory', 'rename', 'unlink', 'rmdir', 'mtime')),
+		CHECK(state IN ('intent', 'completed')),
+		UNIQUE(worktree, action_order));
+	CREATE INDEX IF NOT EXISTS fs_actions_pending ON fs_actions(worktree, phase, state, action_order);
+	CREATE TABLE IF NOT EXISTS pending_checkouts (
 		server_url TEXT NOT NULL, library_id TEXT NOT NULL,
 		worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
 		target_commit TEXT NOT NULL, target_root TEXT NOT NULL, head_etag TEXT NOT NULL,
@@ -1145,7 +1548,7 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		canonical_mtime TEXT NOT NULL, actual_mtime TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0,
 		temp_name TEXT NOT NULL DEFAULT '', temp_device INTEGER NOT NULL DEFAULT 0, temp_inode INTEGER NOT NULL DEFAULT 0,
 		target_device INTEGER NOT NULL DEFAULT 0, target_inode INTEGER NOT NULL DEFAULT 0,
-		completed INTEGER NOT NULL DEFAULT 0, rollback_name TEXT NOT NULL DEFAULT '',
+		completed INTEGER NOT NULL DEFAULT 0, rollback_name TEXT NOT NULL DEFAULT '', create_action_id TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY(worktree, path));
 		CREATE TABLE IF NOT EXISTS path_index (
 		worktree TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, object_id TEXT NOT NULL,
@@ -1155,6 +1558,10 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 	}
 	for table, columns := range map[string]map[string]string{
 		"pending_checkouts": {"apply_state": "TEXT NOT NULL DEFAULT 'pending'"},
+		"fs_actions": {
+			"internal_source": "TEXT NOT NULL DEFAULT ''", "internal_target": "TEXT NOT NULL DEFAULT ''",
+			"action_outcome": "TEXT NOT NULL DEFAULT ''",
+		},
 		"sync_recoveries": {
 			"object_id": "TEXT NOT NULL DEFAULT ''", "canonical_mtime": "TEXT NOT NULL DEFAULT ''",
 			"size": "INTEGER NOT NULL DEFAULT 0", "tombstone_name": "TEXT NOT NULL DEFAULT ''",
@@ -1172,6 +1579,15 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 			}
 		}
 	}
+	if err := migrateFSActionProvenance(ctx, tx); err != nil {
+		return fail(err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE fs_actions SET internal_source = internal_name
+		WHERE internal_source = '' AND internal_name <> '' AND source_name = internal_name AND target_name <> internal_name;
+		UPDATE fs_actions SET internal_target = internal_name
+		WHERE internal_target = '' AND internal_name <> '' AND target_name = internal_name AND source_name <> internal_name`); err != nil {
+		return fail(err)
+	}
 	for column, definition := range map[string]string{
 		"target_device": "INTEGER NOT NULL DEFAULT 0", "target_inode": "INTEGER NOT NULL DEFAULT 0",
 		"rollback_name": "TEXT NOT NULL DEFAULT ''",
@@ -1186,6 +1602,18 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 			}
 		}
 	}
+	var hasCreateActionID int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('checkout_paths') WHERE name='create_action_id'").Scan(&hasCreateActionID); err != nil {
+		return fail(err)
+	}
+	if hasCreateActionID == 0 {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE checkout_paths ADD COLUMN create_action_id TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fail(err)
+		}
+		if err := migrateCheckoutCreateOrigins(ctx, tx); err != nil {
+			return fail(err)
+		}
+	}
 	var checkoutTokenColumn int
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('pending_checkouts') WHERE name = 'access_token'").Scan(&checkoutTokenColumn); err != nil {
 		return fail(err)
@@ -1194,6 +1622,13 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		if _, err := tx.ExecContext(ctx, "ALTER TABLE pending_checkouts DROP COLUMN access_token"); err != nil {
 			return fail(err)
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (13);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (14);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (15);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (16);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (17)`); err != nil {
+		return fail(err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("initialize client state: %w", err)
@@ -1681,9 +2116,12 @@ func pathWithin(parent, child string) bool {
 func openClientDB(path string, readOnly bool) (*sql.DB, error) {
 	u := &url.URL{Scheme: "file", Path: path}
 	query := u.Query()
-	query.Set("_pragma", "busy_timeout(5000)")
+	query.Set("_busy_timeout", "5000")
+	query.Set("_synchronous", "full")
+	query.Add("_pragma", "busy_timeout(5000)")
 	query.Add("_pragma", "synchronous(FULL)")
 	query.Add("_pragma", "secure_delete(ON)")
+	query.Add("_pragma", "foreign_keys(ON)")
 	if readOnly {
 		query.Set("mode", "ro")
 	}
@@ -1697,6 +2135,47 @@ func openClientDB(path string, readOnly bool) (*sql.DB, error) {
 		return nil, errors.Join(fmt.Errorf("ping client database: %w", err), db.Close())
 	}
 	return db, nil
+}
+
+type sqliteErrorCoder interface{ Code() int }
+
+func enableClientDBWAL(ctx context.Context, db *sql.DB) error {
+	const attempts = 100
+	for attempt := 0; attempt < attempts; attempt++ {
+		var mode string
+		err := db.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&mode)
+		if err == nil {
+			if strings.ToLower(mode) != "wal" {
+				return fmt.Errorf("enable client WAL: journal_mode=%s", mode)
+			}
+			return nil
+		}
+		var sqliteErr sqliteErrorCoder
+		if !errors.As(err, &sqliteErr) || (sqliteErr.Code()&0xff != 5 && sqliteErr.Code()&0xff != 6) {
+			return fmt.Errorf("enable client WAL: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("enable client WAL: %w", ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return errors.New("enable client WAL: database remained busy")
+}
+
+func assertClientDBDurability(ctx context.Context, db *sql.DB) error {
+	var journal string
+	var synchronous int
+	if err := db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journal); err != nil {
+		return fmt.Errorf("read client journal mode: %w", err)
+	}
+	if err := db.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&synchronous); err != nil {
+		return fmt.Errorf("read client synchronous mode: %w", err)
+	}
+	if strings.ToLower(journal) != "wal" || synchronous != 2 {
+		return fmt.Errorf("client database requires WAL/FULL durability, got journal_mode=%s synchronous=%d", journal, synchronous)
+	}
+	return nil
 }
 
 func syncFile(path string) error {

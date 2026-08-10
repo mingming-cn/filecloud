@@ -391,7 +391,7 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 	if err != nil || verified.root != pending.TargetRoot {
 		return errors.Join(errors.New("remote target changed before finalization"), err)
 	}
-	if err := finalizeSyncApply(ctx, db, binding.Worktree, pending, paths); err != nil {
+	if err := finalizeSyncApply(ctx, db, binding.Worktree, pending, paths, config); err != nil {
 		return err
 	}
 	pending.ApplyState = "finalized"
@@ -555,11 +555,9 @@ func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 			if err != nil || !statMatchesRecovery(current, value) {
 				return fmt.Errorf("worktree path %q changed at recovery rename", value.path)
 			}
-			if err := unix.Renameat2(int(root.directory.Fd()), value.path, int(root.directory.Fd()), value.name, unix.RENAME_NOREPLACE); err != nil {
+			if err := journalRename(ctx, db, root, worktree, fsPhasePreBase, "", value.path, value.name,
+				value.kind, "", value.name, value.device, value.inode, config.fsActionFault); err != nil {
 				return fmt.Errorf("move existing path %q to registered recovery: %w", value.path, err)
-			}
-			if err := root.directory.Sync(); err != nil {
-				return err
 			}
 			if config.afterSyncRecoveryRename != nil {
 				if err := config.afterSyncRecoveryRename(value.path, value.name); err != nil {
@@ -649,10 +647,13 @@ func statMatchesRecovery(stat unix.Stat_t, value syncRecovery) bool {
 	return uint64(stat.Dev) == value.device && stat.Ino == value.inode && stat.Mode&syscall.S_IFMT == mode
 }
 
-func finalizeSyncApply(ctx context.Context, db *sql.DB, worktree string, pending pendingCheckout, paths []checkoutPath) error {
+func finalizeSyncApply(ctx context.Context, db *sql.DB, worktree string, pending pendingCheckout, paths []checkoutPath, config libraryClientConfig) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
+	}
+	if err := assertNoIncompletePreBase(ctx, tx, worktree); err != nil {
+		return errors.Join(err, tx.Rollback())
 	}
 	if err := updateBindingAndIndex(ctx, tx, worktree, pending.TargetCommit, pending.TargetRoot, pending.HeadETag, paths); err != nil {
 		return errors.Join(err, tx.Rollback())
@@ -664,8 +665,18 @@ func finalizeSyncApply(ctx context.Context, db *sql.DB, worktree string, pending
 	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 		return errors.Join(errors.New("finalize sync apply did not advance pending state"), err, tx.Rollback())
 	}
+	if config.fsTransactionFault != nil {
+		if err := config.fsTransactionFault("before_base_commit"); err != nil {
+			return errors.Join(err, tx.Rollback())
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("finalize synchronized checkout: %w", err)
+	}
+	if config.fsTransactionFault != nil {
+		if err := config.fsTransactionFault("after_base_commit"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -678,13 +689,23 @@ func finishSyncCleanup(ctx context.Context, db *sql.DB, options bindOptions, pen
 	if err != nil {
 		return err
 	}
-	for _, query := range []string{"DELETE FROM checkout_paths WHERE worktree = ?", "DELETE FROM pending_checkouts WHERE worktree = ? AND apply_state = 'finalized'"} {
+	for _, query := range []string{"DELETE FROM checkout_paths WHERE worktree = ?", "DELETE FROM pending_checkouts WHERE worktree = ? AND apply_state = 'finalized'", "DELETE FROM fs_actions WHERE worktree = ? AND state = 'completed' AND origin_action_id IS NOT NULL", "DELETE FROM fs_actions WHERE worktree = ? AND state = 'completed'"} {
 		if _, err := tx.ExecContext(ctx, query, pending.Worktree); err != nil {
+			return errors.Join(err, tx.Rollback())
+		}
+	}
+	if config.fsTransactionFault != nil {
+		if err := config.fsTransactionFault("before_cleanup_commit"); err != nil {
 			return errors.Join(err, tx.Rollback())
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("complete synchronized checkout cleanup: %w", err)
+	}
+	if config.fsTransactionFault != nil {
+		if err := config.fsTransactionFault("after_cleanup_commit"); err != nil {
+			return err
+		}
 	}
 	latest, err := getRemoteHead(ctx, options.base, options.libraryID, options.token)
 	if err != nil {
@@ -695,6 +716,134 @@ func finishSyncCleanup(ctx context.Context, db *sql.DB, options bindOptions, pen
 	}
 	_, err = fmt.Fprintln(stdout, "library synchronized")
 	return err
+}
+
+func snapshotRecoveryRemoval(parent *os.File, name string, expected syncRecovery) ([]checkoutPath, error) {
+	file, info, err := openScannableAt(parent, name, expected.path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || uint64(stat.Dev) != expected.device || stat.Ino != expected.inode ||
+		info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z") != expected.mtime {
+		return nil, errors.New("captured directory identity, type, or mtime changed")
+	}
+	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+	id, err := scanDirectory(file, expected.path, &snapshot)
+	if err != nil || id != expected.id {
+		return nil, errors.Join(errors.New("captured directory content changed"), err)
+	}
+	return snapshot.paths, nil
+}
+
+func persistRecoveryRemovalPlan(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string,
+	value syncRecovery, paths []checkoutPath, fault fsActionFault) ([]fsAction, error) {
+	if err := bindFSJournalRoot(ctx, db, worktree, root); err != nil {
+		return nil, err
+	}
+	identities := map[string][2]uint64{value.tombstone: {value.device, value.inode}}
+	for _, path := range paths {
+		relative := strings.TrimPrefix(path.path, value.path+"/")
+		identities[value.tombstone+"/"+relative] = [2]uint64{path.device, path.inode}
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		left, right := strings.Count(paths[i].path, "/"), strings.Count(paths[j].path, "/")
+		if left != right {
+			return left > right
+		}
+		return paths[i].path < paths[j].path
+	})
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) ([]fsAction, error) { return nil, errors.Join(err, tx.Rollback()) }
+	var order int64
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(action_order), -1) + 1 FROM fs_actions WHERE worktree = ?", worktree).Scan(&order); err != nil {
+		return fail(err)
+	}
+	actions := make([]fsAction, 0, len(paths)+1)
+	for _, path := range paths {
+		relative := strings.TrimPrefix(path.path, value.path+"/")
+		actual := value.tombstone + "/" + relative
+		parent, leaf := splitFSActionPath(actual)
+		identity, ok := identities[parent]
+		if !ok {
+			return fail(errors.New("captured removal plan has no parent identity"))
+		}
+		id, err := newFSActionID()
+		if err != nil {
+			return fail(err)
+		}
+		op := fsOpUnlink
+		if path.kind == "Directory" {
+			op = fsOpRmdir
+		}
+		actions = append(actions, fsAction{Worktree: worktree, ActionID: id, Order: order, Phase: fsPhasePostBase,
+			Op: op, Parent: parent, ParentDevice: identity[0], ParentInode: identity[1], Source: leaf,
+			ExpectedKind: path.kind, ExpectedDevice: path.device, ExpectedInode: path.inode,
+			ExpectedObject: path.id, ExpectedSize: path.size, ExpectedMtime: path.mtime, State: fsStateIntent})
+		order++
+	}
+	id, err := newFSActionID()
+	if err != nil {
+		return fail(err)
+	}
+	actions = append(actions, fsAction{Worktree: worktree, ActionID: id, Order: order, Phase: fsPhasePostBase,
+		Op: fsOpRmdir, Parent: "", ParentDevice: root.device, ParentInode: root.inode, Source: value.tombstone,
+		ExpectedKind: "Directory", ExpectedDevice: value.device, ExpectedInode: value.inode,
+		ExpectedObject: value.id, ExpectedMtime: value.mtime, InternalSource: value.tombstone, State: fsStateIntent})
+	for _, action := range actions {
+		if err := validateFSAction(action); err != nil {
+			return fail(err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO fs_actions(worktree, action_id, action_order, phase, op, parent_path,
+			parent_device, parent_inode, source_name, target_name, expected_kind, expected_device, expected_inode,
+			expected_object, expected_size, expected_mtime, internal_source, internal_target, state)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, action.Worktree, action.ActionID,
+			action.Order, action.Phase, action.Op, action.Parent, action.ParentDevice, action.ParentInode, action.Source,
+			action.Target, action.ExpectedKind, action.ExpectedDevice, action.ExpectedInode, action.ExpectedObject,
+			action.ExpectedSize, action.ExpectedMtime, action.InternalSource, action.InternalTarget, action.State); err != nil {
+			return fail(err)
+		}
+	}
+	if fault != nil {
+		for _, action := range actions {
+			if err := fault("before_intent_commit", action); err != nil {
+				return fail(err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if fault != nil {
+		for _, action := range actions {
+			if err := fault("after_intent_commit", action); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return actions, nil
+}
+
+func removeRecoveryDirectory(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string,
+	value syncRecovery, fault fsActionFault) error {
+	paths, err := snapshotRecoveryRemoval(root.directory, value.tombstone, value)
+	if err != nil {
+		return err
+	}
+	actions, err := persistRecoveryRemovalPlan(ctx, db, root, worktree, value, paths, fault)
+	if err != nil {
+		return err
+	}
+	for _, action := range actions {
+		if err := completeFSAction(ctx, db, root, action, fault); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cleanupSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string, config libraryClientConfig) error {
@@ -732,11 +881,9 @@ func cleanupSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 			if !statMatchesRecovery(recoveryStat, value) {
 				return fmt.Errorf("registered sync recovery %q changed identity", value.path)
 			}
-			if err := unix.Renameat2(int(root.directory.Fd()), value.name, int(root.directory.Fd()), value.tombstone, unix.RENAME_NOREPLACE); err != nil {
+			if err := journalRename(ctx, db, root, worktree, fsPhasePostBase, "", value.name, value.tombstone,
+				value.kind, value.name, value.tombstone, value.device, value.inode, config.fsActionFault); err != nil {
 				return fmt.Errorf("isolate sync recovery %q for cleanup: %w", value.path, err)
-			}
-			if err := root.directory.Sync(); err != nil {
-				return err
 			}
 		case !recoveryExists && tombstoneExists:
 			if !statMatchesRecovery(tombstoneStat, value) {
@@ -758,11 +905,15 @@ func cleanupSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 		if err := verifyNamedRecovery(root.directory, value.tombstone, value); err != nil {
 			return fmt.Errorf("verify sync recovery %q before cleanup: %w", value.path, err)
 		}
-		if err := removeReservedTree(root.directory, value.tombstone, value.device, value.inode, value.kind); err != nil {
-			return fmt.Errorf("remove sync recovery %q: %w", value.path, err)
-		}
-		if err := root.directory.Sync(); err != nil {
-			return err
+		if value.kind == "File" {
+			if err := journalRemove(ctx, db, root, worktree, fsPhasePostBase, "", value.tombstone,
+				"File", value.tombstone, value.id, value.mtime, value.size, value.device, value.inode, config.fsActionFault); err != nil {
+				return fmt.Errorf("remove sync recovery %q: %w", value.path, err)
+			}
+		} else {
+			if err := removeRecoveryDirectory(ctx, db, root, worktree, value, config.fsActionFault); err != nil {
+				return fmt.Errorf("remove sync recovery %q: %w", value.path, err)
+			}
 		}
 		if _, err := db.ExecContext(ctx, "DELETE FROM sync_recoveries WHERE worktree = ? AND path = ?", worktree, value.path); err != nil {
 			return err
@@ -789,7 +940,7 @@ func rollbackSyncApply(ctx context.Context, db *sql.DB, root *openedWorktree, cl
 	if err != nil {
 		return err
 	}
-	if err := cleanupCheckoutTemps(root, temps); err != nil {
+	if err := cleanupCheckoutTemps(ctx, db, root, worktree, fsPhaseRollback, temps, config.fsActionFault); err != nil {
 		return err
 	}
 	if err := rollbackInstalledCheckoutPaths(ctx, db, root, cacheRoot, worktree, config); err != nil {
@@ -830,6 +981,15 @@ func loadRollbackCheckoutPaths(ctx context.Context, db *sql.DB, worktree string)
 	return values, nil
 }
 
+func deleteRolledBackCheckoutPath(ctx context.Context, db *sql.DB, worktree, path string) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM checkout_paths WHERE worktree=? AND path=? AND NOT EXISTS (
+		SELECT 1 FROM fs_actions origin JOIN fs_actions preserve
+			ON preserve.worktree=origin.worktree AND preserve.origin_action_id=origin.action_id
+		WHERE origin.worktree=checkout_paths.worktree AND origin.source_name=checkout_paths.temp_name
+			AND origin.action_outcome='rolled_back')`, worktree, path)
+	return err
+}
+
 func rollbackInstalledCheckoutPaths(ctx context.Context, db *sql.DB, root *openedWorktree, cacheRoot *os.File, worktree string, config libraryClientConfig) error {
 	values, err := loadRollbackCheckoutPaths(ctx, db, worktree)
 	if err != nil {
@@ -841,12 +1001,12 @@ func rollbackInstalledCheckoutPaths(ctx context.Context, db *sql.DB, root *opene
 			return err
 		}
 		if !found {
-			if _, err := db.ExecContext(ctx, "DELETE FROM checkout_paths WHERE worktree = ? AND path = ?", worktree, value.path); err != nil {
+			if err := deleteRolledBackCheckoutPath(ctx, db, worktree, value.path); err != nil {
 				return err
 			}
 			continue
 		}
-		err = rollbackCheckoutTarget(ctx, db, parent, cacheRoot, name, worktree, value, config)
+		err = rollbackCheckoutTarget(ctx, db, root, parent, cacheRoot, name, worktree, value, config)
 		closeErr := parent.Close()
 		if err != nil || closeErr != nil {
 			return errors.Join(err, closeErr)
@@ -855,7 +1015,7 @@ func rollbackInstalledCheckoutPaths(ctx context.Context, db *sql.DB, root *opene
 	return nil
 }
 
-func rollbackCheckoutTarget(ctx context.Context, db *sql.DB, parent, cacheRoot *os.File, name, worktree string, value rollbackCheckoutPath, config libraryClientConfig) error {
+func rollbackCheckoutTarget(ctx context.Context, db *sql.DB, root *openedWorktree, parent, cacheRoot *os.File, name, worktree string, value rollbackCheckoutPath, config libraryClientConfig) error {
 	device, inode := value.tempDevice, value.tempInode
 	if value.kind == "Directory" && value.targetDevice != 0 && value.targetInode != 0 {
 		device, inode = value.targetDevice, value.targetInode
@@ -867,8 +1027,7 @@ func rollbackCheckoutTarget(ctx context.Context, db *sql.DB, parent, cacheRoot *
 	}
 	if value.rollbackName == "" {
 		if !visibleExists {
-			_, err := db.ExecContext(ctx, "DELETE FROM checkout_paths WHERE worktree = ? AND path = ?", worktree, value.path)
-			return err
+			return deleteRolledBackCheckoutPath(ctx, db, worktree, value.path)
 		}
 		if device == 0 || inode == 0 {
 			return fmt.Errorf("checkout target %q has no matching registered identity", value.path)
@@ -903,7 +1062,9 @@ func rollbackCheckoutTarget(ctx context.Context, db *sql.DB, parent, cacheRoot *
 		if err := verifyRollbackCheckoutTarget(parent, cacheRoot, name, value, device, inode); err != nil {
 			return fmt.Errorf("checkout target %q changed before rollback: %w", value.path, err)
 		}
-		if err := unix.Renameat2(int(parent.Fd()), name, int(parent.Fd()), value.rollbackName, unix.RENAME_NOREPLACE); err != nil {
+		parentPath, _ := splitFSActionPath(value.path)
+		if err := journalRename(ctx, db, root, worktree, fsPhaseRollback, parentPath, name, value.rollbackName,
+			value.kind, "", value.rollbackName, device, inode, config.fsActionFault); err != nil {
 			return fmt.Errorf("isolate checkout target %q for rollback: %w", value.path, err)
 		}
 		if err := syncRollbackParent(parent, config); err != nil {
@@ -914,22 +1075,22 @@ func rollbackCheckoutTarget(ctx context.Context, db *sql.DB, parent, cacheRoot *
 			return fmt.Errorf("checkout rollback tombstone %q changed identity", value.path)
 		}
 	case !visibleExists && !tombstoneExists:
-		_, err := db.ExecContext(ctx, "DELETE FROM checkout_paths WHERE worktree = ? AND path = ?", worktree, value.path)
-		return err
+		return deleteRolledBackCheckoutPath(ctx, db, worktree, value.path)
 	default:
 		return fmt.Errorf("checkout target %q has ambiguous rollback state", value.path)
 	}
 	if err := verifyRollbackCheckoutTarget(parent, cacheRoot, value.rollbackName, value, device, inode); err != nil {
 		return fmt.Errorf("checkout rollback tombstone %q changed before deletion: %w", value.path, err)
 	}
-	if err := removeRollbackTarget(parent, value.rollbackName, device, inode, value.kind); err != nil {
+	parentPath, _ := splitFSActionPath(value.path)
+	if err := journalRemove(ctx, db, root, worktree, fsPhaseRollback, parentPath, value.rollbackName,
+		value.kind, value.rollbackName, value.id, value.mtime, value.size, device, inode, config.fsActionFault); err != nil {
 		return fmt.Errorf("remove checkout target %q during rollback: %w", value.path, err)
 	}
 	if err := syncRollbackParent(parent, config); err != nil {
 		return err
 	}
-	_, err := db.ExecContext(ctx, "DELETE FROM checkout_paths WHERE worktree = ? AND path = ?", worktree, value.path)
-	return err
+	return deleteRolledBackCheckoutPath(ctx, db, worktree, value.path)
 }
 
 func verifyRollbackCheckoutTarget(parent, cacheRoot *os.File, name string, value rollbackCheckoutPath, device, inode uint64) error {
@@ -1044,37 +1205,6 @@ func openRollbackParent(root *openedWorktree, path string) (*os.File, string, bo
 	return os.NewFile(uintptr(current), currentPath), components[len(components)-1], true, nil
 }
 
-func removeRollbackTarget(parent *os.File, name string, device, inode uint64, kind string) error {
-	flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
-	if kind == "Directory" {
-		flags |= unix.O_DIRECTORY
-	}
-	fd, err := unix.Openat(int(parent.Fd()), name, flags, 0)
-	if err != nil {
-		return err
-	}
-	file := os.NewFile(uintptr(fd), name)
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil || !statMatchesCheckoutTarget(stat, kind, device, inode) {
-		return errors.Join(errors.New("checkout rollback target identity changed"), err, file.Close())
-	}
-	if kind == "Directory" {
-		if _, err := file.Readdirnames(1); err == nil {
-			return errors.Join(errors.New("checkout rollback directory contains unexpected user content"), file.Close())
-		} else if !errors.Is(err, io.EOF) {
-			return errors.Join(err, file.Close())
-		}
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	unlinkFlags := 0
-	if kind == "Directory" {
-		unlinkFlags = unix.AT_REMOVEDIR
-	}
-	return unix.Unlinkat(int(parent.Fd()), name, unlinkFlags)
-}
-
 func syncRollbackParent(parent *os.File, config libraryClientConfig) error {
 	if err := parent.Sync(); err != nil {
 		return err
@@ -1112,7 +1242,8 @@ func rollbackSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktre
 			if err := verifyNamedRecovery(root.directory, value.name, value); err != nil {
 				return fmt.Errorf("verify sync recovery %q for rollback: %w", value.path, err)
 			}
-			if err := unix.Renameat2(int(root.directory.Fd()), value.name, int(root.directory.Fd()), value.path, unix.RENAME_NOREPLACE); err != nil {
+			if err := journalRename(ctx, db, root, worktree, fsPhaseRollback, "", value.name, value.path,
+				value.kind, value.name, "", value.device, value.inode, config.fsActionFault); err != nil {
 				return fmt.Errorf("restore sync recovery %q: %w", value.path, err)
 			}
 			if err := syncRollbackParent(root.directory, config); err != nil {
@@ -1131,68 +1262,6 @@ func rollbackSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktre
 		}
 	}
 	return nil
-}
-
-func removeReservedTree(parent *os.File, name string, device, inode uint64, kind string) error {
-	flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
-	if kind == "Directory" {
-		flags |= unix.O_DIRECTORY
-	}
-	fd, err := unix.Openat(int(parent.Fd()), name, flags, 0)
-	if err != nil {
-		return err
-	}
-	file := os.NewFile(uintptr(fd), name)
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		return errors.Join(err, file.Close())
-	}
-	expectedMode := uint32(syscall.S_IFREG)
-	if kind == "Directory" {
-		expectedMode = syscall.S_IFDIR
-	}
-	if uint64(stat.Dev) != device || stat.Ino != inode || stat.Mode&syscall.S_IFMT != expectedMode || (kind == "File" && stat.Nlink != 1) {
-		return errors.Join(errors.New("reserved cleanup path identity or type changed"), file.Close())
-	}
-	if kind == "File" {
-		if err := file.Close(); err != nil {
-			return err
-		}
-		return unix.Unlinkat(int(parent.Fd()), name, 0)
-	}
-	entries, err := file.ReadDir(-1)
-	if err != nil {
-		return errors.Join(err, file.Close())
-	}
-	for _, entry := range entries {
-		childTombstone, err := newReservedName(syncTombstonePrefix)
-		if err != nil {
-			return errors.Join(err, file.Close())
-		}
-		if err := unix.Renameat2(fd, entry.Name(), fd, childTombstone, unix.RENAME_NOREPLACE); err != nil {
-			return errors.Join(err, file.Close())
-		}
-		child, err := statAt(file, childTombstone)
-		if err != nil {
-			return errors.Join(err, file.Close())
-		}
-		childKind := "File"
-		if child.Mode&syscall.S_IFMT == syscall.S_IFDIR {
-			childKind = "Directory"
-		} else if child.Mode&syscall.S_IFMT != syscall.S_IFREG {
-			return errors.Join(errors.New("reserved cleanup tree contains unsupported type"), file.Close())
-		}
-		if err := removeReservedTree(file, childTombstone, uint64(child.Dev), child.Ino, childKind); err != nil {
-			return errors.Join(err, file.Close())
-		}
-	}
-	if err := file.Sync(); err != nil {
-		return errors.Join(err, file.Close())
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return unix.Unlinkat(int(parent.Fd()), name, unix.AT_REMOVEDIR)
 }
 
 func newReservedName(prefix string) (string, error) {

@@ -1341,15 +1341,14 @@ func assertNoSyncInternalPaths(t *testing.T, worktree string) {
 
 func countSyncInternalPaths(t *testing.T, worktree string) int {
 	t.Helper()
-	entries, err := os.ReadDir(worktree)
-	if err != nil {
-		t.Fatal(err)
-	}
 	count := 0
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), syncRecoveryPrefix) {
+	if err := filepath.WalkDir(worktree, func(_ string, entry os.DirEntry, err error) error {
+		if err == nil && strings.HasPrefix(entry.Name(), ".filecloud-internal-") {
 			count++
 		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
 	}
 	return count
 }

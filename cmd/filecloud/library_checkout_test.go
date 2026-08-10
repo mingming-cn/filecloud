@@ -322,8 +322,18 @@ func TestLibraryBindCheckoutRecoversTemporaryIdentityWindow(t *testing.T) {
 		}
 		assertPendingCheckout(t, clientDir, target)
 		_, temp := readZeroIdentityTemp(t, clientDir, worktree)
-		if _, err := os.Lstat(temp); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("failed identity update left temporary inode: %v", err)
+		if info, err := os.Lstat(temp); err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("failed identity update did not retain temporary inode: info=%v err=%v", info, err)
+		}
+		db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var durableCreates int
+		queryErr := db.QueryRow(`SELECT COUNT(*) FROM fs_actions WHERE worktree = ? AND op = 'create_file'
+			AND state = 'completed' AND expected_device <> 0 AND expected_inode <> 0`, worktree).Scan(&durableCreates)
+		if closeErr := db.Close(); queryErr != nil || closeErr != nil || durableCreates == 0 {
+			t.Fatalf("durable creates=%d query=%v close=%v", durableCreates, queryErr, closeErr)
 		}
 		if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
 			t.Fatalf("retry identity update failure: %v", err)
@@ -353,6 +363,9 @@ func TestLibraryBindCheckoutRecoversTemporaryIdentityWindow(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.Chtimes(external, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(temp); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Link(external, temp); err != nil {
@@ -491,6 +504,9 @@ func TestLibraryBindCheckoutRecoversTemporaryIdentityWindow(t *testing.T) {
 				t.Fatal("expected identity update failure")
 			}
 			_, temp := readZeroIdentityTemp(t, clientDir, worktree)
+			if err := os.Remove(temp); err != nil {
+				t.Fatal(err)
+			}
 			if kind == "symlink" {
 				if err := os.Symlink("outside", temp); err != nil {
 					t.Fatal(err)

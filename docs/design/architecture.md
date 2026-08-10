@@ -142,7 +142,7 @@ LibraryId 只在所有者作用域内唯一；不同用户可以独立使用相�
 
 `serve` 整个生命周期持有数据目录共享锁。Head 发布先在该锁下验证新 Commit 的完整可达图，再用短事务读取当前 `head_commit_id/head_version`、比较 Expected Head并带当前版本条件更新。服务运行期间对象不可删除；GC 必须取得数据目录独占锁并要求服务停止，因此验证与 CAS 之间对象不会消失。
 
-SQLite 每个连接必须启用 foreign keys；写事务配置有限 busy timeout，不无界等待；迁移取得数据目录独占锁并在单事务中执行，失败保持旧 schema version。WAL/同步级别由崩溃故障注入测试冻结。未来 PostgreSQL/MySQL 在同一查询包中提供方言 migration 和相同的唯一性、级联、affected-row CAS、回滚和并发事务契约测试。第一阶段不定义只有一个实现的 Go interface。
+SQLite 每个连接必须启用 foreign keys；写事务配置有限 busy timeout，不无界等待；迁移取得数据目录独占锁并在单事务中执行，失败保持旧 schema version。迁移前必须拒绝未来版本、未知版本和有缺口的 migration history，且不得先执行 schema DDL。WAL/同步级别由崩溃故障注入测试冻结。未来 PostgreSQL/MySQL 在同一查询包中提供方言 migration 和相同的唯一性、级联、affected-row CAS、回滚和并发事务契约测试。第一阶段不定义只有一个实现的 Go interface。
 
 ## 客户端本地状态
 
@@ -206,14 +206,14 @@ stateDiagram-v2
 
 每个文件写到目标同目录、名称以保留前缀 `.filecloud-internal-` 开头的临时文件，校验完整 FileId 并 `fsync`。协议禁止用户路径段使用该保留前缀；Scanner 只忽略 journal 中登记的内部名称，启动扫描前必须恢复未完成 journal。
 
-每个文件系统动作都是 write-ahead 状态机：
+每个文件系统动作都是 write-ahead 状态机。1A 客户端数据库固定使用 SQLite WAL、`synchronous=FULL` 和 5 秒 busy timeout，并在初始化时读取 PRAGMA 断言 `journal_mode=wal`、`synchronous=2`。每个 Intent/Completed 的成功 COMMIT 是数据库持久化边界；实现不为单个动作手工 checkpoint 或 fsync WAL。故障注入只夹住 COMMIT 前和成功返回后；SQLite 不提供受支持的 intra-COMMIT hook，因此进程测试不把 WAL 同步中途作为可观测边界。
 
-1. 在 SQLite 事务中记录 `Intent`（源路径、目标路径、临时名、恢复名、预期 FileId）并提交，随后同步 journal/WAL。
+1. 在 SQLite 事务中记录 `Intent`（源路径、目标路径、临时名、恢复名、预期 FileId）并提交。
 2. 执行一个原子文件系统动作并 `fsync` 受影响父目录。
-3. 把该步骤标为 `Completed`。重启根据路径组合幂等完成或回滚，不能依赖动作恰好执行一次。
-4. 全部路径完成后，单事务更新路径索引和 Sync Base，再标记 checkout 完成；只有这一步后才能清理内部名称。
+3. 把该步骤标为 `Completed`。重启根据路径组合幂等完成或回滚，不能依赖动作恰好执行一次。create 的 kernel 动作与 identity UPDATE 之间存在不可消除窗口；若重启看到 identity 为零但精确内部 leaf 已存在，禁止收养、打开写入或删除该 inode。实现必须在同一事务中持久化 follow-up rollback rename Intent、原 action 的 `rolled_back` outcome 和 pending `rolling_back`，再 no-replace 移到普通可见 recovery leaf并同步父目录。若可见名已存在（任意类型），不得触碰任一 inode；当前 rollback action 以 `collision` 完成并在同一事务持久化带 ` 2`、` 3` 等有界后缀的 successor Intent，直到找到可用 leaf。
+4. 全部路径完成后，单事务更新路径索引和 Sync Base，再标记 checkout 完成；只有这一步后才能清理内部名称。unbind 可清理 rolled-back journal，但不得删除上述可见 recovery 内容。
 
-替换前先按 journal 把当前目标原子改为恢复名，再重新计算捕获 FileId。若不同于本轮扫描值，恢复 inode 直接改名为最终可见冲突路径，远端内容再安装到原路径；Unix 上仍持有旧 fd 的进程会继续写入这个可见冲突 inode，不需要猜测“何时稳定”。若捕获内容未变，恢复名保留到 Sync Base 事务提交后再清理；此后通过旧 fd 的延迟写不在第一阶段强保证内，必须由验收测试记录平台行为。Windows 因占用无法 rename 时整轮失败并保留原文件。
+替换前先按 journal 把当前目标原子改为恢复名，再重新计算捕获 FileId。若不同于本轮扫描值，恢复 inode 直接改名为最终可见冲突路径，远端内容再安装到原路径；Unix 上仍持有旧 fd 的进程会继续写入这个可见冲突 inode，不需要猜测“何时稳定”。若捕获内容未变，恢复名保留到 Sync Base 事务提交后再清理；此后通过旧 fd 的延迟写不在第一阶段强保证内，必须由验收测试记录平台行为。Windows 因占用无法 rename 时整轮失败并保留原文件；不允许退化为 copy-and-replace。当前 1A 实现仅支持 Linux/ext4，Windows/NTFS 属于未来平台工作，不声明支持。
 
 所有远端路径持久化成功且冲突内容已物化后，更新 Sync Base，保留冲突路径为本地未发布变化并立即开始下一轮发布。
 
