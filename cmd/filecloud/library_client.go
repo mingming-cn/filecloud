@@ -35,6 +35,7 @@ type libraryClientConfig struct {
 	syncFile                        func(*os.File) error
 	syncDirectory                   func(string) error
 	beforeHeadCAS                   func() error
+	beforeBindingRefresh            func() error
 	afterPendingReplacement         func() error
 	beforeCheckoutMaterialize       func() error
 	beforeCheckoutBaseCommit        func() error
@@ -695,8 +696,21 @@ func confirmExistingBinding(ctx context.Context, db *sql.DB, options bindOptions
 	if _, err := rescanRoot(options, existing.SyncBaseRoot); err != nil {
 		return errors.New("existing binding worktree has changes; run library sync")
 	}
-	if _, err := db.ExecContext(ctx, "UPDATE bindings SET access_token = ?, head_etag = ? WHERE worktree = ?", options.token, head.ETag, options.worktree); err != nil {
+	if config.beforeBindingRefresh != nil {
+		if err := config.beforeBindingRefresh(); err != nil {
+			return fmt.Errorf("prepare binding credential refresh: %w", err)
+		}
+	}
+	result, err := db.ExecContext(ctx, `UPDATE bindings SET access_token = ?, head_etag = ?
+		WHERE server_url = ? AND library_id = ? AND worktree = ? AND user_id = ? AND device_id = ?
+		AND sync_base_commit = ? AND sync_base_root = ? AND head_etag = ?`, options.token, head.ETag,
+		existing.ServerURL, existing.LibraryID, existing.Worktree, existing.UserID, existing.DeviceID,
+		existing.SyncBase, existing.SyncBaseRoot, existing.HeadETag)
+	if err != nil {
 		return fmt.Errorf("update binding token: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.Join(errors.New("existing binding changed before credential refresh"), err)
 	}
 	_, err = fmt.Fprintf(stdout, "library already bound: %s\n", options.worktree)
 	return err
@@ -1135,7 +1149,7 @@ func initializeClientDB(ctx context.Context, clientDir string, syncDir func(stri
 	return db, nil
 }
 
-const clientSchemaVersion = 20
+const clientSchemaVersion = 21
 
 var legacyClientV12Columns = map[string][]string{
 	"bindings":             {"server_url|TEXT|1||0", "library_id|TEXT|1||0", "worktree|TEXT|1||1", "user_id|TEXT|1||0", "device_id|TEXT|1||0", "sync_base_commit|TEXT|1||0", "sync_base_root|TEXT|1||0", "head_etag|TEXT|1||0", "access_token|BLOB|1||0"},
@@ -1199,6 +1213,26 @@ const clientV20PendingSQL = `CREATE TABLE pending_publications (
 		requires_delete_confirmation = (deletion_count > 100 OR (tracked_count > 0 AND
 		deletion_count >= tracked_count / 10 + CASE WHEN tracked_count % 10 = 0 THEN 0 ELSE 1 END)))))`
 
+const _clientV21PendingSQL = `CREATE TABLE pending_publications (
+	worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL, base_root TEXT NOT NULL,
+	expected_head TEXT NOT NULL, expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL,
+	candidate_root TEXT NOT NULL, candidate_data BLOB NOT NULL, captured_commit TEXT NOT NULL,
+	captured_root TEXT NOT NULL, captured_data BLOB NOT NULL, candidate_history BLOB NOT NULL,
+	deletion_count INTEGER NOT NULL DEFAULT 0,
+	tracked_count INTEGER NOT NULL DEFAULT 0, requires_delete_confirmation INTEGER NOT NULL DEFAULT 0,
+	delete_confirmed INTEGER NOT NULL DEFAULT 0, legacy_revalidation_required INTEGER NOT NULL DEFAULT 0,
+	CHECK(length(candidate_data) BETWEEN 1 AND 65536),
+	CHECK(length(captured_data) BETWEEN 1 AND 65536),
+	CHECK(length(candidate_history) BETWEEN 8 AND 67112968),
+	CHECK(deletion_count >= 0 AND tracked_count >= deletion_count),
+	CHECK(requires_delete_confirmation IN (0, 1) AND delete_confirmed IN (0, 1)
+		AND legacy_revalidation_required IN (0, 1)),
+	CHECK((legacy_revalidation_required = 1 AND deletion_count = 0 AND tracked_count = 0
+		AND requires_delete_confirmation = 0 AND delete_confirmed = 0) OR
+		(legacy_revalidation_required = 0 AND delete_confirmed <= requires_delete_confirmation AND
+		requires_delete_confirmation = (deletion_count > 100 OR (tracked_count > 0 AND
+		deletion_count >= tracked_count / 10 + CASE WHEN tracked_count % 10 = 0 THEN 0 ELSE 1 END)))))`
+
 var clientV19PendingColumns = []string{
 	"0|worktree|TEXT|1||1", "1|base_commit|TEXT|1||0", "2|base_root|TEXT|1||0",
 	"3|expected_etag|TEXT|1||0", "4|candidate_commit|TEXT|1||0", "5|candidate_root|TEXT|1||0",
@@ -1213,6 +1247,16 @@ var clientV20PendingColumns = []string{
 	"6|candidate_root|TEXT|1||0", "7|candidate_data|BLOB|1||0", "8|deletion_count|INTEGER|1|0|0",
 	"9|tracked_count|INTEGER|1|0|0", "10|requires_delete_confirmation|INTEGER|1|0|0",
 	"11|delete_confirmed|INTEGER|1|0|0", "12|legacy_revalidation_required|INTEGER|1|0|0",
+}
+
+var _clientV21PendingColumns = []string{
+	"0|worktree|TEXT|1||1", "1|base_commit|TEXT|1||0", "2|base_root|TEXT|1||0",
+	"3|expected_head|TEXT|1||0", "4|expected_etag|TEXT|1||0", "5|candidate_commit|TEXT|1||0",
+	"6|candidate_root|TEXT|1||0", "7|candidate_data|BLOB|1||0", "8|captured_commit|TEXT|1||0",
+	"9|captured_root|TEXT|1||0", "10|captured_data|BLOB|1||0", "11|candidate_history|BLOB|1||0",
+	"12|deletion_count|INTEGER|1|0|0", "13|tracked_count|INTEGER|1|0|0",
+	"14|requires_delete_confirmation|INTEGER|1|0|0", "15|delete_confirmed|INTEGER|1|0|0",
+	"16|legacy_revalidation_required|INTEGER|1|0|0",
 }
 
 var legacyClientV12Indexes = map[string][]string{
@@ -1263,6 +1307,10 @@ func validateClientV19Schema(ctx context.Context, db clientSchemaQuerier) error 
 
 func validateClientV20Schema(ctx context.Context, db clientSchemaQuerier) error {
 	return validatePendingPublicationSchema(ctx, db, 20, clientV20PendingSQL, clientV20PendingColumns)
+}
+
+func _validateClientV21Schema(ctx context.Context, db clientSchemaQuerier) error {
+	return validatePendingPublicationSchema(ctx, db, 21, _clientV21PendingSQL, _clientV21PendingColumns)
 }
 
 func validatePendingPublicationSchema(ctx context.Context, db clientSchemaQuerier, version int, expectedSQL string, expectedColumns []string) error {
@@ -1477,6 +1525,9 @@ func validateClientSchemaVersion(ctx context.Context, db *sql.DB) error {
 	}
 	version := versions[len(versions)-1]
 	if version == clientSchemaVersion {
+		return _validateClientV21Schema(ctx, db)
+	}
+	if version == 20 {
 		return validateClientV20Schema(ctx, db)
 	}
 	if version == 19 {
@@ -1615,6 +1666,21 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 	if err := validateClientSchemaVersion(ctx, db); err != nil {
 		return fmt.Errorf("validate client schema before migration: %w", err)
 	}
+	var pendingTableExists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema
+		WHERE type='table' AND name='pending_publications'`).Scan(&pendingTableExists); err != nil {
+		return fmt.Errorf("preflight pending publication schema: %w", err)
+	}
+	if pendingTableExists != 0 {
+		var pendingCandidateOversize int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_publications
+			WHERE length(candidate_data) NOT BETWEEN 1 AND 65536`).Scan(&pendingCandidateOversize); err != nil {
+			return fmt.Errorf("preflight pending publication metadata: %w", err)
+		}
+		if pendingCandidateOversize != 0 {
+			return errors.New("pending publication candidate metadata exceeds synchronization budget")
+		}
+	}
 	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
 		return fmt.Errorf("enable client foreign keys: %w", err)
 	}
@@ -1718,7 +1784,7 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		return fail(err)
 	}
 	if pendingPublications == 0 {
-		if _, err := tx.ExecContext(ctx, clientV20PendingSQL); err != nil {
+		if _, err := tx.ExecContext(ctx, _clientV21PendingSQL); err != nil {
 			return fail(err)
 		}
 	}
@@ -1834,6 +1900,33 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 			return fail(err)
 		}
 	}
+	var capturedColumns int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('pending_publications')
+		WHERE name IN ('captured_commit','captured_root','captured_data','candidate_history')`).Scan(&capturedColumns); err != nil {
+		return fail(err)
+	}
+	if capturedColumns == 0 {
+		if err := validateClientV20Schema(ctx, tx); err != nil {
+			return fail(fmt.Errorf("validate v20 schema before migration: %w", err))
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE pending_publications RENAME TO old_pending_publications`); err != nil {
+			return fail(err)
+		}
+		if _, err := tx.ExecContext(ctx, _clientV21PendingSQL); err != nil {
+			return fail(err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO pending_publications(worktree,base_commit,base_root,expected_head,
+			expected_etag,candidate_commit,candidate_root,candidate_data,captured_commit,captured_root,captured_data,
+			candidate_history,deletion_count,tracked_count,requires_delete_confirmation,delete_confirmed,legacy_revalidation_required)
+			SELECT worktree,base_commit,base_root,expected_head,expected_etag,candidate_commit,candidate_root,candidate_data,
+			candidate_commit,candidate_root,candidate_data,X'4643483100000000',deletion_count,tracked_count,
+			requires_delete_confirmation,delete_confirmed,legacy_revalidation_required FROM old_pending_publications;
+			DROP TABLE old_pending_publications`); err != nil {
+			return fail(err)
+		}
+	} else if capturedColumns != 4 {
+		return fail(errors.New("pending publication captured schema is incomplete"))
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (13);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (14);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (15);
@@ -1841,10 +1934,11 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (17);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (18);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (19);
-		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (20)`); err != nil {
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (20);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (21)`); err != nil {
 		return fail(err)
 	}
-	if err := validateClientV20Schema(ctx, tx); err != nil {
+	if err := _validateClientV21Schema(ctx, tx); err != nil {
 		return fail(fmt.Errorf("validate migrated client schema: %w", err))
 	}
 	if err := tx.Commit(); err != nil {

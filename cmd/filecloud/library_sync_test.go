@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -140,7 +141,427 @@ func TestLibrarySyncAppliesRemoteTreeOperationsWithoutPUT(t *testing.T) {
 	}
 }
 
-func TestLibrarySyncRejectsBothSidesChanged(t *testing.T) {
+func TestLibrarySyncMergesBothSidesChanged(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "remote"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "local"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"local": "local", "remote": "remote"} {
+		if data, err := os.ReadFile(filepath.Join(subscriberTree, name)); err != nil || string(data) != want {
+			t.Fatalf("merged %s=%q err=%v", name, data, err)
+		}
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	publisher := assertTestConverged(t, environment, publisherDir, publisherTree)
+	subscriber := assertTestConverged(t, environment, subscriberDir, subscriberTree)
+	if publisher.SyncBase != subscriber.SyncBase || publisher.SyncBaseRoot != subscriber.SyncBaseRoot {
+		t.Fatalf("merged clients differ: publisher=%+v subscriber=%+v", publisher, subscriber)
+	}
+}
+
+func TestLibrarySyncConflictBoundaryPreservesExistingPending(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			beforeHeadCAS: func() error { return errors.New("stop before CAS") }})
+	if err == nil {
+		t.Fatal("initial pending publication unexpectedly completed")
+	}
+	beforePending := readTestPendingPublication(t, subscriberDir, subscriberTree)
+	beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+	beforeRoot := scanTestRoot(t, subscriberTree)
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+		[]byte(environment.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	puts.Store(0)
+	err = syncTestWorktree(t, subscriberDir, subscriberTree)
+	if err == nil || !strings.Contains(err.Error(), "Issue #17") {
+		t.Fatalf("replacement boundary error=%v", err)
+	}
+	afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+		[]byte(environment.token))
+	if afterPending := readTestPendingPublication(t, subscriberDir, subscriberTree); !reflect.DeepEqual(afterPending, beforePending) ||
+		readTestBinding(t, subscriberDir, subscriberTree) != beforeBinding || scanTestRoot(t, subscriberTree) != beforeRoot ||
+		puts.Load() != 0 || headErr != nil || beforeHead.CommitID == nil || afterHead.CommitID == nil ||
+		*beforeHead.CommitID != *afterHead.CommitID || beforeHead.ETag != afterHead.ETag {
+		t.Fatalf("replacement boundary changed state: pending=%+v head=%+v err=%v puts=%d", afterPending, afterHead, headErr, puts.Load())
+	}
+}
+
+func TestLibrarySyncMigratesV20TrivialMergePending(t *testing.T) {
+	for _, headState := range []string{"expected", "candidate", "successor", "conflict"} {
+		t.Run(headState, func(t *testing.T) {
+			state := newImportedBinding(t)
+			baseURL := mustServerURL(t, state.environment.server.URL)
+			token := []byte(state.environment.token)
+			if err := os.WriteFile(filepath.Join(state.worktree, "local"), []byte("changed"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			root, err := openWorktreeRoot(state.worktree, func(*os.File) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := scanWorktreeWithConfig(root, worktreeScanConfig{})
+			if err != nil {
+				root.Close()
+				t.Fatal(err)
+			}
+			options := bindOptions{base: baseURL, libraryID: testClientLibraryID, token: token, worktreeRoot: root}
+			if err := uploadSnapshot(t.Context(), options, snapshot); err != nil {
+				root.Close()
+				t.Fatal(err)
+			}
+			if err := root.Close(); err != nil {
+				t.Fatal(err)
+			}
+			now := func(second int) func() time.Time {
+				return func() time.Time { return time.Date(2026, 8, 10, 1, 2, second, 0, time.UTC) }
+			}
+			localData, localID, err := canonicalCommit(testClientUserID, testClientDeviceID, snapshot.root,
+				[]string{state.binding.SyncBase}, now(1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			expectedData, expectedID, err := canonicalCommit(testClientUserID, testClientDeviceID, state.binding.SyncBaseRoot,
+				[]string{state.binding.SyncBase}, now(2))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for id, data := range map[string][]byte{localID: localData, expectedID: expectedData} {
+				if err := putMetadata(t.Context(), baseURL, testClientLibraryID, token, "commits", id, data); err != nil {
+					t.Fatal(err)
+				}
+			}
+			expectedHead, _, err := updateRemoteHead(t.Context(), baseURL, testClientLibraryID, token,
+				state.binding.HeadETag, expectedID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mergeData, mergeID, err := canonicalCommit(testClientUserID, testClientDeviceID, snapshot.root,
+				[]string{expectedID, localID}, now(3))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := putMetadata(t.Context(), baseURL, testClientLibraryID, token, "commits", mergeID, mergeData); err != nil {
+				t.Fatal(err)
+			}
+			currentHead := expectedHead
+			switch headState {
+			case "candidate":
+				currentHead, _, err = updateRemoteHead(t.Context(), baseURL, testClientLibraryID, token, currentHead.ETag, mergeID)
+			case "successor":
+				currentHead, _, err = updateRemoteHead(t.Context(), baseURL, testClientLibraryID, token, currentHead.ETag, mergeID)
+				if err != nil {
+					break
+				}
+				successorData, successorID, commitErr := canonicalCommit(testClientUserID, testClientDeviceID, snapshot.root,
+					[]string{mergeID}, now(4))
+				if commitErr == nil {
+					commitErr = putMetadata(t.Context(), baseURL, testClientLibraryID, token, "commits", successorID, successorData)
+				}
+				if commitErr == nil {
+					currentHead, _, commitErr = updateRemoteHead(t.Context(), baseURL, testClientLibraryID, token, currentHead.ETag, successorID)
+				}
+				err = commitErr
+			case "conflict":
+				conflictData, conflictID, commitErr := canonicalCommit(testClientUserID, testClientDeviceID,
+					state.binding.SyncBaseRoot, []string{expectedID}, now(5))
+				if commitErr == nil {
+					commitErr = putMetadata(t.Context(), baseURL, testClientLibraryID, token, "commits", conflictID, conflictData)
+				}
+				if commitErr == nil {
+					currentHead, _, commitErr = updateRemoteHead(t.Context(), baseURL, testClientLibraryID, token, currentHead.ETag, conflictID)
+				}
+				err = commitErr
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			db, err := openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`DROP TABLE pending_publications;
+				DELETE FROM client_schema_migrations WHERE version=21`); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(clientV20PendingSQL); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0)`, state.worktree,
+				state.binding.SyncBase, state.binding.SyncBaseRoot, expectedID, expectedHead.ETag, mergeID, snapshot.root, mergeData); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, state.clientDir, state.worktree); err != nil {
+				t.Fatalf("migrated v20 %s Head=%+v: %v", headState, currentHead, err)
+			}
+			assertTestConverged(t, state.environment, state.clientDir, state.worktree)
+		})
+	}
+}
+
+func TestLibrarySyncRejectsStalePendingBeforeHeadCAS(t *testing.T) {
+	state := newImportedBinding(t)
+	if err := os.WriteFile(filepath.Join(state.worktree, "local"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeBinding := readTestBinding(t, state.clientDir, state.worktree)
+	beforeRoot := scanTestRoot(t, state.worktree)
+	beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+		[]byte(state.environment.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", state.clientDir, "--worktree", state.worktree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			beforeHeadCAS: func() error {
+				db, err := openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+				if err != nil {
+					return err
+				}
+				defer db.Close()
+				_, err = db.Exec(`UPDATE pending_publications SET tracked_count=tracked_count+1 WHERE worktree=?`, state.worktree)
+				return err
+			}})
+	if err == nil || !strings.Contains(err.Error(), "pending publication changed before remote publication") {
+		t.Fatalf("stale pending publication error=%v", err)
+	}
+	afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+		[]byte(state.environment.token))
+	if headErr != nil || beforeHead.CommitID == nil || afterHead.CommitID == nil || *beforeHead.CommitID != *afterHead.CommitID ||
+		beforeHead.ETag != afterHead.ETag || readTestBinding(t, state.clientDir, state.worktree) != beforeBinding ||
+		scanTestRoot(t, state.worktree) != beforeRoot {
+		t.Fatalf("stale CAS changed head=%+v binding=%+v root=%s err=%v", afterHead,
+			readTestBinding(t, state.clientDir, state.worktree), scanTestRoot(t, state.worktree), headErr)
+	}
+}
+
+func TestLibraryBindRejectsStaleBindingCredentialRefresh(t *testing.T) {
+	state := newImportedBinding(t)
+	beforeRoot := scanTestRoot(t, state.worktree)
+	err := runLibraryWithConfig(t.Context(), state.args[1:], strings.NewReader(state.environment.token+"\n"),
+		io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			beforeBindingRefresh: func() error {
+				db, err := openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+				if err != nil {
+					return err
+				}
+				defer db.Close()
+				_, err = db.Exec(`UPDATE bindings SET device_id=? WHERE worktree=?`, testOtherDeviceID, state.worktree)
+				return err
+			}})
+	after := readTestBinding(t, state.clientDir, state.worktree)
+	if err == nil || !strings.Contains(err.Error(), "existing binding changed before credential refresh") ||
+		after.DeviceID != testOtherDeviceID || after.SyncBase != state.binding.SyncBase ||
+		after.SyncBaseRoot != state.binding.SyncBaseRoot || after.HeadETag != state.binding.HeadETag ||
+		scanTestRoot(t, state.worktree) != beforeRoot {
+		t.Fatalf("stale binding refresh error=%v binding=%+v", err, after)
+	}
+}
+
+func TestLibrarySyncRejectsOversizedPendingBlobsBeforeMutation(t *testing.T) {
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	var puts atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			puts.Add(1)
+		}
+		environment.handler.ServeHTTP(w, r)
+	}))
+	defer proxy.Close()
+	clientDir, worktree := newClientPaths(t)
+	if err := os.WriteFile(filepath.Join(worktree, "local"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := append(bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testClientDeviceID), "--import-local")
+	if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "pending"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", clientDir, "--worktree", worktree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			beforeHeadCAS: func() error { return errors.New("stop before CAS") }})
+	if err == nil {
+		t.Fatal("expected pending publication")
+	}
+	pending := readTestPendingPublication(t, clientDir, worktree)
+	beforeBinding, beforeRoot := readTestBinding(t, clientDir, worktree), scanTestRoot(t, worktree)
+	beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, proxy.URL), testClientLibraryID, []byte(environment.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		column string
+		value  any
+		size   int
+	}{
+		{"candidate_data", pending.CandidateData, 65537},
+		{"captured_data", pending.CapturedData, 65537},
+		{"candidate_history", pending.CandidateHistory, _maxCandidateHistoryBytes + 1},
+	} {
+		t.Run(test.column, func(t *testing.T) {
+			db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON`); err == nil {
+				_, err = db.Exec(`UPDATE pending_publications SET `+test.column+`=zeroblob(?) WHERE worktree=?`, test.size, worktree)
+			}
+			if closeErr := db.Close(); err != nil || closeErr != nil {
+				t.Fatal(errors.Join(err, closeErr))
+			}
+			puts.Store(0)
+			err = syncTestWorktree(t, clientDir, worktree)
+			if err == nil || !strings.Contains(err.Error(), "exceeds synchronization budget") {
+				t.Fatalf("oversized %s error=%v", test.column, err)
+			}
+			afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, proxy.URL), testClientLibraryID, []byte(environment.token))
+			if headErr != nil || puts.Load() != 0 || readTestBinding(t, clientDir, worktree) != beforeBinding ||
+				scanTestRoot(t, worktree) != beforeRoot || countClientRows(t, clientDir, "pending_publications", worktree) != 1 ||
+				beforeHead.CommitID == nil || afterHead.CommitID == nil || *beforeHead.CommitID != *afterHead.CommitID ||
+				beforeHead.ETag != afterHead.ETag {
+				t.Fatalf("oversized %s mutated state: puts=%d head=%+v err=%v", test.column, puts.Load(), afterHead, headErr)
+			}
+			db, err = openClientDB(filepath.Join(clientDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON`); err == nil {
+				_, err = db.Exec(`UPDATE pending_publications SET `+test.column+`=? WHERE worktree=?`, test.value, worktree)
+			}
+			if closeErr := db.Close(); err != nil || closeErr != nil {
+				t.Fatal(errors.Join(err, closeErr))
+			}
+		})
+	}
+}
+
+func TestFinalizePublishedRollsBackStaleRows(t *testing.T) {
+	for _, stale := range []string{"pending field", "binding device"} {
+		t.Run(stale, func(t *testing.T) {
+			state := newImportedBinding(t)
+			if err := os.WriteFile(filepath.Join(state.worktree, "pending"), []byte("data"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", state.clientDir, "--worktree", state.worktree},
+				strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+					beforeHeadCAS: func() error { return errors.New("stop before CAS") }})
+			if err == nil {
+				t.Fatal("expected pending publication")
+			}
+			binding := readTestBinding(t, state.clientDir, state.worktree)
+			pending := readTestPendingPublication(t, state.clientDir, state.worktree)
+			db, err := openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if stale == "pending field" {
+				_, err = db.Exec(`UPDATE pending_publications SET tracked_count=tracked_count+1 WHERE worktree=?`, state.worktree)
+			} else {
+				_, err = db.Exec(`UPDATE bindings SET device_id=? WHERE worktree=?`, testOtherDeviceID, state.worktree)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := openWorktreeRoot(state.worktree, func(*os.File) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, scanErr := scanWorktree(root)
+			if err := errors.Join(scanErr, root.Close()); err != nil {
+				t.Fatal(err)
+			}
+			beforeIndex := countClientRows(t, state.clientDir, "path_index", state.worktree)
+			head := remoteHead{CommitID: &pending.CandidateCommit, ETag: "published-etag"}
+			if err := finalizePublished(t.Context(), db, binding, snapshot, head, pending, io.Discard); err == nil {
+				t.Fatal("stale finalization succeeded")
+			}
+			afterBinding := readTestBinding(t, state.clientDir, state.worktree)
+			afterPending := readTestPendingPublication(t, state.clientDir, state.worktree)
+			if countClientRows(t, state.clientDir, "path_index", state.worktree) != beforeIndex ||
+				afterBinding.SyncBase != binding.SyncBase || afterBinding.SyncBaseRoot != binding.SyncBaseRoot ||
+				afterBinding.HeadETag != binding.HeadETag || afterPending.CandidateCommit != pending.CandidateCommit {
+				t.Fatalf("stale %s partially finalized: binding=%+v pending=%+v", stale, afterBinding, afterPending)
+			}
+			if stale == "pending field" && afterPending.TrackedCount != pending.TrackedCount+1 {
+				t.Fatalf("stale pending row was overwritten: before=%+v after=%+v", pending, afterPending)
+			}
+			if stale == "binding device" && afterBinding.DeviceID != testOtherDeviceID {
+				t.Fatalf("stale binding row was overwritten: %+v", afterBinding)
+			}
+		})
+	}
+}
+
+func TestLibrarySyncRecursivelyMergesNestedDirectory(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.MkdirAll(filepath.Join(publisherTree, "nested", "deep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]string{"local.txt": "base-local", "remote.txt": "base-remote"} {
+		if err := os.WriteFile(filepath.Join(publisherTree, "nested", "deep", name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(publisherTree, "nested", "deep", "remote.txt"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "nested", "deep", "local.txt"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"local.txt": "local", "remote.txt": "remote"} {
+		data, err := os.ReadFile(filepath.Join(subscriberTree, "nested", "deep", name))
+		if err != nil || string(data) != want {
+			t.Fatalf("nested %s=%q err=%v", name, data, err)
+		}
+	}
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+}
+
+func TestLibrarySyncRecursiveMergeParentsAndCapturedSnapshot(t *testing.T) {
 	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
 	if err := os.WriteFile(filepath.Join(publisherTree, "remote"), []byte("remote"), 0o600); err != nil {
 		t.Fatal(err)
@@ -151,12 +572,459 @@ func TestLibrarySyncRejectsBothSidesChanged(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(subscriberTree, "local"), []byte("local"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := syncTestWorktree(t, subscriberDir, subscriberTree)
-	if err == nil || !strings.Contains(err.Error(), "merge is not supported") {
-		t.Fatalf("both changed error=%v", err)
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			now:           func() time.Time { return time.Date(2026, 8, 9, 15, 0, 0, 0, time.UTC) },
+			beforeHeadCAS: func() error { return errors.New("inspect merge") }})
+	if err == nil || !strings.Contains(err.Error(), "inspect merge") {
+		t.Fatalf("merge inspection error=%v", err)
 	}
-	if data, err := os.ReadFile(filepath.Join(subscriberTree, "local")); err != nil || string(data) != "local" {
-		t.Fatalf("rejected merge changed local data=%q err=%v", data, err)
+	pending := readTestPendingPublication(t, subscriberDir, subscriberTree)
+	commit, err := object.VerifyCommit(pending.CandidateData, pending.CandidateCommit)
+	if err != nil || len(commit.Parents) != 2 || commit.Parents[0] != pending.ExpectedHead ||
+		commit.Parents[1] != pending.CapturedCommit || pending.CapturedRoot != scanTestRoot(t, subscriberTree) ||
+		pending.CandidateRoot == pending.CapturedRoot {
+		t.Fatalf("pending=%+v commit=%+v err=%v", pending, commit, err)
+	}
+}
+
+func TestLibrarySyncProtectedRecursiveMergeUploadsOnlyAfterConfirmation(t *testing.T) {
+	for _, test := range []struct {
+		name, count string
+		tracked     int
+		deleted     int
+	}{
+		{name: "ten percent", tracked: 10, deleted: 1},
+		{name: "more than one hundred", tracked: 102, deleted: 101},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts := newTrackedSyncPair(t, test.tracked)
+			if err := os.WriteFile(filepath.Join(publisherTree, "remote-addition"), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			for index := 0; index < test.deleted; index++ {
+				if err := os.Remove(filepath.Join(subscriberTree, fmt.Sprintf("tracked-%03d", index))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := readTestBinding(t, subscriberDir, subscriberTree)
+			beforeIndex := countClientRows(t, subscriberDir, "path_index", subscriberTree)
+			head, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+				[]byte(environment.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			puts.Store(0)
+			err = syncTestWorktree(t, subscriberDir, subscriberTree)
+			var required *deleteConfirmationRequiredError
+			if !errors.As(err, &required) || required.deleted != int64(test.deleted) || required.tracked != int64(test.tracked) {
+				t.Fatalf("protected recursive merge error=%v required=%+v", err, required)
+			}
+			pending := readTestPendingPublication(t, subscriberDir, subscriberTree)
+			if puts.Load() != 0 || pending.CandidateCommit != required.candidate ||
+				pending.CapturedCommit == pending.CandidateCommit || !pending.RequiresDeleteConfirmation || pending.DeleteConfirmed ||
+				readTestBinding(t, subscriberDir, subscriberTree) != before ||
+				countClientRows(t, subscriberDir, "path_index", subscriberTree) != beforeIndex {
+				t.Fatalf("protected recursive state puts=%d pending=%+v", puts.Load(), pending)
+			}
+			afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+				[]byte(environment.token))
+			if headErr != nil || head.CommitID == nil || afterHead.CommitID == nil || *head.CommitID != *afterHead.CommitID ||
+				head.ETag != afterHead.ETag || err.Error() != deletionConfirmationError(pending).Error() {
+				t.Fatalf("protected recursive Head/error changed: before=%+v after=%+v err=%v", head, afterHead, err)
+			}
+			if err := confirmTestDeletion(t, subscriberDir, subscriberTree,
+				pending.CandidateCommit[:deleteCandidatePrefixLen], libraryClientConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			assertTestConverged(t, environment, subscriberDir, subscriberTree)
+		})
+	}
+}
+
+func TestLibrarySyncProtectedRecursiveMergeSurvivesRepeatedHeadAdvances(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts := newTrackedSyncPair(t, 10)
+	if err := os.WriteFile(filepath.Join(publisherTree, "remote-0"), []byte("remote-0"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"tracked-000", "tracked-001"} {
+		if err := os.Remove(filepath.Join(subscriberTree, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	puts.Store(0)
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err == nil {
+		t.Fatal("initial protected merge succeeded")
+	}
+	first := readTestPendingPublication(t, subscriberDir, subscriberTree)
+	if history, err := _decodeCandidateHistory(first.CandidateHistory); err != nil || len(history) != 0 || puts.Load() != 0 {
+		t.Fatalf("initial history=%d puts=%d err=%v", len(history), puts.Load(), err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err == nil || puts.Load() != 0 {
+		t.Fatalf("restart error=%v puts=%d", err, puts.Load())
+	}
+
+	advance := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(publisherTree, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+			t.Fatal(err)
+		}
+		puts.Store(0)
+	}
+	advance("remote-1")
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err == nil {
+		t.Fatal("first protected replacement succeeded")
+	}
+	second := readTestPendingPublication(t, subscriberDir, subscriberTree)
+	history, err := _decodeCandidateHistory(second.CandidateHistory)
+	if err != nil || len(history) != 1 || !bytes.Equal(history[0], first.CandidateData) || puts.Load() != 0 ||
+		second.BaseCommit != first.ExpectedHead || second.CapturedCommit != first.CapturedCommit {
+		t.Fatalf("first replacement=%+v history=%d puts=%d err=%v", second, len(history), puts.Load(), err)
+	}
+
+	advance("remote-2")
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err == nil {
+		t.Fatal("second protected replacement succeeded")
+	}
+	third := readTestPendingPublication(t, subscriberDir, subscriberTree)
+	history, err = _decodeCandidateHistory(third.CandidateHistory)
+	if err != nil || len(history) != 2 || !bytes.Equal(history[0], first.CandidateData) ||
+		!bytes.Equal(history[1], second.CandidateData) || puts.Load() != 0 || third.BaseCommit != second.ExpectedHead ||
+		third.CapturedCommit != first.CapturedCommit || third.CapturedRoot != first.CapturedRoot ||
+		!bytes.Equal(third.CapturedData, first.CapturedData) {
+		t.Fatalf("second replacement=%+v history=%d puts=%d err=%v", third, len(history), puts.Load(), err)
+	}
+	binding := readTestBinding(t, subscriberDir, subscriberTree)
+	db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := openWorktreeRoot(subscriberTree, func(*os.File) error { return nil })
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	snapshot, err := scanWorktree(root)
+	if err != nil {
+		root.Close()
+		db.Close()
+		t.Fatal(err)
+	}
+	head, err := getRemoteHead(t.Context(), mustServerURL(t, binding.ServerURL), testClientLibraryID, []byte(environment.token))
+	if err != nil {
+		root.Close()
+		db.Close()
+		t.Fatal(err)
+	}
+	budget := &_replayBudget{commitLimit: 2, treeLimit: _mergeMaxObjects, pathLimit: _mergeMaxObjects,
+		commits: make(map[string]object.Commit), walked: make(map[string]bool)}
+	puts.Store(0)
+	err = resumePublication(t.Context(), db, bindOptions{base: mustServerURL(t, binding.ServerURL),
+		libraryID: testClientLibraryID, token: []byte(environment.token), clientDir: subscriberDir, worktreeRoot: root},
+		binding, snapshot, head, third, io.Discard, normalizeLibraryClientConfig(libraryClientConfig{}), budget)
+	if closeErr := errors.Join(root.Close(), db.Close()); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "cumulative synchronization budget") || puts.Load() != 0 ||
+		!reflect.DeepEqual(readTestPendingPublication(t, subscriberDir, subscriberTree), third) ||
+		readTestBinding(t, subscriberDir, subscriberTree) != binding {
+		t.Fatalf("cumulative history budget changed state: err=%v puts=%d", err, puts.Load())
+	}
+
+	firstMerge, err := object.VerifyCommit(history[0], object.ID(history[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := time.Parse("2006-01-02T15:04:05Z", firstMerge.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alter := func(owner, device, root string, parents []string) []byte {
+		t.Helper()
+		data, _, err := canonicalCommit(owner, device, root, parents, func() time.Time { return created })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	corruptions := map[string][][]byte{
+		"noncanonical commit": {append(append([]byte(nil), history[0]...), ' '), history[1]},
+		"wrong owner":         {alter("11111111-2222-4333-8444-555555555555", testClientDeviceID, firstMerge.Root, firstMerge.Parents), history[1]},
+		"wrong device":        {alter(testClientUserID, testClientDeviceID, firstMerge.Root, firstMerge.Parents), history[1]},
+		"wrong parents":       {alter(testClientUserID, testClientDeviceID, firstMerge.Root, []string{firstMerge.Parents[1], firstMerge.Parents[0]}), history[1]},
+		"wrong root":          {alter(testClientUserID, testClientDeviceID, third.CapturedRoot, firstMerge.Parents), history[1]},
+		"reordered":           {history[1], history[0]},
+		"duplicate":           {history[0], history[0]},
+	}
+	for name, commits := range corruptions {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := _encodeCandidateHistory(commits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			corrupt := third
+			corrupt.CandidateHistory = encoded
+			if err := verifyPendingPublication(corrupt, binding); err == nil {
+				t.Fatal("corrupt candidate history was accepted")
+			}
+		})
+	}
+	if err := confirmTestDeletion(t, subscriberDir, subscriberTree,
+		third.CandidateCommit[:deleteCandidatePrefixLen], libraryClientConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+}
+
+func TestRecursiveMergeReplayUsesCumulativePathBudget(t *testing.T) {
+	data, id, err := canonicalDirectory("", []scanEntry{{name: "a", kind: "File", id: strings.Repeat("0", 64),
+		modified: "2026-08-10T00:00:00Z"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := &_replayBudget{commitLimit: 10, treeLimit: 10, pathLimit: 1, commits: make(map[string]object.Commit),
+		walked: make(map[string]bool)}
+	merger := &_treeMerger{ctx: t.Context(), directories: map[string][]byte{id: data}, synthesized: make(map[string][]byte),
+		active: make(map[string]bool), seen: make(map[string]bool), budget: budget}
+	if paths, err := merger.paths(id, "", 0); err != nil || len(paths) != 1 {
+		t.Fatalf("first bounded traversal paths=%d err=%v", len(paths), err)
+	}
+	if _, err := merger.paths(id, "", 0); err == nil || !strings.Contains(err.Error(), "cumulative path budget") {
+		t.Fatalf("second traversal error=%v", err)
+	}
+}
+
+func TestCandidateHistoryCodecRejectsCorruption(t *testing.T) {
+	valid, err := _encodeCandidateHistory([][]byte{[]byte("commit")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tooMany := append([]byte(nil), _emptyCandidateHistory...)
+	binary.BigEndian.PutUint32(tooMany[4:], maxSyncParentWalk+1)
+	cases := map[string][]byte{
+		"short header":       valid[:7],
+		"truncated length":   valid[:10],
+		"zero length":        append(append([]byte(nil), _emptyCandidateHistory[:4]...), 0, 0, 0, 1, 0, 0, 0, 0),
+		"oversized metadata": append(append([]byte(nil), _emptyCandidateHistory[:4]...), 0, 0, 0, 1, 0, 1, 0, 1),
+		"trailing data":      append(append([]byte(nil), valid...), 0),
+		"too many commits":   tooMany,
+		"wrong magic":        append([]byte("BAD!"), _emptyCandidateHistory[4:]...),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := _decodeCandidateHistory(data); err == nil {
+				t.Fatal("corrupt candidate history was accepted")
+			}
+		})
+	}
+}
+
+func TestLibrarySyncProtectedRecursiveMutationInvalidatesConfirmation(t *testing.T) {
+	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _ := newTrackedSyncPair(t, 10)
+	if err := os.WriteFile(filepath.Join(publisherTree, "remote-addition"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(subscriberTree, "tracked-000")); err != nil {
+		t.Fatal(err)
+	}
+	err := syncTestWorktree(t, subscriberDir, subscriberTree)
+	var required *deleteConfirmationRequiredError
+	if !errors.As(err, &required) {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "mutation"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = confirmTestDeletion(t, subscriberDir, subscriberTree, required.candidate[:deleteCandidatePrefixLen], libraryClientConfig{})
+	if err == nil || !strings.Contains(err.Error(), "stale candidate discarded") ||
+		countClientRows(t, subscriberDir, "pending_publications", subscriberTree) != 0 {
+		t.Fatalf("mutated recursive confirmation error=%v", err)
+	}
+}
+
+func TestLibrarySyncProtectedReplacementStoresBeforeUpload(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts := newTrackedSyncPair(t, 10)
+	if err := os.Remove(filepath.Join(subscriberTree, "tracked-000")); err != nil {
+		t.Fatal(err)
+	}
+	err := syncTestWorktree(t, subscriberDir, subscriberTree)
+	var required *deleteConfirmationRequiredError
+	if !errors.As(err, &required) {
+		t.Fatal(err)
+	}
+	old := readTestPendingPublication(t, subscriberDir, subscriberTree)
+	var putsAtReplacement atomic.Int32
+	config := libraryClientConfig{beforeHeadCAS: func() error {
+		if err := os.WriteFile(filepath.Join(publisherTree, "remote-addition"), []byte("remote"), 0o600); err != nil {
+			return err
+		}
+		return syncTestWorktree(t, publisherDir, publisherTree)
+	}, afterPendingReplacement: func() error {
+		putsAtReplacement.Store(puts.Load())
+		return nil
+	}}
+	puts.Store(0)
+	err = confirmTestDeletion(t, subscriberDir, subscriberTree, old.CandidateCommit[:deleteCandidatePrefixLen], config)
+	if !errors.As(err, &required) {
+		t.Fatalf("protected replacement error=%v", err)
+	}
+	next := readTestPendingPublication(t, subscriberDir, subscriberTree)
+	if next.CandidateCommit == old.CandidateCommit ||
+		next.CandidateCommit[:deleteCandidatePrefixLen] == old.CandidateCommit[:deleteCandidatePrefixLen] ||
+		required.candidate != next.CandidateCommit || next.DeleteConfirmed || !next.RequiresDeleteConfirmation ||
+		puts.Load() != putsAtReplacement.Load() ||
+		puts.Load() == 0 || next.CapturedCommit != old.CapturedCommit || !bytes.Equal(next.CapturedData, old.CapturedData) {
+		t.Fatalf("replacement old=%+v next=%+v puts=%d at-replacement=%d", old, next, puts.Load(), putsAtReplacement.Load())
+	}
+	head, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+		[]byte(environment.token))
+	if headErr != nil || head.CommitID == nil || *head.CommitID != next.ExpectedHead {
+		t.Fatalf("replacement Head=%+v err=%v", head, headErr)
+	}
+}
+
+func TestRecursiveMergeDirectoryMtimeFollowsMergedContent(t *testing.T) {
+	emptyData, emptyID, err := canonicalEmptyDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeDirectory := func(entries ...scanEntry) ([]byte, string) {
+		t.Helper()
+		data, id, err := canonicalDirectory("child", entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data, id
+	}
+	baseData, baseID := makeDirectory(scanEntry{name: "base", kind: "File", id: emptyID, modified: "2026-01-01T00:00:00Z"})
+	localData, localID := makeDirectory(
+		scanEntry{name: "base", kind: "File", id: emptyID, modified: "2026-01-01T00:00:00Z"},
+		scanEntry{name: "local", kind: "File", id: emptyID, modified: "2026-01-02T00:00:00Z"})
+	remoteData, remoteID := makeDirectory(
+		scanEntry{name: "base", kind: "File", id: emptyID, modified: "2026-01-01T00:00:00Z"},
+		scanEntry{name: "remote", kind: "File", id: emptyID, modified: "2026-01-02T00:00:00Z"})
+
+	const t0, t1, t2 = "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"
+	for _, test := range []struct {
+		name                          string
+		localID, localMtime           string
+		remoteID, remoteMtime, wantID string
+		wantMtime                     string
+		synthesized                   bool
+	}{
+		{name: "local content beats newer remote mtime", localID: localID, localMtime: t1,
+			remoteID: baseID, remoteMtime: t2, wantID: localID, wantMtime: t1},
+		{name: "remote content beats newer local mtime", localID: baseID, localMtime: t2,
+			remoteID: remoteID, remoteMtime: t1, wantID: remoteID, wantMtime: t1},
+		{name: "same content takes newer mtime", localID: localID, localMtime: t1,
+			remoteID: localID, remoteMtime: t2, wantID: localID, wantMtime: t2},
+		{name: "synthesized content takes newer mtime", localID: localID, localMtime: t1,
+			remoteID: remoteID, remoteMtime: t2, wantMtime: t2, synthesized: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			merge := func(localChildID, localMtime, remoteChildID, remoteMtime string) (string, string, string) {
+				t.Helper()
+				makeParent := func(childID, mtime string) ([]byte, string) {
+					return makeDirectory(scanEntry{name: "child", kind: "Directory", id: childID, modified: mtime})
+				}
+				baseParentData, baseParentID := makeParent(baseID, t0)
+				localParentData, localParentID := makeParent(localChildID, localMtime)
+				remoteParentData, remoteParentID := makeParent(remoteChildID, remoteMtime)
+				merger := &_treeMerger{directories: map[string][]byte{emptyID: emptyData, baseID: baseData,
+					localID: localData, remoteID: remoteData, baseParentID: baseParentData,
+					localParentID: localParentData, remoteParentID: remoteParentData}, synthesized: make(map[string][]byte),
+					active: make(map[string]bool), seen: make(map[string]bool)}
+				root, err := merger.merge(baseParentID, localParentID, remoteParentID, "", 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				directory, err := merger.loadDirectory(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				entry := directory.Entries[0]
+				return root, entry.ID, entry.ModifiedAt
+			}
+			forwardRoot, forwardID, forwardMtime := merge(test.localID, test.localMtime, test.remoteID, test.remoteMtime)
+			reverseRoot, reverseID, reverseMtime := merge(test.remoteID, test.remoteMtime, test.localID, test.localMtime)
+			if forwardRoot != reverseRoot || forwardID != reverseID || forwardMtime != test.wantMtime || reverseMtime != forwardMtime {
+				t.Fatalf("forward=%s/%s/%s reverse=%s/%s/%s", forwardRoot, forwardID, forwardMtime,
+					reverseRoot, reverseID, reverseMtime)
+			}
+			if test.synthesized {
+				if forwardID == test.localID || forwardID == test.remoteID || forwardID == baseID {
+					t.Fatalf("merged child ID %s was not synthesized", forwardID)
+				}
+			} else if forwardID != test.wantID {
+				t.Fatalf("merged child ID=%s, want %s", forwardID, test.wantID)
+			}
+		})
+	}
+}
+
+func TestLibrarySyncSamePathBoundariesLeaveStateUntouched(t *testing.T) {
+	for _, test := range []struct {
+		name, issue string
+		remote      func(string) error
+		local       func(string) error
+	}{
+		{"divergent file", "Issue #17", func(root string) error {
+			return os.WriteFile(filepath.Join(root, "base"), []byte("remote"), 0o600)
+		}, func(root string) error { return os.WriteFile(filepath.Join(root, "base"), []byte("local"), 0o600) }},
+		{"delete modify", "Issue #18", func(root string) error {
+			return os.WriteFile(filepath.Join(root, "base"), []byte("remote"), 0o600)
+		}, func(root string) error { return os.Remove(filepath.Join(root, "base")) }},
+		{"type conflict", "Issue #18", func(root string) error {
+			if err := os.Remove(filepath.Join(root, "base")); err != nil {
+				return err
+			}
+			return os.Mkdir(filepath.Join(root, "base"), 0o700)
+		}, func(root string) error { return os.WriteFile(filepath.Join(root, "base"), []byte("local"), 0o600) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts, _ := newSyncPair(t)
+			if err := test.remote(publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktreeConfirmingDeletes(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.local(subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+			beforeRoot := scanTestRoot(t, subscriberTree)
+			beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+				[]byte(environment.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			puts.Store(0)
+			err = syncTestWorktree(t, subscriberDir, subscriberTree)
+			if err == nil || !strings.Contains(err.Error(), test.issue) {
+				t.Fatalf("boundary error=%v", err)
+			}
+			afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+				[]byte(environment.token))
+			if after := readTestBinding(t, subscriberDir, subscriberTree); after != beforeBinding ||
+				scanTestRoot(t, subscriberTree) != beforeRoot || countClientRows(t, subscriberDir, "pending_publications", subscriberTree) != 0 ||
+				puts.Load() != 0 || headErr != nil || afterHead.CommitID == nil || beforeHead.CommitID == nil ||
+				*afterHead.CommitID != *beforeHead.CommitID || afterHead.ETag != beforeHead.ETag {
+				t.Fatalf("boundary changed state: binding=%+v head=%+v err=%v puts=%d", after, afterHead, headErr, puts.Load())
+			}
+		})
 	}
 }
 
@@ -625,8 +1493,8 @@ func TestLibrarySyncMergeReplacementResetsDeleteConfirmation(t *testing.T) {
 	}
 }
 
-func TestLibrarySyncBothRootsChangedPreservesPending(t *testing.T) {
-	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+func TestLibrarySyncPendingBothRootsChangedMerges(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
 	if err := os.WriteFile(filepath.Join(subscriberTree, "local-change"), []byte("local"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -643,13 +1511,18 @@ func TestLibrarySyncBothRootsChangedPreservesPending(t *testing.T) {
 	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
 		t.Fatal(err)
 	}
-	err = syncTestWorktree(t, subscriberDir, subscriberTree)
-	if err == nil || !strings.Contains(err.Error(), "recursive merge is unavailable") {
-		t.Fatalf("recursive merge boundary error=%v", err)
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
 	}
-	if after := readTestPendingPublication(t, subscriberDir, subscriberTree); !reflect.DeepEqual(after, before) {
-		t.Fatalf("recursive merge changed pending: before=%+v after=%+v", before, after)
+	if count := countClientRows(t, subscriberDir, "pending_publications", subscriberTree); count != 0 {
+		t.Fatalf("pending rows=%d, before=%+v", count, before)
 	}
+	for name, want := range map[string]string{"local-change": "local", "remote-change": "remote"} {
+		if data, err := os.ReadFile(filepath.Join(subscriberTree, name)); err != nil || string(data) != want {
+			t.Fatalf("merged %s=%q err=%v", name, data, err)
+		}
+	}
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
 }
 
 func publishSameRootSuccessor(t *testing.T, state importedBinding, created time.Time) string {
@@ -771,6 +1644,50 @@ func TestLibrarySyncInterrupted100MiBUploadSendsOnlyMissingBlocks(t *testing.T) 
 		t.Fatalf("distinct block count=%d, want 25", len(expected))
 	}
 	assertTestConverged(t, environment, clientDir, worktree)
+}
+
+func TestLibrarySyncRecursiveMergeResolvesLostCASResponse(t *testing.T) {
+	var updates atomic.Int32
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{AfterHeadUpdate: func() error {
+		if updates.Add(1) == 4 {
+			return errors.New("response lost")
+		}
+		return nil
+	}})
+	publisherDir, publisherTree := newClientPaths(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := append(bindArgs(publisherDir, environment.server.URL, testClientLibraryID, publisherTree, testClientDeviceID), "--import-local")
+	if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	subscriberDir, subscriberTree := newClientPaths(t)
+	if err := runTest(t.Context(), bindArgs(subscriberDir, environment.server.URL, testClientLibraryID, subscriberTree, testOtherDeviceID),
+		strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(publisherTree, "remote"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "local"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatalf("recursive lost response sync: %v", err)
+	}
+	if updates.Load() != 4 {
+		t.Fatalf("Head updates=%d", updates.Load())
+	}
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+	for name, want := range map[string]string{"local": "local", "remote": "remote"} {
+		if data, err := os.ReadFile(filepath.Join(subscriberTree, name)); err != nil || string(data) != want {
+			t.Fatalf("merged %s=%q err=%v", name, data, err)
+		}
+	}
 }
 
 func TestLibrarySyncResolvesLostCASResponse(t *testing.T) {
@@ -1810,6 +2727,36 @@ func newSyncPair(t *testing.T) (libraryCLIEnvironment, string, string, string, s
 	puts.Store(0)
 	commits.Store(0)
 	return environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts, commits
+}
+
+func newTrackedSyncPair(t *testing.T, tracked int) (libraryCLIEnvironment, string, string, string, string, *atomic.Int32) {
+	t.Helper()
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	publisherDir, publisherTree := newClientPaths(t)
+	for index := 0; index < tracked; index++ {
+		if err := os.WriteFile(filepath.Join(publisherTree, fmt.Sprintf("tracked-%03d", index)), []byte("base"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := append(bindArgs(publisherDir, environment.server.URL, testClientLibraryID, publisherTree, testClientDeviceID), "--import-local")
+	if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	puts := &atomic.Int32{}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			puts.Add(1)
+		}
+		environment.handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	subscriberDir, subscriberTree := newClientPaths(t)
+	if err := runTest(t.Context(), bindArgs(subscriberDir, proxy.URL, testClientLibraryID, subscriberTree, testOtherDeviceID),
+		strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	puts.Store(0)
+	return environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts
 }
 
 func newEmptySyncPair(t *testing.T) (libraryCLIEnvironment, string, string, string, string) {

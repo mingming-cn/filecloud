@@ -399,6 +399,13 @@ func TestClientV20PendingPublicationFingerprint(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
+			if _, err := db.Exec(`DROP TABLE pending_publications;
+				DELETE FROM client_schema_migrations WHERE version=21`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(clientV20PendingSQL); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := db.Exec(`INSERT INTO pending_publications VALUES
 				('/work','base','root','base','etag','candidate','candidate-root',X'0102',101,101,1,0,0)`); err != nil {
 				t.Fatal(err)
@@ -461,8 +468,195 @@ func TestClientV20PendingPublicationFingerprint(t *testing.T) {
 	})
 }
 
-func TestPendingPublicationV18AndV19ExpectedHeadMigration(t *testing.T) {
-	for _, version := range []int{18, 19} {
+func TestClientV21PendingPublicationFingerprint(t *testing.T) {
+	rebuild := func(db *sql.DB, createSQL string) error {
+		if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO old_pending_publications`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(createSQL); err != nil {
+			return err
+		}
+		_, err := db.Exec(`DROP TABLE old_pending_publications`)
+		return err
+	}
+	cases := []struct {
+		name   string
+		mutate func(*sql.DB) error
+	}{
+		{"removed check", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(_clientV21PendingSQL,
+				"CHECK(deletion_count >= 0 AND tracked_count >= deletion_count)", "CHECK(deletion_count >= 0)", 1))
+		}},
+		{"altered default", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(_clientV21PendingSQL,
+				"deletion_count INTEGER NOT NULL DEFAULT 0", "deletion_count INTEGER NOT NULL DEFAULT 1", 1))
+		}},
+		{"altered nullability", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(_clientV21PendingSQL, "captured_data BLOB NOT NULL", "captured_data BLOB", 1))
+		}},
+		{"altered type", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(_clientV21PendingSQL, "captured_data BLOB NOT NULL", "captured_data TEXT NOT NULL", 1))
+		}},
+		{"altered captured default", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(_clientV21PendingSQL, "captured_data BLOB NOT NULL", "captured_data BLOB NOT NULL DEFAULT X''", 1))
+		}},
+		{"altered history nullability", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(_clientV21PendingSQL, "candidate_history BLOB NOT NULL", "candidate_history BLOB", 1))
+		}},
+		{"altered history type", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(_clientV21PendingSQL, "candidate_history BLOB NOT NULL", "candidate_history TEXT NOT NULL", 1))
+		}},
+		{"altered history default", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(_clientV21PendingSQL, "candidate_history BLOB NOT NULL", "candidate_history BLOB NOT NULL DEFAULT X''", 1))
+		}},
+		{"intermediate schema without history", func(db *sql.DB) error {
+			createSQL := strings.Replace(_clientV21PendingSQL, ", candidate_history BLOB NOT NULL", "", 1)
+			createSQL = strings.Replace(createSQL, "\n\tCHECK(length(candidate_history) BETWEEN 8 AND 67112968),", "", 1)
+			return rebuild(db, createSQL)
+		}},
+		{"extra trigger", func(db *sql.DB) error {
+			_, err := db.Exec(`CREATE TRIGGER captured_update AFTER UPDATE ON pending_publications BEGIN SELECT 1; END`)
+			return err
+		}},
+		{"extra view", func(db *sql.DB) error {
+			_, err := db.Exec(`CREATE VIEW captured_publications AS SELECT captured_commit FROM pending_publications`)
+			return err
+		}},
+		{"extra index", func(db *sql.DB) error {
+			_, err := db.Exec(`CREATE INDEX captured_commit_index ON pending_publications(captured_commit)`)
+			return err
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := test.mutate(db); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+				t.Fatal(err)
+			}
+			var databasePath, beforeSchema string
+			if err := db.QueryRow("SELECT file FROM pragma_database_list WHERE name='main'").Scan(&databasePath); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT group_concat(type || ':' || name || ':' || COALESCE(sql,''), char(10))
+				FROM (SELECT type,name,sql FROM sqlite_schema ORDER BY type,name)`).Scan(&beforeSchema); err != nil {
+				t.Fatal(err)
+			}
+			beforeBytes, err := os.ReadFile(databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := initializeClientSchema(t.Context(), db); err == nil {
+				t.Fatal("invalid v21 schema was accepted")
+			}
+			var afterSchema string
+			if err := db.QueryRow(`SELECT group_concat(type || ':' || name || ':' || COALESCE(sql,''), char(10))
+				FROM (SELECT type,name,sql FROM sqlite_schema ORDER BY type,name)`).Scan(&afterSchema); err != nil {
+				t.Fatal(err)
+			}
+			afterBytes, err := os.ReadFile(databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if beforeSchema != afterSchema || !bytes.Equal(beforeBytes, afterBytes) {
+				t.Fatal("v21 rejection changed schema or database bytes")
+			}
+			var version int
+			if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&version); err != nil || version != 21 {
+				t.Fatalf("schema rejection changed version=%d err=%v", version, err)
+			}
+		})
+	}
+}
+
+func TestPendingPublicationBlobLimits(t *testing.T) {
+	for _, test := range []struct {
+		name, candidate, captured, history string
+	}{
+		{"candidate_data", "zeroblob(65537)", "X'01'", "X'4643483100000000'"},
+		{"captured_data", "X'01'", "zeroblob(65537)", "X'4643483100000000'"},
+		{"candidate_history", "X'01'", "X'01'", "zeroblob(67112969)"},
+	} {
+		t.Run("current load/"+test.name, func(t *testing.T) {
+			db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			statement := `PRAGMA ignore_check_constraints=ON;
+				INSERT INTO pending_publications VALUES('/work','base','root','base','etag','candidate','root',` +
+				test.candidate + `,'candidate','root',` + test.captured + `,` + test.history + `,0,0,0,0,0)`
+			if _, err := db.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+			if pending, err := loadPendingPublication(t.Context(), db, "/work"); err == nil || pending != nil ||
+				!strings.Contains(err.Error(), "exceeds synchronization budget") {
+				t.Fatalf("oversized pending load=%+v err=%v", pending, err)
+			}
+			var rows int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM pending_publications WHERE worktree='/work'`).Scan(&rows); err != nil || rows != 1 {
+				t.Fatalf("oversized load changed row count=%d err=%v", rows, err)
+			}
+		})
+	}
+
+	t.Run("v20 migration preflight", func(t *testing.T) {
+		clientDir := t.TempDir()
+		db, err := initializeClientDB(t.Context(), clientDir, syncDirectory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := db.Exec(`DROP TABLE pending_publications;
+			DELETE FROM client_schema_migrations WHERE version=21`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(clientV20PendingSQL); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO pending_publications VALUES
+			('/work','base','root','base','etag','candidate','root',zeroblob(65537),0,0,0,0,0);
+			PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			t.Fatal(err)
+		}
+		var databasePath, beforeSchema string
+		if err := db.QueryRow("SELECT file FROM pragma_database_list WHERE name='main'").Scan(&databasePath); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT group_concat(type || ':' || name || ':' || COALESCE(sql,''), char(10))
+			FROM (SELECT type,name,sql FROM sqlite_schema ORDER BY type,name)`).Scan(&beforeSchema); err != nil {
+			t.Fatal(err)
+		}
+		beforeBytes, err := os.ReadFile(databasePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := initializeClientSchema(t.Context(), db); err == nil || !strings.Contains(err.Error(), "exceeds synchronization budget") {
+			t.Fatalf("oversized v20 migration error=%v", err)
+		}
+		var afterSchema string
+		if err := db.QueryRow(`SELECT group_concat(type || ':' || name || ':' || COALESCE(sql,''), char(10))
+			FROM (SELECT type,name,sql FROM sqlite_schema ORDER BY type,name)`).Scan(&afterSchema); err != nil {
+			t.Fatal(err)
+		}
+		afterBytes, err := os.ReadFile(databasePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if beforeSchema != afterSchema || !bytes.Equal(beforeBytes, afterBytes) {
+			t.Fatal("oversized v20 rejection changed schema or database bytes")
+		}
+	})
+}
+
+func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
+	for _, version := range []int{18, 19, 20} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
 			if err != nil {
@@ -474,6 +668,9 @@ func TestPendingPublicationV18AndV19ExpectedHeadMigration(t *testing.T) {
 			if version == 19 {
 				createSQL = clientV19PendingSQL
 				values += ",0"
+			} else if version == 20 {
+				createSQL = clientV20PendingSQL
+				values = "'/work','base','root','base','etag','candidate','candidate-root',X'0102',0,0,0,0,0"
 			}
 			if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO new_pending_publications`); err != nil {
 				t.Fatal(err)
@@ -497,6 +694,16 @@ func TestPendingPublicationV18AndV19ExpectedHeadMigration(t *testing.T) {
 			}
 			if expected != base || expected != "base" {
 				t.Fatalf("v%d migration expected=%q base=%q", version, expected, base)
+			}
+			var capturedCommit, capturedRoot string
+			var candidateData, capturedData, history []byte
+			if err := db.QueryRow(`SELECT captured_commit,captured_root,candidate_data,captured_data,candidate_history
+				FROM pending_publications WHERE worktree='/work'`).Scan(&capturedCommit, &capturedRoot, &candidateData,
+				&capturedData, &history); err != nil || capturedCommit != "candidate" || capturedRoot != "candidate-root" ||
+				!bytes.Equal(candidateData, capturedData) || !bytes.Equal(capturedData, []byte{1, 2}) ||
+				!bytes.Equal(history, _emptyCandidateHistory) {
+				t.Fatalf("v%d migration captured=%q/%q data=%x/%x history=%x err=%v", version, capturedCommit,
+					capturedRoot, candidateData, capturedData, history, err)
 			}
 		})
 	}
@@ -548,24 +755,25 @@ func TestPendingPublicationV17DeletionConfirmationMigration(t *testing.T) {
 	}
 	var columns, version, rows int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pending_publications') WHERE name IN
-		('expected_head','deletion_count','tracked_count','requires_delete_confirmation','delete_confirmed',
-		'legacy_revalidation_required')`).Scan(&columns); err != nil {
+		('expected_head','captured_commit','captured_root','captured_data','candidate_history','deletion_count','tracked_count',
+		'requires_delete_confirmation','delete_confirmed','legacy_revalidation_required')`).Scan(&columns); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow("SELECT MAX(version) FROM client_schema_migrations").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pending_publications WHERE worktree='/work' AND expected_head=base_commit
-		AND deletion_count=0 AND tracked_count=0 AND requires_delete_confirmation=0 AND delete_confirmed=0
-		AND legacy_revalidation_required=1`).Scan(&rows); err != nil {
+		AND captured_commit=candidate_commit AND captured_root=candidate_root AND captured_data=candidate_data
+		AND candidate_history=X'4643483100000000' AND deletion_count=0 AND tracked_count=0
+		AND requires_delete_confirmation=0 AND delete_confirmed=0 AND legacy_revalidation_required=1`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if columns != 6 || version != clientSchemaVersion || rows != 1 {
+	if columns != 10 || version != clientSchemaVersion || rows != 1 {
 		t.Fatalf("columns=%d version=%d preserved_rows=%d", columns, version, rows)
 	}
 	for _, values := range []string{
-		"'/bad','base','root','base','etag','candidate','root',X'00',1,20,0,0,1",
-		"'/bad','base','root','base','etag','candidate','root',X'00',1,20,0,1,0",
+		"'/bad','base','root','base','etag','candidate','root',X'00','candidate','root',X'00',X'4643483100000000',1,20,0,0,1",
+		"'/bad','base','root','base','etag','candidate','root',X'00','candidate','root',X'00',X'4643483100000000',1,20,0,1,0",
 	} {
 		if _, err := db.Exec("INSERT INTO pending_publications VALUES(" + values + ")"); err == nil {
 			t.Fatal("pending publication CHECK accepted inconsistent legacy or confirmation state")

@@ -194,11 +194,11 @@ stateDiagram-v2
 
 ### 上传与发布
 
-客户端先上传候选 Commit 及所有引用对象。对象 PUT 天然幂等；批量检查只减少请求，不影响正确性。CAS 前在本地事务中保存 `PendingPublication{Base, ExpectedHead, ExpectedETag, CommitId}`，再以 `If-Match` 发布 Head。
+客户端先在本地构造候选 Commit 及完整引用图并持久化 `PendingPublication{Base, ExpectedHead, ExpectedETag, Candidate, Captured, CandidateHistory}`；若命中删除保护，在精确确认前不上传任何对象。授权后才上传稳定扫描对象、Captured Commit、按 ID 排序去重的合成目录、按时间顺序的历史 Candidate Commit 和当前 Candidate Commit，最后以 `If-Match` 发布 Head。对象 PUT 天然幂等；批量检查只减少请求，不影响正确性。`CapturedCommit/CapturedRoot/CapturedData` 标识当前工作目录稳定扫描对应的本地提交、根和规范提交正文；普通发布中 Captured 等于 Candidate，递归合并中 Captured 是作为第二 parent 的本地提交，而 Candidate 是尚未 checkout 到工作目录的合并结果。`CandidateHistory` 按从旧到新的顺序保存连续 Head 冲突中被替换且尚未上传的 Candidate 规范正文；普通本地发布和第一次递归合并为空。连续 Head 冲突只替换 Candidate，始终保留 Captured 并把旧 Candidate 追加到历史。
 
-恢复 pending publication 时先读取远端 Head，再根据工作树变化决定是否丢弃候选：若等于 CommitId 且工作树仍等于候选 root，直接完成发布；若工作树已变化，则从远端候选 Commit/Directory 元数据重建 Sync Base 和路径索引、清除 pending，但不修改工作树，并要求重跑同步以把当前本地变化发布为后继提交。若 CommitId 是当前 Head 的可达祖先，说明它已发布且被后继提交包含，继续现有后继处理；若远端仍等于 ExpectedHead，才允许按候选状态重试 CAS；否则进入三方合并。祖先检查沿 parent 图执行并受与 Head 验证相同的深度和工作量预算约束。
+恢复 pending publication 时先读取远端 Head，并重新扫描工作目录。未上传的递归候选从持久化 CapturedData 和稳定扫描对象开始，按 CandidateHistory 再到当前 Candidate 的顺序逐步重放；每一步只读取已发布的远端 first parent，并把前一步生成的本地根和合成目录直接提供给下一步，不依赖旧 Candidate 已上传。重建逐项核对 Candidate root、规范正文、parents 和相对三方 Base 树计算的删除统计；重验只执行 GET 和本地 SQLite 操作。若 Candidate 已成为 Head 或其可达祖先，且扫描仍等于 Captured：CandidateRoot 等于 CapturedRoot 时直接完成普通发布；根不同时，在一个事务中把绑定和索引推进到 Captured、建立指向已观察 Head 的 pending checkout 并精确删除 pending publication，随后由既有文件系统 journal checkout。若 CAS 后扫描已变化，同一事务只把绑定和索引推进到 Captured、清除 publication pending，不覆盖工作目录，并要求重跑同步。若远端仍等于 ExpectedHead，才允许在扫描等于 Captured 时重试 CAS；否则进入三方合并。Candidate 的第二 parent 链必须在 1024 个提交内无环地到达 Captured，Captured 再到达绑定 Sync Base；链上提交必须是同一所有者和本地 Device。
 
-每次 `HeadConflict` 都以前一次请求的 ExpectedHead 作为新 Base、以上一次候选作为 Local、以最新 Head 作为 Remote 重新合并；替换后的 `Base/BaseRoot` 精确记录旧 `ExpectedHead` 及其已验证根，`ExpectedHead/ExpectedETag` 精确记录最新 Head CAS 对，合并 Commit 的 parents 固定为 `[最新 Head, 旧 Candidate]`。上传新对象后，在下一次 CAS 前原子替换 pending publication。不得一直使用最初 Sync Base 重放合并。只有 Sync Base 推进后才能清除 pending 状态。
+每次 `HeadConflict` 都以前一次请求的 ExpectedHead 作为新 Base、以上一次候选作为 Local、以最新 Head 作为 Remote 重新合并；替换后的 `Base/BaseRoot` 精确记录旧 `ExpectedHead` 及其已验证根，`ExpectedHead/ExpectedETag` 精确记录最新 Head CAS 对，合并 Commit 的 parents 固定为 `[最新 Head, 旧 Candidate]`。客户端先在本地重建合并图和统计并原子替换 pending publication，同时清除旧候选的删除确认；新候选未受保护或获得精确确认后才上传新合成目录和新 Candidate。删除统计按旧 ExpectedHead 树与新合并树重算，保护阈值命中时必须重新确认。不得一直使用最初 Sync Base 重放合并。只有 Sync Base 推进后才能清除 pending 状态。
 
 ### 下载与 checkout
 
@@ -234,9 +234,11 @@ stateDiagram-v2
 
 冲突名格式固定为 `<stem> (Filecloud conflict <DeviceId前8位小写十六进制> <YYYYMMDDTHHMMSSZ>)<ext>`，时间取本地候选 Commit 的 `CreatedAt`。若碰撞，追加 ` 2`、` 3`。每次追加后都重新执行 Unicode、段长和总路径检查。生成器按 UTF-8 边界截短 stem 以满足 240 字节段上限；若同目录的完整路径仍超过上限，则依次尝试资料库根目录 `Filecloud Conflicts`、`Filecloud Conflicts 2` 等：已有同名目录可复用，已有同名非目录则递增，直到得到合法目录。内部文件名使用 `<CandidateCommitId前12位>-<截短basename>` 并执行同样碰撞检查。冲突副本也进入合并 Commit，因此会同步到其他设备。
 
-mtime 规则：只有一侧路径状态改变时采用该侧；双方 FileId 相同而只有 mtime 不同时采用字典序较大的规范 UTC 时间；双方内容冲突时原路径和冲突副本各保留各自 mtime。递归合并目录后，结果 DirectoryId 等于某一侧时采用该侧 mtime；产生新 DirectoryId 时采用 Local/Remote 规范 mtime 中字典序较大的值。目录 mtime 在全部子项 checkout 后最后设置。该规则不依赖本地时钟正确性，只要求确定性。
+mtime 规则：只有一侧路径状态改变时采用该侧；双方 FileId 或 DirectoryId 相同而只有 mtime 不同时采用字典序较大的规范 UTC 时间；双方内容冲突时原路径和冲突副本各保留各自 mtime。递归合并目录后，仅结果 DirectoryId 只等于单独一侧时采用该侧 mtime；结果同时等于两侧或产生新 DirectoryId 时采用 Local/Remote 规范 mtime 中字典序较大的值。目录 mtime 在全部子项 checkout 后最后设置。该规则不依赖本地时钟正确性，只要求确定性。
 
-目录/文件类型互换按“不同改变”处理，本地完整子树保存到冲突目录，不能只保留根 entry。目录删除与对端修改也递归保留修改侧完整子树。第一阶段不做文本内容自动合并。重命名由树差异表现为删除加新增；相同对象 ID 可用于展示或优化，但不改变上述无损规则。
+当前递归合并只处理不同精确路径上的无冲突变化：名称集合按规范字节排序，目录即使双方 DirectoryId 都变化也按名称递归；双方新建目录以空目录为 Base。双方文件 ID 相同而仅 mtime 不同时取较大规范时间；新建或重建目录 entry 的 mtime 取两侧较大值，完整复用一侧 entry 时保留该侧 mtime。遍历限制为目录深 256、路径 1024 bytes，并共享有界对象/entry 工作预算；缓存和远端对象每次按规范内容与 ID 验证。
+
+同一路径双方出现不同 FileId 属于 Issue #17；删除与修改、目录删除与子树修改以及文件/目录类型冲突属于 Issue #18。当前实现对这些情况返回边界错误，不生成文本合并或冲突副本，不改变工作目录、pending、Head 或绑定，也不上传新的合并对象。同目录出现大小写折叠或规范名称碰撞同样作为结构边界失败。后续实现 #17/#18 时再启用上表中的冲突副本和子树保留语义。重命名仍由树差异表现为删除加新增。
 
 ## 路径规则
 
@@ -259,7 +261,7 @@ JCS 本身不做 Unicode normalization，因此名称必须先按 Unicode 15.1 N
 
 ## 删除保护
 
-若候选提交删除超过 100 个已跟踪路径或当前已跟踪路径总数的 10%（含边界），客户端先持久化候选、扫描根和删除统计，再默认中止；此时不上传任何对象、不更新 Head，也不改变 Sync Base 或路径索引。删除数按 `path_index` 中不存在于新扫描结果的文件和目录路径计算。错误仅返回 Candidate Commit 的固定 12 位小写十六进制前缀、删除数、已跟踪总数、百分比和阈值，不返回路径名或内容。
+若候选提交删除超过 100 个已跟踪路径或当前已跟踪路径总数的 10%（含边界），客户端先持久化候选、扫描根和删除统计，再默认中止；此时不上传任何对象、不更新 Head，也不改变 Sync Base 或路径索引。普通候选的删除数按 `path_index` 中不存在于新扫描结果的文件和目录路径计算；递归候选按该轮三方合并的 Base 树与合并结果路径计算，不复用可能属于不同 Base 的索引。错误仅返回 Candidate Commit 的固定 12 位小写十六进制前缀、删除数、已跟踪总数、百分比和阈值，不返回路径名或内容。
 
 只有 `sync --confirm-delete <prefix>` 可确认当前工作目录完全相同的受保护 pending 候选；参数必须恰好为错误给出的 12 位前缀，不能使用更短前缀、完整 CommitId、其他工作目录的候选或任意大小写变体。没有受保护 pending 候选时使用该参数会明确失败且不改变状态。确认前使用完整扫描器重新扫描：扫描根变化时删除旧候选并要求普通 `sync` 生成新候选；扫描根未变化时原子记录确认并复用已持久化的 CommitId 和提交正文。旧 schema 中没有删除统计的 pending 在迁移后标记为必须重验证，不得直接上传或发布；仅当远端仍是其 Expected Head 且扫描 root 相同时，才从当前路径索引重算统计并清除标记，受保护候选仍需一次新的精确确认。已确认候选的上传、网络或 CAS 失败保留确认状态，后续普通 `sync` 可继续；确认不转移到不同候选或不同同步基线。这是误操作保护，不改变三方合并的删除语义。
 
