@@ -232,15 +232,17 @@ stateDiagram-v2
 | 修改/新增 | 删除 | 原路径遵循 Remote 删除，Local 写冲突副本 |
 | 删除 | 删除 | 删除 |
 
-冲突名格式固定为 `<stem> (Filecloud conflict <DeviceId前8位小写十六进制> <YYYYMMDDTHHMMSSZ>)<ext>`，时间取本地候选 Commit 的 `CreatedAt`。若碰撞，追加 ` 2`、` 3`。每次追加后都重新执行 Unicode、段长和总路径检查。生成器按 UTF-8 边界截短 stem 以满足 240 字节段上限；若同目录的完整路径仍超过上限，则依次尝试资料库根目录 `Filecloud Conflicts`、`Filecloud Conflicts 2` 等：已有同名目录可复用，已有同名非目录则递增，直到得到合法目录。内部文件名使用 `<CandidateCommitId前12位>-<截短basename>` 并执行同样碰撞检查。冲突副本也进入合并 Commit，因此会同步到其他设备。
+冲突名格式固定为 `<stem> (Filecloud conflict <DeviceId前8位小写十六进制> <YYYYMMDDTHHMMSSZ>)<ext>`，时间取本地候选 Commit 的 `CreatedAt`。若碰撞，追加 ` 2`、` 3`。每次追加后都重新执行 Unicode、段长和总路径检查。Issue #19 实现前不截短 stem，也不回退到资料库根冲突目录；任何溢出在 pending 与上传前明确失败。冲突副本也进入合并 Commit，因此会同步到其他设备。
 
 mtime 规则：只有一侧路径状态改变时采用该侧；双方 FileId 或 DirectoryId 相同而只有 mtime 不同时采用字典序较大的规范 UTC 时间；双方内容冲突时原路径和冲突副本各保留各自 mtime。递归合并目录后，仅结果 DirectoryId 只等于单独一侧时采用该侧 mtime；结果同时等于两侧或产生新 DirectoryId 时采用 Local/Remote 规范 mtime 中字典序较大的值。目录 mtime 在全部子项 checkout 后最后设置。该规则不依赖本地时钟正确性，只要求确定性。
 
 当前递归合并按规范字节顺序处理名称集合，目录即使双方 DirectoryId 都变化也按名称递归；双方新建目录以空目录为 Base。双方文件 ID 相同而仅 mtime 不同时取较大规范时间；双方同路径 FileId 不同时保留 Remote 原路径，并按本地父 Commit 的规范 DeviceId、CreatedAt 生成 Local 冲突副本。初次合并使用 Captured Commit，连续 HeadConflict 使用旧 Candidate；新结果 Candidate 永不作为自身命名输入。新建或重建目录 entry 的 mtime 取两侧较大值，完整复用一侧 entry 时保留该侧 mtime。遍历限制为目录深 256、路径 1024 bytes，并共享有界对象/entry 工作预算；缓存和远端对象每次按规范内容与 ID 验证。
 
-删除与修改、目录删除与子树修改以及文件/目录类型冲突属于 Issue #18，当前仍返回耐久边界错误。同目录出现大小写折叠或规范名称碰撞同样作为结构边界失败。Issue #19 完成前，冲突名超过 240 bytes 或完整路径超过 1024 bytes 时返回明确边界，不截短、不创建根回退目录，也不保存 pending 或上传对象。重命名仍由树差异表现为删除加新增。
+删除与修改、目录删除与子树修改以及文件/目录类型冲突按同一三方规则处理：Remote 决定原路径，Local 的不同完整对象或子树使用确定冲突名；Local 删除而 Remote 修改时只保留 Remote，双方删除时路径消失。双方 FileId 相同但 mtime 不同时只保留一项并取较大规范时间；双方 Directory 始终递归，Base 不是 Directory 时以规范空目录作为递归 Base。结构目录副本通过前缀重映射其全部捕获文件 lineage，目录和空目录由 Candidate 路径及 mtime 重建，不增加 Directory promotion 或持久化 schema。重复同步已收敛树时不再生成冲突副本。重命名仍仅由树差异表现为删除加新增，不做 rename 检测。
 
-合并 Candidate checkout 时，捕获的本地冲突文件从内部 recovery 直接以 journaled no-replace rename 提升到 Candidate 的固定冲突路径，保留 inode 和旧文件描述符身份。promotion 后再次变化的同一 inode 被提升到下一个确定后缀，固定 Candidate 路径从不可变对象恢复；Sync Base 只推进到固定 Candidate，并明确要求下一轮同步发布 late 可见副本。跨父 rename 的源父身份记录在 `fs_actions`，目标父身份取同一 checkout 的耐久 `checkout_paths`，两侧父目录均在 Completed 前同步。
+同目录出现大小写折叠或规范名称碰撞仍作为结构边界失败。Issue #19 完成前，冲突名超过 240 bytes 或完整路径超过 1024 bytes 时返回明确边界，不截短、不创建根回退目录，也不保存 pending 或上传对象。
+
+合并 Candidate checkout 时，捕获的本地冲突文件从内部 recovery 直接以 journaled no-replace rename 提升到 Candidate 的固定冲突路径，保留 inode 和旧文件描述符身份。promotion 后再次变化的同一 inode 被提升到下一个确定后缀，固定 Candidate 路径从不可变对象恢复；Sync Base 只推进到固定 Candidate，并明确要求下一轮同步发布 late 可见副本。跨父 rename 的源父身份记录在 `fs_actions`，目标父身份取同一 checkout 的耐久 `checkout_paths`，两侧父目录均在 Completed 前同步。结构目录冲突复用相同的逐文件 promotion；进程崩溃测试覆盖 Intent、rename、父目录同步和 Completed 的耐久阶段，仅声明 Linux 进程崩溃恢复，不声明断电或 APFS/NTFS 语义。
 
 ## 路径规则
 

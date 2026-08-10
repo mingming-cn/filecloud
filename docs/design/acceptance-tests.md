@@ -66,6 +66,8 @@
 | 连续竞争 | CAS 前两次被其他客户端推进 Head | 每次使用上次 Expected Head 重新设 Base，不制造虚假冲突 |
 | pending 祖先 | CAS 响应丢失后其他客户端再发布 | 识别 pending Commit 为当前 Head 祖先，不重复发布本地变化 |
 
+Issue #18 的删除/修改与类型冲突已按上表启用：Remote 类型或删除占原路径，Local 完整对象或子树进入确定冲突路径；目录副本必须包含嵌套文件、空目录和规范 mtime。验收同时核对双方删除、相同变化、rename 的删除加新增语义，以及重复同步不新增 Commit 或冲突副本。结构目录冲突复用逐文件 promotion，并在 Linux 上对五个公开持久阶段执行进程崩溃重启矩阵；断电和 APFS/NTFS 不在该结论范围内。Issue #19 前冲突路径溢出仍须在 pending、PUT 和 Head 变化前明确失败。
+
 ## 扫描竞态
 
 - 文件读取中改写、truncate、替换 inode、保留 mtime 的同大小改写：可观察变化必须导致重试或整轮失败。

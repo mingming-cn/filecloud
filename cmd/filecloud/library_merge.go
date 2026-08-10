@@ -253,11 +253,16 @@ func _movedConflictPromotions(lineage map[string]_conflictPromotion) []_conflict
 }
 
 func (merger *_treeMerger) moveLineage(path, target string) {
+	prefix := path + "/"
 	for source, value := range merger.lineage {
 		if value.target == path {
 			value.target = target
-			merger.lineage[source] = value
+		} else if strings.HasPrefix(value.target, prefix) {
+			value.target = target + strings.TrimPrefix(value.target, path)
+		} else {
+			continue
 		}
+		merger.lineage[source] = value
 	}
 }
 
@@ -363,7 +368,7 @@ func (merger *_treeMerger) merge(baseID, localID, remoteID, path string, depth i
 			return "", errors.New("recursive merge path exceeds protocol limit")
 		}
 		baseEntry, localEntry, remoteEntry := baseEntries[name], localEntries[name], remoteEntries[name]
-		if _divergentFileConflict(baseEntry, localEntry, remoteEntry) {
+		if _localConflictCopy(baseEntry, localEntry, remoteEntry) {
 			conflictName, err := _conflictCopyName(name, path, merger.localSeed, occupied)
 			if err != nil {
 				return "", err
@@ -373,9 +378,12 @@ func (merger *_treeMerger) merge(baseID, localID, remoteID, path string, depth i
 				conflictPath = path + "/" + conflictName
 			}
 			merger.moveLineage(childPath, conflictPath)
-			entries = append(entries,
-				scanEntry{name: remoteEntry.Name, kind: remoteEntry.Type, id: remoteEntry.ID, modified: remoteEntry.ModifiedAt},
-				scanEntry{name: conflictName, kind: localEntry.Type, id: localEntry.ID, modified: localEntry.ModifiedAt})
+			if remoteEntry != nil {
+				entries = append(entries, scanEntry{name: remoteEntry.Name, kind: remoteEntry.Type,
+					id: remoteEntry.ID, modified: remoteEntry.ModifiedAt})
+			}
+			entries = append(entries, scanEntry{name: conflictName, kind: localEntry.Type,
+				id: localEntry.ID, modified: localEntry.ModifiedAt})
 			occupied = append(occupied, conflictName)
 			continue
 		}
@@ -413,16 +421,13 @@ func (merger *_treeMerger) mergeEntry(base, local, remote *object.DirectoryEntry
 	if _sameMergeEntry(local, remote) {
 		return _copyMergeEntry(local), nil
 	}
-	if local == nil || remote == nil {
-		return nil, fmt.Errorf("merge boundary at %q: delete-vs-modify is owned by Issue #18", path)
+	if local == nil {
+		return _copyMergeEntry(remote), nil
 	}
-	if local.Type != remote.Type || base != nil && (base.Type != local.Type || base.Type != remote.Type) {
-		return nil, fmt.Errorf("merge boundary at %q: file/directory type conflict is owned by Issue #18", path)
+	if remote == nil || local.Type != remote.Type || local.Type == "File" && local.ID != remote.ID {
+		return nil, errors.New("local structural conflict was not allocated by its directory")
 	}
 	if local.Type == "File" {
-		if local.ID != remote.ID {
-			return nil, errors.New("divergent file conflict was not allocated by its directory")
-		}
 		result := *local
 		if remote.ModifiedAt > result.ModifiedAt {
 			result.ModifiedAt = remote.ModifiedAt
@@ -435,7 +440,7 @@ func (merger *_treeMerger) mergeEntry(base, local, remote *object.DirectoryEntry
 	}
 	merger.directories[emptyID] = emptyData
 	baseID := emptyID
-	if base != nil {
+	if base != nil && base.Type == "Directory" {
 		baseID = base.ID
 	}
 	id, err := merger.merge(baseID, local.ID, remote.ID, path, depth+1)
@@ -458,12 +463,11 @@ func (merger *_treeMerger) mergeEntry(base, local, remote *object.DirectoryEntry
 	return &object.DirectoryEntry{ID: id, Name: local.Name, Type: "Directory", ModifiedAt: modified}, nil
 }
 
-func _divergentFileConflict(base, local, remote *object.DirectoryEntry) bool {
-	if _sameMergeEntry(local, base) || _sameMergeEntry(remote, base) || _sameMergeEntry(local, remote) ||
-		local == nil || remote == nil || local.Type != "File" || remote.Type != "File" || local.ID == remote.ID {
+func _localConflictCopy(base, local, remote *object.DirectoryEntry) bool {
+	if _sameMergeEntry(local, base) || _sameMergeEntry(remote, base) || _sameMergeEntry(local, remote) || local == nil {
 		return false
 	}
-	return base == nil || base.Type == "File"
+	return remote == nil || local.Type != remote.Type || local.Type == "File" && local.ID != remote.ID
 }
 
 func _conflictCopyName(leaf, parent string, seed object.Commit, occupied []string) (string, error) {

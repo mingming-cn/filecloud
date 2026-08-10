@@ -565,6 +565,210 @@ func TestLibrarySyncRecursivelyMergesNestedDirectory(t *testing.T) {
 	assertTestConverged(t, environment, subscriberDir, subscriberTree)
 }
 
+func TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject(t *testing.T) {
+	structuralMtime := time.Date(2025, 6, 7, 8, 9, 10, 0, time.UTC)
+	var held *os.File
+	write := func(t *testing.T, root, path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, path)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conflicts := func(t *testing.T, root, leaf string) []string {
+		t.Helper()
+		ext := filepath.Ext(leaf)
+		matches, err := filepath.Glob(filepath.Join(root,
+			strings.TrimSuffix(leaf, ext)+" (Filecloud conflict *)"+ext))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return matches
+	}
+	for _, test := range []struct {
+		name         string
+		base         func(*testing.T, string)
+		remote       func(*testing.T, string)
+		local        func(*testing.T, string)
+		assertResult func(*testing.T, string)
+	}{
+		{name: "local delete remote modify file", base: func(t *testing.T, root string) { write(t, root, "item.txt", "base") },
+			remote: func(t *testing.T, root string) { write(t, root, "item.txt", "remote") },
+			local:  func(t *testing.T, root string) { os.Remove(filepath.Join(root, "item.txt")) },
+			assertResult: func(t *testing.T, root string) {
+				if data, err := os.ReadFile(filepath.Join(root, "item.txt")); err != nil || string(data) != "remote" || len(conflicts(t, root, "item.txt")) != 0 {
+					t.Fatalf("remote original=%q err=%v conflicts=%v", data, err, conflicts(t, root, "item.txt"))
+				}
+			}},
+		{name: "local modify remote delete file", base: func(t *testing.T, root string) { write(t, root, "item.txt", "base") },
+			remote: func(t *testing.T, root string) { os.Remove(filepath.Join(root, "item.txt")) },
+			local:  func(t *testing.T, root string) { write(t, root, "item.txt", "local") },
+			assertResult: func(t *testing.T, root string) {
+				matches := conflicts(t, root, "item.txt")
+				data, err := os.ReadFile(matches[0])
+				if _, originalErr := os.Lstat(filepath.Join(root, "item.txt")); len(matches) != 1 || err != nil || string(data) != "local" || !errors.Is(originalErr, os.ErrNotExist) {
+					t.Fatalf("local conflict=%v data=%q err=%v original=%v", matches, data, err, originalErr)
+				}
+			}},
+		{name: "local delete remote modify directory", base: func(t *testing.T, root string) { write(t, root, "item/base.txt", "base") },
+			remote: func(t *testing.T, root string) {
+				write(t, root, "item/base.txt", "remote")
+				write(t, root, "item/nested/new.txt", "remote nested")
+			}, local: func(t *testing.T, root string) { os.RemoveAll(filepath.Join(root, "item")) },
+			assertResult: func(t *testing.T, root string) {
+				for path, want := range map[string]string{"item/base.txt": "remote", "item/nested/new.txt": "remote nested"} {
+					if data, err := os.ReadFile(filepath.Join(root, path)); err != nil || string(data) != want {
+						t.Fatalf("%s=%q err=%v", path, data, err)
+					}
+				}
+			}},
+		{name: "local modify remote delete directory", base: func(t *testing.T, root string) { write(t, root, "item/base.txt", "base") },
+			remote: func(t *testing.T, root string) { os.RemoveAll(filepath.Join(root, "item")) },
+			local: func(t *testing.T, root string) {
+				write(t, root, "item/base.txt", "local")
+				write(t, root, "item/nested/new.txt", "local nested")
+				if err := os.MkdirAll(filepath.Join(root, "item/empty"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				for _, path := range []string{"item/nested", "item/empty", "item"} {
+					if err := os.Chtimes(filepath.Join(root, path), structuralMtime, structuralMtime); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var err error
+				held, err = os.Open(filepath.Join(root, "item/nested/new.txt"))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}, assertResult: func(t *testing.T, root string) {
+				matches := conflicts(t, root, "item")
+				if len(matches) != 1 {
+					t.Fatalf("conflict directories=%v", matches)
+				}
+				for path, want := range map[string]string{"base.txt": "local", "nested/new.txt": "local nested"} {
+					if data, err := os.ReadFile(filepath.Join(matches[0], path)); err != nil || string(data) != want {
+						t.Fatalf("%s=%q err=%v", path, data, err)
+					}
+				}
+				for _, path := range []string{"", "nested", "empty"} {
+					info, err := os.Stat(filepath.Join(matches[0], path))
+					if err != nil || !info.IsDir() || !info.ModTime().Equal(structuralMtime) {
+						t.Fatalf("directory %q info=%v err=%v", path, info, err)
+					}
+				}
+				heldInfo, heldErr := held.Stat()
+				pathInfo, pathErr := os.Stat(filepath.Join(matches[0], "nested/new.txt"))
+				if heldErr != nil || pathErr != nil || !os.SameFile(heldInfo, pathInfo) {
+					t.Fatalf("held descendant identity held=%v/%v path=%v/%v", heldInfo, heldErr, pathInfo, pathErr)
+				}
+				if err := held.Close(); err != nil {
+					t.Fatal(err)
+				}
+				held = nil
+			}},
+		{name: "local file remote directory", base: func(t *testing.T, root string) { write(t, root, "item.txt", "base") },
+			remote: func(t *testing.T, root string) {
+				os.Remove(filepath.Join(root, "item.txt"))
+				write(t, root, "item.txt/nested/remote.txt", "remote")
+				os.MkdirAll(filepath.Join(root, "item.txt/empty"), 0o700)
+			}, local: func(t *testing.T, root string) { write(t, root, "item.txt", "local") },
+			assertResult: func(t *testing.T, root string) {
+				matches := conflicts(t, root, "item.txt")
+				data, err := os.ReadFile(matches[0])
+				if len(matches) != 1 || err != nil || string(data) != "local" {
+					t.Fatalf("file conflict=%v data=%q err=%v", matches, data, err)
+				}
+				if data, err := os.ReadFile(filepath.Join(root, "item.txt/nested/remote.txt")); err != nil || string(data) != "remote" {
+					t.Fatalf("remote directory=%q err=%v", data, err)
+				}
+			}},
+		{name: "local directory remote file", base: func(t *testing.T, root string) { write(t, root, "item.tar", "base") },
+			remote: func(t *testing.T, root string) { write(t, root, "item.tar", "remote") },
+			local: func(t *testing.T, root string) {
+				os.Remove(filepath.Join(root, "item.tar"))
+				write(t, root, "item.tar/nested/local.txt", "local")
+				os.MkdirAll(filepath.Join(root, "item.tar/empty"), 0o700)
+			}, assertResult: func(t *testing.T, root string) {
+				if data, err := os.ReadFile(filepath.Join(root, "item.tar")); err != nil || string(data) != "remote" {
+					t.Fatalf("remote file=%q err=%v", data, err)
+				}
+				matches := conflicts(t, root, "item.tar")
+				if len(matches) != 1 {
+					t.Fatalf("directory conflicts=%v", matches)
+				}
+				if data, err := os.ReadFile(filepath.Join(matches[0], "nested/local.txt")); err != nil || string(data) != "local" {
+					t.Fatalf("local subtree=%q err=%v", data, err)
+				}
+				if info, err := os.Stat(filepath.Join(matches[0], "empty")); err != nil || !info.IsDir() {
+					t.Fatalf("empty directory info=%v err=%v", info, err)
+				}
+			}},
+		{name: "both delete", base: func(t *testing.T, root string) { write(t, root, "item", "base") },
+			remote: func(t *testing.T, root string) { os.Remove(filepath.Join(root, "item")) },
+			local:  func(t *testing.T, root string) { os.Remove(filepath.Join(root, "item")) },
+			assertResult: func(t *testing.T, root string) {
+				if _, err := os.Lstat(filepath.Join(root, "item")); !errors.Is(err, os.ErrNotExist) || len(conflicts(t, root, "item")) != 0 {
+					t.Fatalf("both-delete path err=%v conflicts=%v", err, conflicts(t, root, "item"))
+				}
+			}},
+		{name: "identical change", base: func(t *testing.T, root string) { write(t, root, "item", "base") },
+			remote: func(t *testing.T, root string) { write(t, root, "item", "same") },
+			local:  func(t *testing.T, root string) { write(t, root, "item", "same") },
+			assertResult: func(t *testing.T, root string) {
+				if data, err := os.ReadFile(filepath.Join(root, "item")); err != nil || string(data) != "same" || len(conflicts(t, root, "item")) != 0 {
+					t.Fatalf("identical path=%q err=%v conflicts=%v", data, err, conflicts(t, root, "item"))
+				}
+			}},
+		{name: "rename is delete plus add", base: func(t *testing.T, root string) { write(t, root, "old.txt", "rename") },
+			remote: func(t *testing.T, root string) { write(t, root, "remote.txt", "remote") },
+			local: func(t *testing.T, root string) {
+				if err := os.Rename(filepath.Join(root, "old.txt"), filepath.Join(root, "renamed.txt")); err != nil {
+					t.Fatal(err)
+				}
+			}, assertResult: func(t *testing.T, root string) {
+				if _, err := os.Lstat(filepath.Join(root, "old.txt")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("old path err=%v", err)
+				}
+				for path, want := range map[string]string{"renamed.txt": "rename", "remote.txt": "remote"} {
+					if data, err := os.ReadFile(filepath.Join(root, path)); err != nil || string(data) != want {
+						t.Fatalf("%s=%q err=%v", path, data, err)
+					}
+				}
+			}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, commits := newSyncPair(t)
+			test.base(t, publisherTree)
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			test.remote(t, publisherTree)
+			if err := syncTestWorktreeConfirmingDeletes(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			test.local(t, subscriberTree)
+			if err := syncTestWorktreeConfirmingDeletes(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			test.assertResult(t, subscriberTree)
+			before := assertTestConverged(t, environment, subscriberDir, subscriberTree)
+			commits.Store(0)
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			after := assertTestConverged(t, environment, subscriberDir, subscriberTree)
+			if commits.Load() != 0 || before.SyncBase != after.SyncBase {
+				t.Fatalf("repeat sync commits=%d before=%s after=%s", commits.Load(), before.SyncBase, after.SyncBase)
+			}
+		})
+	}
+}
+
 func TestLibrarySyncRecursiveMergeParentsAndCapturedSnapshot(t *testing.T) {
 	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
 	if err := os.WriteFile(filepath.Join(publisherTree, "remote"), []byte("remote"), 0o600); err != nil {
@@ -982,6 +1186,110 @@ func TestRecursiveMergeDirectoryMtimeFollowsMergedContent(t *testing.T) {
 	}
 }
 
+func TestRecursiveMergeStructuralConflictTruthTable(t *testing.T) {
+	const (
+		baseFile   = "1111111111111111111111111111111111111111111111111111111111111111"
+		localFile  = "2222222222222222222222222222222222222222222222222222222222222222"
+		remoteFile = "3333333333333333333333333333333333333333333333333333333333333333"
+		t0         = "2026-01-01T00:00:00Z"
+		t1         = "2026-01-02T00:00:00Z"
+		t2         = "2026-01-03T00:00:00Z"
+	)
+	seed := object.Commit{DeviceID: testClientDeviceID, CreatedAt: "2025-02-03T04:05:06Z"}
+	conflict := "item (Filecloud conflict aaaaaaaa 20250203T040506Z)"
+	extConflict := "item (Filecloud conflict aaaaaaaa 20250203T040506Z).txt"
+	directories := make(map[string][]byte)
+	makeDirectory := func(path string, entries ...scanEntry) string {
+		t.Helper()
+		data, id, err := canonicalDirectory(path, entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		directories[id] = data
+		return id
+	}
+	emptyID := makeDirectory("")
+	localChild := makeDirectory("item", scanEntry{name: "nested.txt", kind: "File", id: localFile, modified: t1})
+	remoteChild := makeDirectory("item", scanEntry{name: "remote.txt", kind: "File", id: remoteFile, modified: t2})
+
+	entry := func(name, kind, id, mtime string) scanEntry {
+		return scanEntry{name: name, kind: kind, id: id, modified: mtime}
+	}
+	for _, test := range []struct {
+		name                string
+		base, local, remote []scanEntry
+		want                []scanEntry
+		lineage             map[string]_conflictPromotion
+		wantTarget          string
+	}{
+		{name: "local delete remote modify file", base: []scanEntry{entry("item.txt", "File", baseFile, t0)},
+			remote: []scanEntry{entry("item.txt", "File", remoteFile, t2)},
+			want:   []scanEntry{entry("item.txt", "File", remoteFile, t2)}},
+		{name: "local modify remote delete file", base: []scanEntry{entry("item.txt", "File", baseFile, t0)},
+			local: []scanEntry{entry("item.txt", "File", localFile, t1)},
+			want:  []scanEntry{entry(extConflict, "File", localFile, t1)},
+			lineage: map[string]_conflictPromotion{"item.txt": {source: "item.txt", target: "item.txt", id: localFile,
+				mtime: t1}}, wantTarget: extConflict},
+		{name: "both delete", base: []scanEntry{entry("item", "File", baseFile, t0)}},
+		{name: "same changed file canonical mtime", base: []scanEntry{entry("item", "Directory", localChild, t0)},
+			local:  []scanEntry{entry("item", "File", localFile, t1)},
+			remote: []scanEntry{entry("item", "File", localFile, t2)},
+			want:   []scanEntry{entry("item", "File", localFile, t2)}},
+		{name: "base absent divergent files", local: []scanEntry{entry("item", "File", localFile, t1)},
+			remote: []scanEntry{entry("item", "File", remoteFile, t2)},
+			want:   []scanEntry{entry("item", "File", remoteFile, t2), entry(conflict, "File", localFile, t1)}},
+		{name: "local directory remote delete", base: []scanEntry{entry("item", "Directory", emptyID, t0)},
+			local: []scanEntry{entry("item", "Directory", localChild, t1)},
+			want:  []scanEntry{entry(conflict, "Directory", localChild, t1)},
+			lineage: map[string]_conflictPromotion{"item/nested.txt": {source: "item/nested.txt", target: "item/nested.txt",
+				id: localFile, mtime: t1}}, wantTarget: conflict + "/nested.txt"},
+		{name: "local delete remote directory modify", base: []scanEntry{entry("item", "Directory", emptyID, t0)},
+			remote: []scanEntry{entry("item", "Directory", remoteChild, t2)},
+			want:   []scanEntry{entry("item", "Directory", remoteChild, t2)}},
+		{name: "local file remote directory", base: []scanEntry{entry("item", "File", baseFile, t0)},
+			local: []scanEntry{entry("item", "File", localFile, t1)}, remote: []scanEntry{entry("item", "Directory", remoteChild, t2)},
+			want: []scanEntry{entry("item", "Directory", remoteChild, t2), entry(conflict, "File", localFile, t1)}},
+		{name: "local directory remote file", base: []scanEntry{entry("item", "File", baseFile, t0)},
+			local: []scanEntry{entry("item", "Directory", localChild, t1)}, remote: []scanEntry{entry("item", "File", remoteFile, t2)},
+			want: []scanEntry{entry("item", "File", remoteFile, t2), entry(conflict, "Directory", localChild, t1)},
+			lineage: map[string]_conflictPromotion{"item/nested.txt": {source: "item/nested.txt", target: "item/nested.txt",
+				id: localFile, mtime: t1}}, wantTarget: conflict + "/nested.txt"},
+		{name: "directories recurse over base file", base: []scanEntry{entry("item", "File", baseFile, t0)},
+			local: []scanEntry{entry("item", "Directory", localChild, t1)}, remote: []scanEntry{entry("item", "Directory", remoteChild, t2)},
+			want: []scanEntry{entry("item", "Directory", "", t2)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			baseID := makeDirectory("", test.base...)
+			localID := makeDirectory("", test.local...)
+			remoteID := makeDirectory("", test.remote...)
+			merger := &_treeMerger{directories: directories, synthesized: make(map[string][]byte), active: make(map[string]bool),
+				seen: make(map[string]bool), localSeed: seed, lineage: test.lineage}
+			root, err := merger.merge(baseID, localID, remoteID, "", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := merger.loadDirectory(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Entries) != len(test.want) {
+				t.Fatalf("entries=%+v want=%+v", got.Entries, test.want)
+			}
+			for index, want := range test.want {
+				entry := got.Entries[index]
+				if entry.Name != want.name || entry.Type != want.kind || entry.ModifiedAt != want.modified ||
+					want.id != "" && entry.ID != want.id {
+					t.Fatalf("entry[%d]=%+v want=%+v", index, entry, want)
+				}
+			}
+			if test.wantTarget != "" && test.lineage["item/nested.txt"].target != test.wantTarget &&
+				test.lineage["item.txt"].target != test.wantTarget {
+				t.Fatalf("lineage=%+v want target %q", test.lineage, test.wantTarget)
+			}
+		})
+	}
+}
+
 func TestConflictCopyName(t *testing.T) {
 	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID, CreatedAt: "2025-02-03T04:05:06Z"}
 	for _, test := range []struct {
@@ -1349,6 +1657,78 @@ func TestLibrarySyncSecondPromotionCrashMatrix(t *testing.T) {
 				if readErr != nil || string(local) != "local-"+name {
 					t.Fatalf("%s local=%q err=%v", name, local, readErr)
 				}
+			}
+			assertNoSyncInternalPaths(t, subscriberTree)
+			assertTestConverged(t, environment, subscriberDir, subscriberTree)
+		})
+	}
+}
+
+func TestLibrarySyncStructuralDirectoryConflictCrashMatrix(t *testing.T) {
+	for _, point := range []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"} {
+		t.Run(point, func(t *testing.T) {
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			for index := 0; index < 30; index++ {
+				if err := os.WriteFile(filepath.Join(publisherTree, fmt.Sprintf("ballast-%02d", index)), []byte("base"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.MkdirAll(filepath.Join(publisherTree, "item", "nested"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(publisherTree, "item", "nested", "local.txt"), []byte("base"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.RemoveAll(filepath.Join(publisherTree, "item")); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, "item", "nested", "local.txt"), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(subscriberTree, "item", "empty"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT="+point,
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+			assertProcessSIGKILL(t, command.Run())
+			var err error
+			for attempt := 0; attempt < 4; attempt++ {
+				err = syncTestWorktree(t, subscriberDir, subscriberTree)
+				if err == nil {
+					break
+				}
+				if !strings.Contains(err.Error(), "rerun sync") {
+					t.Fatalf("restart %d: %v", attempt, err)
+				}
+			}
+			if err != nil {
+				t.Fatalf("structural conflict did not converge: %v", err)
+			}
+			matches, err := filepath.Glob(filepath.Join(subscriberTree, "item (Filecloud conflict *)"))
+			if err != nil || len(matches) != 1 {
+				t.Fatalf("conflict directories=%v err=%v", matches, err)
+			}
+			if data, err := os.ReadFile(filepath.Join(matches[0], "nested", "local.txt")); err != nil || string(data) != "local" {
+				t.Fatalf("local descendant=%q err=%v", data, err)
+			}
+			if info, err := os.Stat(filepath.Join(matches[0], "empty")); err != nil || !info.IsDir() {
+				t.Fatalf("empty descendant=%v err=%v", info, err)
+			}
+			if _, err := os.Lstat(filepath.Join(subscriberTree, "item")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("remote deletion was not preserved: %v", err)
 			}
 			assertNoSyncInternalPaths(t, subscriberTree)
 			assertTestConverged(t, environment, subscriberDir, subscriberTree)
@@ -2691,57 +3071,6 @@ func TestLibrarySyncLateConflictBeforeFinalizeRequiresRerun(t *testing.T) {
 	}
 	assertNoSyncInternalPaths(t, subscriberTree)
 	assertTestConverged(t, environment, subscriberDir, subscriberTree)
-}
-
-func TestLibrarySyncSamePathBoundariesLeaveStateUntouched(t *testing.T) {
-	for _, test := range []struct {
-		name, issue string
-		remote      func(string) error
-		local       func(string) error
-	}{
-		{"delete modify", "Issue #18", func(root string) error {
-			return os.WriteFile(filepath.Join(root, "base"), []byte("remote"), 0o600)
-		}, func(root string) error { return os.Remove(filepath.Join(root, "base")) }},
-		{"type conflict", "Issue #18", func(root string) error {
-			if err := os.Remove(filepath.Join(root, "base")); err != nil {
-				return err
-			}
-			return os.Mkdir(filepath.Join(root, "base"), 0o700)
-		}, func(root string) error { return os.WriteFile(filepath.Join(root, "base"), []byte("local"), 0o600) }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts, _ := newSyncPair(t)
-			if err := test.remote(publisherTree); err != nil {
-				t.Fatal(err)
-			}
-			if err := syncTestWorktreeConfirmingDeletes(t, publisherDir, publisherTree); err != nil {
-				t.Fatal(err)
-			}
-			if err := test.local(subscriberTree); err != nil {
-				t.Fatal(err)
-			}
-			beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
-			beforeRoot := scanTestRoot(t, subscriberTree)
-			beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
-				[]byte(environment.token))
-			if err != nil {
-				t.Fatal(err)
-			}
-			puts.Store(0)
-			err = syncTestWorktree(t, subscriberDir, subscriberTree)
-			if err == nil || !strings.Contains(err.Error(), test.issue) {
-				t.Fatalf("boundary error=%v", err)
-			}
-			afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
-				[]byte(environment.token))
-			if after := readTestBinding(t, subscriberDir, subscriberTree); after != beforeBinding ||
-				scanTestRoot(t, subscriberTree) != beforeRoot || countClientRows(t, subscriberDir, "pending_publications", subscriberTree) != 0 ||
-				puts.Load() != 0 || headErr != nil || afterHead.CommitID == nil || beforeHead.CommitID == nil ||
-				*afterHead.CommitID != *beforeHead.CommitID || afterHead.ETag != beforeHead.ETag {
-				t.Fatalf("boundary changed state: binding=%+v head=%+v err=%v puts=%d", after, afterHead, headErr, puts.Load())
-			}
-		})
-	}
 }
 
 func TestProtectedDeletionBoundaries(t *testing.T) {
