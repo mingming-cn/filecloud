@@ -83,15 +83,12 @@ func TestLibraryBindImportsLocalSnapshotAndSyncNoOps(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = runTest(t.Context(), []string{"library", "sync", "--client-dir", clientDir, "--worktree", worktree}, strings.NewReader(""), io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "issue #10") {
-		t.Fatalf("changed sync error=%v", err)
+	if err != nil {
+		t.Fatalf("changed sync: %v", err)
 	}
-	unchanged, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
-	if err != nil || unchanged.ETag != beforeETag {
-		t.Fatalf("unsupported sync changed Head: %+v err=%v", unchanged, err)
-	}
-	if err := os.Remove(filepath.Join(worktree, "changed")); err != nil {
-		t.Fatal(err)
+	changedHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	if err != nil || changedHead.ETag == beforeETag || changedHead.CommitID == nil || *changedHead.CommitID == *head.CommitID {
+		t.Fatalf("changed sync did not advance Head: %+v err=%v", changedHead, err)
 	}
 }
 

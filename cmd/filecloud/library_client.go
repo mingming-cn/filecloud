@@ -43,6 +43,14 @@ type libraryClientConfig struct {
 	beforeCheckoutDirectoryRename   func(string, string) error
 	afterCheckoutInstall            func(string, string) error
 	beforeFinalize                  func() error
+	beforeSyncRecoveryPrepare       func() error
+	afterSyncRecoveryRegistered     func(string) error
+	beforeSyncRecoveryRename        func(string, string) error
+	afterSyncRecoveryRename         func(string, string) error
+	beforeSyncRecoveryCompleted     func(string) error
+	beforeSyncRecoveryCleanup       func(string, string) error
+	afterSyncRecoveryCleanupRename  func(string, string) error
+	afterSyncRecoveryRestore        func(string) error
 	beforeFlock                     func()
 	afterLock                       func()
 }
@@ -94,7 +102,7 @@ type bindIntent struct {
 
 type pendingCheckout struct {
 	ServerURL, LibraryID, Worktree, UserID, DeviceID string
-	TargetCommit, TargetRoot, HeadETag               string
+	TargetCommit, TargetRoot, HeadETag, ApplyState   string
 }
 
 type remoteHead struct {
@@ -336,7 +344,7 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 		return finalizeImportedBinding(ctx, db, options, *intent, head, stdout, config)
 	}
 	if head.CommitID == nil || len(commit.Parents) != 1 || *head.CommitID != commit.Parents[0] || head.ETag != intent.ExpectedETag {
-		return errors.New("library Head changed during local import; merge requires issue #10")
+		return errors.New("library Head changed during local import; merge is not supported yet")
 	}
 	snapshot, err = rescanRoot(options, intent.CandidateRoot)
 	if err != nil {
@@ -362,7 +370,7 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 		return errors.Join(publishErr, fmt.Errorf("resolve library Head after publish: %w", getErr))
 	}
 	if published.CommitID == nil || *published.CommitID != intent.CandidateCommit {
-		return errors.Join(publishErr, errors.New("library Head changed during local import; merge requires issue #10"))
+		return errors.Join(publishErr, errors.New("library Head changed during local import; merge is not supported yet"))
 	}
 	return finalizeImportedBinding(ctx, db, options, *intent, published, stdout, config)
 }
@@ -555,7 +563,7 @@ func confirmExistingBinding(ctx context.Context, db *sql.DB, options bindOptions
 		return errors.New("existing binding base commit does not match its owner and snapshot")
 	}
 	if _, err := rescanRoot(options, existing.SyncBaseRoot); err != nil {
-		return errors.New("existing binding worktree has changes; sync requires issue #10")
+		return errors.New("existing binding worktree has changes; run library sync")
 	}
 	if _, err := db.ExecContext(ctx, "UPDATE bindings SET access_token = ?, head_etag = ? WHERE worktree = ?", options.token, head.ETag, options.worktree); err != nil {
 		return fmt.Errorf("update binding token: %w", err)
@@ -593,6 +601,9 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, db.Close()) }()
+	if err := initializeClientSchema(ctx, db); err != nil {
+		return err
+	}
 	var binding clientBinding
 	var token []byte
 	if err := db.QueryRowContext(ctx, `SELECT server_url, library_id, worktree, user_id, device_id, sync_base_commit,
@@ -614,22 +625,9 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, root.Close()) }()
-	snapshot, err := scanWorktree(root)
-	if err != nil {
-		return err
-	}
-	head, err := getRemoteHead(ctx, base, binding.LibraryID, token)
-	if err != nil {
-		return err
-	}
-	if snapshot.root == binding.SyncBaseRoot && head.CommitID != nil && *head.CommitID == binding.SyncBase {
-		_, err = fmt.Fprintln(stdout, "library already synchronized")
-		return err
-	}
-	if snapshot.root != binding.SyncBaseRoot {
-		return errors.New("local worktree has changes; general synchronization requires issue #10")
-	}
-	return errors.New("remote library has changes; checkout requires issue #9")
+	options := bindOptions{clientDir: canonicalClientDir, serverURL: binding.ServerURL, libraryID: binding.LibraryID,
+		worktree: binding.Worktree, deviceID: binding.DeviceID, base: base, token: token, worktreeRoot: root}
+	return syncLibrary(ctx, db, options, binding, stdout, config)
 }
 
 func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writer, config libraryClientConfig) (retErr error) {
@@ -670,6 +668,9 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, db.Close()) }()
+	if err := initializeClientSchema(ctx, db); err != nil {
+		return err
+	}
 	temps, err := checkoutTempNames(ctx, db, canonicalWorktree)
 	if err != nil {
 		return fmt.Errorf("read registered checkout temporary files: %w", err)
@@ -684,6 +685,29 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 			if closeErr := root.Close(); cleanupErr != nil || closeErr != nil {
 				return errors.Join(cleanupErr, closeErr)
 			}
+		}
+	}
+	var applyState string
+	stateErr := db.QueryRowContext(ctx, "SELECT apply_state FROM pending_checkouts WHERE worktree = ?", canonicalWorktree).Scan(&applyState)
+	if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
+		return stateErr
+	}
+	if stateErr == nil && (applyState == "applying" || applyState == "rolling_back" || applyState == "finalized") {
+		root, err := openWorktreeRoot(canonicalWorktree, config.checkFilesystem)
+		if err != nil {
+			return err
+		}
+		var recoveryErr error
+		if applyState == "finalized" {
+			recoveryErr = cleanupSyncRecoveries(ctx, db, root, canonicalWorktree, config)
+		} else {
+			recoveryErr = beginSyncRollback(ctx, db, canonicalWorktree)
+			if recoveryErr == nil {
+				recoveryErr = rollbackSyncApply(ctx, db, root, canonicalClientDir, canonicalWorktree, config)
+			}
+		}
+		if closeErr := root.Close(); recoveryErr != nil || closeErr != nil {
+			return errors.Join(recoveryErr, closeErr)
 		}
 	}
 	tx, err := db.BeginTx(ctx, nil)
@@ -714,8 +738,14 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 	if err != nil {
 		return errors.Join(fmt.Errorf("count removed pending checkouts: %w", err), tx.Rollback())
 	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM pending_publications WHERE worktree = ?", canonicalWorktree); err != nil {
+		return errors.Join(fmt.Errorf("remove pending publication: %w", err), tx.Rollback())
+	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM checkout_paths WHERE worktree = ?", canonicalWorktree); err != nil {
 		return errors.Join(fmt.Errorf("remove checkout paths: %w", err), tx.Rollback())
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM sync_recoveries WHERE worktree = ?", canonicalWorktree); err != nil {
+		return errors.Join(fmt.Errorf("remove sync recoveries: %w", err), tx.Rollback())
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM path_index WHERE worktree = ?", canonicalWorktree); err != nil {
 		return errors.Join(fmt.Errorf("remove path index: %w", err), tx.Rollback())
@@ -948,13 +978,22 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		server_url TEXT NOT NULL, library_id TEXT NOT NULL,
 		worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
 		target_commit TEXT NOT NULL, target_root TEXT NOT NULL, head_etag TEXT NOT NULL,
-		UNIQUE(server_url, library_id));
+		apply_state TEXT NOT NULL DEFAULT 'pending', UNIQUE(server_url, library_id));
+		CREATE TABLE IF NOT EXISTS pending_publications (
+		worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL, base_root TEXT NOT NULL,
+		expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL, candidate_root TEXT NOT NULL,
+		candidate_data BLOB NOT NULL);
+		CREATE TABLE IF NOT EXISTS sync_recoveries (
+		worktree TEXT NOT NULL, path TEXT NOT NULL, recovery_name TEXT NOT NULL,
+		type TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '', canonical_mtime TEXT NOT NULL DEFAULT '',
+		size INTEGER NOT NULL DEFAULT 0, device INTEGER NOT NULL DEFAULT 0, inode INTEGER NOT NULL DEFAULT 0,
+		completed INTEGER NOT NULL DEFAULT 0, tombstone_name TEXT NOT NULL DEFAULT '', PRIMARY KEY(worktree, path));
 		CREATE TABLE IF NOT EXISTS checkout_paths (
 		worktree TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, object_id TEXT NOT NULL,
 		canonical_mtime TEXT NOT NULL, actual_mtime TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0,
 		temp_name TEXT NOT NULL DEFAULT '', temp_device INTEGER NOT NULL DEFAULT 0, temp_inode INTEGER NOT NULL DEFAULT 0,
 		target_device INTEGER NOT NULL DEFAULT 0, target_inode INTEGER NOT NULL DEFAULT 0,
-		completed INTEGER NOT NULL DEFAULT 0,
+		completed INTEGER NOT NULL DEFAULT 0, rollback_name TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY(worktree, path));
 		CREATE TABLE IF NOT EXISTS path_index (
 		worktree TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, object_id TEXT NOT NULL,
@@ -962,13 +1001,35 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		PRIMARY KEY(worktree, path));`); err != nil {
 		return fail(err)
 	}
-	for _, column := range []string{"target_device", "target_inode"} {
+	for table, columns := range map[string]map[string]string{
+		"pending_checkouts": {"apply_state": "TEXT NOT NULL DEFAULT 'pending'"},
+		"sync_recoveries": {
+			"object_id": "TEXT NOT NULL DEFAULT ''", "canonical_mtime": "TEXT NOT NULL DEFAULT ''",
+			"size": "INTEGER NOT NULL DEFAULT 0", "tombstone_name": "TEXT NOT NULL DEFAULT ''",
+		},
+	} {
+		for column, definition := range columns {
+			var present int
+			if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+table+"') WHERE name = ?", column).Scan(&present); err != nil {
+				return fail(err)
+			}
+			if present == 0 {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition); err != nil {
+					return fail(err)
+				}
+			}
+		}
+	}
+	for column, definition := range map[string]string{
+		"target_device": "INTEGER NOT NULL DEFAULT 0", "target_inode": "INTEGER NOT NULL DEFAULT 0",
+		"rollback_name": "TEXT NOT NULL DEFAULT ''",
+	} {
 		var present int
 		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('checkout_paths') WHERE name = ?", column).Scan(&present); err != nil {
 			return fail(err)
 		}
 		if present == 0 {
-			if _, err := tx.ExecContext(ctx, "ALTER TABLE checkout_paths ADD COLUMN "+column+" INTEGER NOT NULL DEFAULT 0"); err != nil {
+			if _, err := tx.ExecContext(ctx, "ALTER TABLE checkout_paths ADD COLUMN "+column+" "+definition); err != nil {
 				return fail(err)
 			}
 		}

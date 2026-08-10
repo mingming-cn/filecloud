@@ -28,6 +28,7 @@ const (
 type checkoutPath struct {
 	path, kind, id, mtime string
 	size                  int64
+	device, inode         uint64
 }
 
 func pendingCheckoutExists(ctx context.Context, clientDir, worktree string) (bool, error) {
@@ -56,10 +57,10 @@ func pendingCheckoutExists(ctx context.Context, clientDir, worktree string) (boo
 func loadPendingCheckout(ctx context.Context, db *sql.DB, serverURL, libraryID, worktree string) (*pendingCheckout, error) {
 	var value pendingCheckout
 	err := db.QueryRowContext(ctx, `SELECT server_url, library_id, worktree, user_id, device_id,
-		target_commit, target_root, head_etag FROM pending_checkouts
+		target_commit, target_root, head_etag, apply_state FROM pending_checkouts
 		WHERE worktree = ? OR (server_url = ? AND library_id = ?) LIMIT 1`, worktree, serverURL, libraryID).Scan(
 		&value.ServerURL, &value.LibraryID, &value.Worktree, &value.UserID, &value.DeviceID,
-		&value.TargetCommit, &value.TargetRoot, &value.HeadETag)
+		&value.TargetCommit, &value.TargetRoot, &value.HeadETag, &value.ApplyState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -73,9 +74,13 @@ func loadPendingCheckout(ctx context.Context, db *sql.DB, serverURL, libraryID, 
 }
 
 func savePendingCheckout(ctx context.Context, db *sql.DB, value pendingCheckout) error {
+	state := value.ApplyState
+	if state == "" {
+		state = "pending"
+	}
 	_, err := db.ExecContext(ctx, `INSERT INTO pending_checkouts(server_url, library_id, worktree, user_id, device_id,
-		target_commit, target_root, head_etag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, value.ServerURL,
-		value.LibraryID, value.Worktree, value.UserID, value.DeviceID, value.TargetCommit, value.TargetRoot, value.HeadETag)
+		target_commit, target_root, head_etag, apply_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.ServerURL,
+		value.LibraryID, value.Worktree, value.UserID, value.DeviceID, value.TargetCommit, value.TargetRoot, value.HeadETag, state)
 	if err != nil {
 		return fmt.Errorf("save pending checkout: %w", err)
 	}

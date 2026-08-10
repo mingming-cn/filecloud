@@ -30,6 +30,7 @@ type worktreeSnapshot struct {
 	root    string
 	objects []scannedObject
 	blocks  map[string]blockSource
+	paths   []checkoutPath
 }
 
 type scanEntry struct {
@@ -39,6 +40,10 @@ type scanEntry struct {
 const openPath = 0x200000 // Linux O_PATH; inspect type without opening a device or blocking on a FIFO.
 
 func scanWorktree(root *openedWorktree) (worktreeSnapshot, error) {
+	return scanWorktreeIgnoring(root, nil)
+}
+
+func scanWorktreeIgnoring(root *openedWorktree, ignoredRootNames map[string]bool) (worktreeSnapshot, error) {
 	if err := root.validateIdentity(); err != nil {
 		return worktreeSnapshot{}, err
 	}
@@ -52,7 +57,7 @@ func scanWorktree(root *openedWorktree) (worktreeSnapshot, error) {
 		return worktreeSnapshot{}, fmt.Errorf("rewind worktree: %w", err)
 	}
 	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
-	rootID, err := scanDirectory(directory, "", &snapshot)
+	rootID, err := scanDirectoryIgnoring(directory, "", &snapshot, ignoredRootNames)
 	if err != nil {
 		return worktreeSnapshot{}, err
 	}
@@ -64,6 +69,10 @@ func scanWorktree(root *openedWorktree) (worktreeSnapshot, error) {
 }
 
 func scanDirectory(directory *os.File, relative string, snapshot *worktreeSnapshot) (string, error) {
+	return scanDirectoryIgnoring(directory, relative, snapshot, nil)
+}
+
+func scanDirectoryIgnoring(directory *os.File, relative string, snapshot *worktreeSnapshot, ignoredRootNames map[string]bool) (string, error) {
 	before, err := directory.Stat()
 	if err != nil {
 		return "", fmt.Errorf("inspect directory %q: %w", relative, err)
@@ -76,6 +85,9 @@ func scanDirectory(directory *os.File, relative string, snapshot *worktreeSnapsh
 	values := make([]scanEntry, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
+		if relative == "" && ignoredRootNames[name] {
+			continue
+		}
 		childPath := name
 		if relative != "" {
 			childPath = relative + "/" + name
@@ -95,7 +107,7 @@ func scanDirectory(directory *os.File, relative string, snapshot *worktreeSnapsh
 			id, err = scanRegularFile(child, childPath, info, snapshot)
 		case info.IsDir():
 			kind = "Directory"
-			id, err = scanDirectory(child, childPath, snapshot)
+			id, err = scanDirectoryIgnoring(child, childPath, snapshot, ignoredRootNames)
 		default:
 			err = fmt.Errorf("unsupported worktree path type at %q", childPath)
 		}
@@ -104,6 +116,16 @@ func scanDirectory(directory *os.File, relative string, snapshot *worktreeSnapsh
 			return "", errors.Join(err, closeErr)
 		}
 		values = append(values, scanEntry{name, kind, id, modified})
+		size := int64(0)
+		if kind == "File" {
+			size = info.Size()
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return "", errors.New("worktree path has no stable identity")
+		}
+		snapshot.paths = append(snapshot.paths, checkoutPath{path: childPath, kind: kind, id: id, mtime: modified,
+			size: size, device: uint64(stat.Dev), inode: stat.Ino})
 	}
 	after, err := directory.Stat()
 	if err != nil || !sameFileState(before, after) {
