@@ -37,77 +37,156 @@ type scanEntry struct {
 	name, kind, id, modified string
 }
 
-const openPath = 0x200000 // Linux O_PATH; inspect type without opening a device or blocking on a FIFO.
+type scanFault struct {
+	phase, path string
+	attempt     int
+}
+
+type worktreeScanConfig struct {
+	ignoredRootNames           map[string]bool
+	trackedPaths               map[string]bool
+	warning                    io.Writer
+	fault                      func(scanFault) error
+	ignoreUntrackedUnsupported bool
+}
+
+type unstableWorktreeError struct {
+	path, detail string
+}
+
+func (e *unstableWorktreeError) Error() string {
+	if e.path == "" {
+		return "unstable worktree: " + e.detail
+	}
+	return fmt.Sprintf("unstable worktree at %q: %s", e.path, e.detail)
+}
+
+type fileState struct {
+	device, inode uint64
+	mode, nlink   uint64
+	size          int64
+	mtime, ctime  syscall.Timespec
+}
+
+type listedEntry struct {
+	name, kind string
+	state      fileState
+}
+
+type scannedPathState struct {
+	kind  string
+	state fileState
+	hash  string
+}
+
+type scanSession struct {
+	config      worktreeScanConfig
+	snapshot    worktreeSnapshot
+	paths       map[string]scannedPathState
+	directories map[string][]listedEntry
+	warned      map[string]bool
+}
+
+const (
+	openPath        = 0x200000 // Linux O_PATH; inspect type without opening a device or blocking on a FIFO.
+	scanRetryBudget = 3
+)
 
 func scanWorktree(root *openedWorktree) (worktreeSnapshot, error) {
-	return scanWorktreeIgnoring(root, nil)
+	return scanWorktreeWithConfig(root, worktreeScanConfig{})
 }
 
 func scanWorktreeIgnoring(root *openedWorktree, ignoredRootNames map[string]bool) (worktreeSnapshot, error) {
+	return scanWorktreeWithConfig(root, worktreeScanConfig{ignoredRootNames: ignoredRootNames})
+}
+
+func scanWorktreeWithConfig(root *openedWorktree, config worktreeScanConfig) (worktreeSnapshot, error) {
 	if err := root.validateIdentity(); err != nil {
 		return worktreeSnapshot{}, err
 	}
-	dup, err := syscall.Dup(int(root.directory.Fd()))
+	directory, err := duplicateDirectory(root.directory, root.path)
 	if err != nil {
 		return worktreeSnapshot{}, fmt.Errorf("duplicate worktree root: %w", err)
 	}
-	directory := os.NewFile(uintptr(dup), root.path)
 	defer directory.Close()
-	if _, err := directory.Seek(0, io.SeekStart); err != nil {
-		return worktreeSnapshot{}, fmt.Errorf("rewind worktree: %w", err)
+	session := scanSession{
+		config:   config,
+		snapshot: worktreeSnapshot{blocks: make(map[string]blockSource)},
+		paths:    make(map[string]scannedPathState), directories: make(map[string][]listedEntry), warned: make(map[string]bool),
 	}
-	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
-	rootID, err := scanDirectoryIgnoring(directory, "", &snapshot, ignoredRootNames)
+	rootID, err := session.scanDirectory(directory, "")
 	if err != nil {
+		return worktreeSnapshot{}, err
+	}
+	if config.fault != nil {
+		if err := config.fault(scanFault{phase: "before-final-validation"}); err != nil {
+			return worktreeSnapshot{}, err
+		}
+	}
+	if err := session.validateTree(root); err != nil {
 		return worktreeSnapshot{}, err
 	}
 	if err := root.validateIdentity(); err != nil {
 		return worktreeSnapshot{}, err
 	}
-	snapshot.root = rootID
-	return snapshot, nil
+	session.snapshot.root = rootID
+	return session.snapshot, nil
 }
 
-func scanDirectory(directory *os.File, relative string, snapshot *worktreeSnapshot) (string, error) {
-	return scanDirectoryIgnoring(directory, relative, snapshot, nil)
+func duplicateDirectory(directory *os.File, name string) (*os.File, error) {
+	fd, err := syscall.Dup(int(directory.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
 }
 
-func scanDirectoryIgnoring(directory *os.File, relative string, snapshot *worktreeSnapshot, ignoredRootNames map[string]bool) (string, error) {
-	before, err := directory.Stat()
+func (session *scanSession) scanDirectory(directory *os.File, relative string) (string, error) {
+	before, err := stateOf(directory)
 	if err != nil {
 		return "", fmt.Errorf("inspect directory %q: %w", relative, err)
 	}
-	entries, err := directory.Readdir(-1)
+	first, err := session.enumerateDirectory(directory, relative)
 	if err != nil {
-		return "", fmt.Errorf("read directory %q: %w", relative, err)
+		return "", err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	values := make([]scanEntry, 0, len(entries))
-	for _, entry := range entries {
-		name := entry.Name()
-		if relative == "" && ignoredRootNames[name] {
-			continue
+	if err := session.runFault("after-directory-enumeration-1", relative, 1); err != nil {
+		return "", err
+	}
+	second, err := session.enumerateDirectory(directory, relative)
+	if err != nil {
+		return "", err
+	}
+	if err := session.runFault("after-directory-enumeration-2", relative, 1); err != nil {
+		return "", err
+	}
+	if !sameListing(first, second) {
+		return "", &unstableWorktreeError{relative, "directory entries changed between enumerations"}
+	}
+	session.directories[relative] = cloneListing(second)
+	session.paths[relative] = scannedPathState{kind: "Directory", state: before}
+
+	values := make([]scanEntry, 0, len(second))
+	for _, entry := range second {
+		childPath := joinScanPath(relative, entry.name)
+		if err := session.runFault("before-open", childPath, 1); err != nil {
+			return "", fmt.Errorf("open worktree path %q: %w", childPath, err)
 		}
-		childPath := name
-		if relative != "" {
-			childPath = relative + "/" + name
-		}
-		if !utf8.ValidString(name) || len(childPath) > 1024 {
-			return "", fmt.Errorf("invalid worktree path %q", childPath)
-		}
-		child, info, err := openScannableAt(directory, name, childPath)
+		child, _, err := openListedAt(directory, entry, childPath)
 		if err != nil {
 			return "", err
 		}
-		modified := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
-		var kind, id string
-		switch {
-		case info.Mode().IsRegular():
-			kind = "File"
-			id, err = scanRegularFile(child, childPath, info, snapshot)
-		case info.IsDir():
-			kind = "Directory"
-			id, err = scanDirectoryIgnoring(child, childPath, snapshot, ignoredRootNames)
+		var id string
+		switch entry.kind {
+		case "File":
+			id, err = session.scanRegularFile(child, childPath)
+		case "Directory":
+			id, err = session.scanDirectory(child, childPath)
 		default:
 			err = fmt.Errorf("unsupported worktree path type at %q", childPath)
 		}
@@ -115,22 +194,339 @@ func scanDirectoryIgnoring(directory *os.File, relative string, snapshot *worktr
 		if err != nil || closeErr != nil {
 			return "", errors.Join(err, closeErr)
 		}
-		values = append(values, scanEntry{name, kind, id, modified})
+		stable := session.paths[childPath].state
+		modified := formatScanTime(stable.mtime)
+		values = append(values, scanEntry{entry.name, entry.kind, id, modified})
 		size := int64(0)
-		if kind == "File" {
-			size = info.Size()
+		if entry.kind == "File" {
+			size = stable.size
 		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return "", errors.New("worktree path has no stable identity")
+		session.snapshot.paths = append(session.snapshot.paths, checkoutPath{path: childPath, kind: entry.kind, id: id,
+			mtime: modified, size: size, device: stable.device, inode: stable.inode})
+	}
+	after, err := stateOf(directory)
+	if err != nil || !sameState(before, after) {
+		return "", &unstableWorktreeError{relative, "directory changed during scan"}
+	}
+	data, id, err := canonicalDirectory(relative, values)
+	if err != nil {
+		return "", err
+	}
+	session.snapshot.objects = append(session.snapshot.objects, scannedObject{"directories", id, data})
+	return id, nil
+}
+
+func (session *scanSession) enumerateDirectory(directory *os.File, relative string) ([]listedEntry, error) {
+	if _, err := directory.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind directory %q: %w", relative, err)
+	}
+	entries, err := directory.Readdirnames(-1)
+	if err != nil {
+		return nil, fmt.Errorf("read directory %q: %w", relative, err)
+	}
+	result := make([]listedEntry, 0, len(entries))
+	for _, name := range entries {
+		if relative == "" && session.config.ignoredRootNames[name] {
+			continue
 		}
-		snapshot.paths = append(snapshot.paths, checkoutPath{path: childPath, kind: kind, id: id, mtime: modified,
-			size: size, device: uint64(stat.Dev), inode: stat.Ino})
+		path := joinScanPath(relative, name)
+		if !utf8.ValidString(name) || len(path) > 1024 {
+			return nil, fmt.Errorf("invalid worktree path %q", path)
+		}
+		state, kind, err := inspectAt(directory, name, path)
+		if err != nil {
+			return nil, err
+		}
+		if kind == "" {
+			if session.config.ignoreUntrackedUnsupported && !session.config.trackedPaths[path] {
+				session.warnUnsupported(path)
+				continue
+			}
+			return nil, fmt.Errorf("unsupported worktree path type at %q", path)
+		}
+		result = append(result, listedEntry{name: name, kind: kind, state: state})
 	}
-	after, err := directory.Stat()
-	if err != nil || !sameFileState(before, after) {
-		return "", errors.New("worktree changed during scan")
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].name != result[j].name {
+			return result[i].name < result[j].name
+		}
+		if result[i].kind != result[j].kind {
+			return result[i].kind < result[j].kind
+		}
+		if result[i].state.device != result[j].state.device {
+			return result[i].state.device < result[j].state.device
+		}
+		return result[i].state.inode < result[j].state.inode
+	})
+	return result, nil
+}
+
+func inspectAt(directory *os.File, name, path string) (fileState, string, error) {
+	fd, err := syscall.Openat(int(directory.Fd()), name, openPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return fileState{}, "", fmt.Errorf("inspect worktree path %q without following links: %w", path, err)
 	}
+	defer syscall.Close(fd)
+	state, err := stateOfFD(fd)
+	if err != nil {
+		return fileState{}, "", fmt.Errorf("inspect worktree path %q: %w", path, err)
+	}
+	switch state.mode & syscall.S_IFMT {
+	case syscall.S_IFREG:
+		return state, "File", nil
+	case syscall.S_IFDIR:
+		return state, "Directory", nil
+	default:
+		return state, "", nil
+	}
+}
+
+func openListedAt(directory *os.File, listed listedEntry, path string) (*os.File, fileState, error) {
+	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+	if listed.kind == "Directory" {
+		flags |= syscall.O_DIRECTORY
+	}
+	fd, err := syscall.Openat(int(directory.Fd()), listed.name, flags, 0)
+	if err != nil {
+		return nil, fileState{}, fmt.Errorf("open worktree path %q without following links: %w", path, err)
+	}
+	state, err := stateOfFD(fd)
+	if err != nil || !sameIdentity(listed.state, state) || state.mode != listed.state.mode {
+		syscall.Close(fd)
+		return nil, fileState{}, &unstableWorktreeError{path, "path changed while opening"}
+	}
+	return os.NewFile(uintptr(fd), path), state, nil
+}
+
+func (session *scanSession) scanRegularFile(file *os.File, path string) (string, error) {
+	for attempt := 1; attempt <= scanRetryBudget; attempt++ {
+		before, err := stateOf(file)
+		if err != nil {
+			return "", fmt.Errorf("inspect worktree file %q: %w", path, err)
+		}
+		first, _, err := readFileBlocks(file, false)
+		if err != nil {
+			return "", fmt.Errorf("read worktree file %q: %w", path, err)
+		}
+		if err := session.runFault("after-file-read-1", path, attempt); err != nil {
+			return "", err
+		}
+		middle, err := stateOf(file)
+		if err != nil {
+			return "", fmt.Errorf("inspect worktree file %q: %w", path, err)
+		}
+		second, sources, err := readFileBlocks(file, true)
+		if err != nil {
+			return "", fmt.Errorf("reread worktree file %q: %w", path, err)
+		}
+		if err := session.runFault("after-file-read-2", path, attempt); err != nil {
+			return "", err
+		}
+		after, err := stateOf(file)
+		if err != nil {
+			return "", fmt.Errorf("inspect worktree file %q: %w", path, err)
+		}
+		if sameState(before, middle) && sameState(middle, after) && equalStrings(first, second) {
+			data, id, err := canonicalFile(path, after.size, second)
+			if err != nil {
+				return "", err
+			}
+			for index, blockID := range second {
+				if _, exists := session.snapshot.blocks[blockID]; !exists {
+					session.snapshot.blocks[blockID] = blockSource{path: path, offset: sources[index].offset, size: sources[index].size}
+				}
+			}
+			session.snapshot.objects = append(session.snapshot.objects, scannedObject{"files", id, data})
+			session.paths[path] = scannedPathState{kind: "File", state: after, hash: id}
+			if err := session.runFault("after-file-scan", path, attempt); err != nil {
+				return "", err
+			}
+			return id, nil
+		}
+	}
+	return "", &unstableWorktreeError{path, fmt.Sprintf("file changed across %d scan attempts", scanRetryBudget)}
+}
+
+func readFileBlocks(file *os.File, keepSources bool) ([]string, []blockSource, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, err
+	}
+	blocks := make([]string, 0)
+	sources := make([]blockSource, 0)
+	buffer := make([]byte, object.MaxBlockSize)
+	for offset := int64(0); ; offset += object.MaxBlockSize {
+		count, err := io.ReadFull(file, buffer)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, nil, err
+		}
+		blocks = append(blocks, object.ID(buffer[:count]))
+		if keepSources {
+			sources = append(sources, blockSource{offset: offset, size: int64(count)})
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		}
+	}
+	return blocks, sources, nil
+}
+
+func (session *scanSession) validateTree(root *openedWorktree) error {
+	directory, err := duplicateDirectory(root.directory, root.path)
+	if err != nil {
+		return fmt.Errorf("duplicate worktree root for validation: %w", err)
+	}
+	defer directory.Close()
+	return session.validateDirectory(directory, "")
+}
+
+func (session *scanSession) validateDirectory(directory *os.File, relative string) error {
+	expected, ok := session.directories[relative]
+	if !ok {
+		return &unstableWorktreeError{relative, "directory was not recorded"}
+	}
+	state, err := stateOf(directory)
+	if err != nil {
+		return fmt.Errorf("validate directory %q: %w", relative, err)
+	}
+	if !sameState(session.paths[relative].state, state) {
+		return &unstableWorktreeError{relative, "directory metadata changed before final validation"}
+	}
+	actual, err := session.enumerateDirectory(directory, relative)
+	if err != nil {
+		return err
+	}
+	if !sameListing(expected, actual) {
+		return &unstableWorktreeError{relative, "directory entries changed before final validation"}
+	}
+	for _, entry := range actual {
+		path := joinScanPath(relative, entry.name)
+		if err := session.runFault("before-open", path, 1); err != nil {
+			return fmt.Errorf("open worktree path %q during final validation: %w", path, err)
+		}
+		child, state, err := openListedAt(directory, entry, path)
+		if err != nil {
+			return err
+		}
+		recorded, ok := session.paths[path]
+		if !ok || recorded.kind != entry.kind || !sameState(recorded.state, state) {
+			child.Close()
+			return &unstableWorktreeError{path, "path changed before final validation"}
+		}
+		if entry.kind == "Directory" {
+			err = session.validateDirectory(child, path)
+		} else if state.ctime == (syscall.Timespec{}) {
+			blocks, _, readErr := readFileBlocks(child, false)
+			if readErr != nil {
+				err = readErr
+			} else {
+				_, id, objectErr := canonicalFile(path, state.size, blocks)
+				err = objectErr
+				if err == nil && id != recorded.hash {
+					err = &unstableWorktreeError{path, "file content changed before final validation"}
+				}
+			}
+		}
+		if closeErr := child.Close(); err != nil || closeErr != nil {
+			return errors.Join(err, closeErr)
+		}
+	}
+	return nil
+}
+
+func (session *scanSession) runFault(phase, path string, attempt int) error {
+	if session.config.fault == nil {
+		return nil
+	}
+	return session.config.fault(scanFault{phase: phase, path: path, attempt: attempt})
+}
+
+func (session *scanSession) warnUnsupported(path string) {
+	if session.warned[path] || session.config.warning == nil {
+		return
+	}
+	session.warned[path] = true
+	fmt.Fprintf(session.config.warning, "warning: ignoring untracked unsupported worktree path %q\n", path)
+}
+
+func stateOf(file *os.File) (fileState, error) {
+	return stateOfFD(int(file.Fd()))
+}
+
+func stateOfFD(fd int) (fileState, error) {
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		return fileState{}, err
+	}
+	return fileState{device: uint64(stat.Dev), inode: stat.Ino, mode: uint64(stat.Mode), nlink: uint64(stat.Nlink),
+		size: stat.Size, mtime: stat.Mtim, ctime: stat.Ctim}, nil
+}
+
+func sameIdentity(left, right fileState) bool {
+	return left.device == right.device && left.inode == right.inode
+}
+
+func sameState(left, right fileState) bool {
+	return sameIdentity(left, right) && left.mode == right.mode && left.nlink == right.nlink && left.size == right.size &&
+		left.mtime == right.mtime && left.ctime == right.ctime
+}
+
+func sameListing(left, right []listedEntry) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].name != right[index].name || left[index].kind != right[index].kind ||
+			!sameIdentity(left[index].state, right[index].state) {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneListing(entries []listedEntry) []listedEntry {
+	return append([]listedEntry(nil), entries...)
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func joinScanPath(parent, name string) string {
+	if parent == "" {
+		return name
+	}
+	return parent + "/" + name
+}
+
+func formatScanTime(value syscall.Timespec) string {
+	return time.Unix(value.Sec, value.Nsec).UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+}
+
+func canonicalFile(path string, size int64, blocks []string) ([]byte, string, error) {
+	quotedBlocks := make([]string, len(blocks))
+	for index, id := range blocks {
+		quotedBlocks[index] = strconv.Quote(id)
+	}
+	input := []byte(`{"Blocks":[` + strings.Join(quotedBlocks, ",") + `],"Size":` + strconv.Quote(strconv.FormatInt(size, 10)) + `,"Type":"File","Version":1}`)
+	data, id, err := object.Canonicalize("files", input)
+	if err != nil {
+		return nil, "", fmt.Errorf("construct file object for %q: %w", path, err)
+	}
+	return data, id, nil
+}
+
+func canonicalDirectory(relative string, values []scanEntry) ([]byte, string, error) {
 	var input bytes.Buffer
 	input.WriteString(`{"Entries":[`)
 	for index, entry := range values {
@@ -142,93 +538,45 @@ func scanDirectoryIgnoring(directory *os.File, relative string, snapshot *worktr
 	input.WriteString(`],"Type":"Directory","Version":1}`)
 	data, id, err := object.Canonicalize("directories", input.Bytes())
 	if err != nil {
-		return "", fmt.Errorf("invalid worktree directory %q: %w", relative, err)
+		return nil, "", fmt.Errorf("invalid worktree directory %q: %w", relative, err)
 	}
-	snapshot.objects = append(snapshot.objects, scannedObject{"directories", id, data})
-	return id, nil
+	return data, id, nil
 }
 
+// These wrappers keep checkout recovery on the same stable scanner primitives.
 func openScannableAt(directory *os.File, name, path string) (*os.File, os.FileInfo, error) {
-	inspectionFD, err := syscall.Openat(int(directory.Fd()), name, openPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	state, kind, err := inspectAt(directory, name, path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("inspect worktree path %q without following links: %w", path, err)
+		return nil, nil, err
 	}
-	var inspected syscall.Stat_t
-	if err := syscall.Fstat(inspectionFD, &inspected); err != nil {
-		syscall.Close(inspectionFD)
-		return nil, nil, fmt.Errorf("inspect worktree path %q: %w", path, err)
-	}
-	kind := inspected.Mode & syscall.S_IFMT
-	if kind != syscall.S_IFREG && kind != syscall.S_IFDIR {
-		syscall.Close(inspectionFD)
+	if kind == "" {
 		return nil, nil, fmt.Errorf("unsupported worktree path type at %q", path)
 	}
-	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
-	if kind == syscall.S_IFDIR {
-		flags |= syscall.O_DIRECTORY
-	}
-	fd, err := syscall.Openat(int(directory.Fd()), name, flags, 0)
+	file, _, err := openListedAt(directory, listedEntry{name: name, kind: kind, state: state}, path)
 	if err != nil {
-		syscall.Close(inspectionFD)
-		return nil, nil, fmt.Errorf("open worktree path %q without following links: %w", path, err)
+		return nil, nil, err
 	}
-	var opened syscall.Stat_t
-	if err := syscall.Fstat(fd, &opened); err != nil || opened.Dev != inspected.Dev || opened.Ino != inspected.Ino || opened.Mode != inspected.Mode {
-		syscall.Close(inspectionFD)
-		syscall.Close(fd)
-		return nil, nil, fmt.Errorf("worktree path %q changed while opening", path)
-	}
-	syscall.Close(inspectionFD)
-	file := os.NewFile(uintptr(fd), path)
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
-		return nil, nil, fmt.Errorf("inspect opened worktree path %q: %w", path, err)
+		return nil, nil, err
 	}
 	return file, info, nil
 }
 
-func scanRegularFile(file *os.File, path string, before os.FileInfo, snapshot *worktreeSnapshot) (string, error) {
-	blocks := make([]string, 0, (before.Size()+object.MaxBlockSize-1)/object.MaxBlockSize)
-	buffer := make([]byte, object.MaxBlockSize)
-	for offset := int64(0); ; offset += object.MaxBlockSize {
-		count, err := io.ReadFull(file, buffer)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
-			return "", fmt.Errorf("read worktree file %q: %w", path, err)
-		}
-		id := object.ID(buffer[:count])
-		blocks = append(blocks, id)
-		if _, exists := snapshot.blocks[id]; !exists {
-			snapshot.blocks[id] = blockSource{path: path, offset: offset, size: int64(count)}
-		}
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			break
-		}
-	}
-	after, err := file.Stat()
-	if err != nil || !sameFileState(before, after) {
-		return "", errors.New("worktree changed during scan")
-	}
-	quotedBlocks := make([]string, len(blocks))
-	for index, id := range blocks {
-		quotedBlocks[index] = strconv.Quote(id)
-	}
-	input := []byte(`{"Blocks":[` + strings.Join(quotedBlocks, ",") + `],"Size":` + strconv.Quote(strconv.FormatInt(before.Size(), 10)) + `,"Type":"File","Version":1}`)
-	data, id, err := object.Canonicalize("files", input)
-	if err != nil {
-		return "", fmt.Errorf("construct file object for %q: %w", path, err)
-	}
-	snapshot.objects = append(snapshot.objects, scannedObject{"files", id, data})
-	return id, nil
+func scanRegularFile(file *os.File, path string, _ os.FileInfo, snapshot *worktreeSnapshot) (string, error) {
+	session := scanSession{snapshot: *snapshot, paths: make(map[string]scannedPathState)}
+	id, err := session.scanRegularFile(file, path)
+	*snapshot = session.snapshot
+	return id, err
 }
 
-func sameFileState(left, right os.FileInfo) bool {
-	l, lok := left.Sys().(*syscall.Stat_t)
-	r, rok := right.Sys().(*syscall.Stat_t)
-	return lok && rok && l.Dev == r.Dev && l.Ino == r.Ino && l.Mode == r.Mode && l.Size == r.Size && l.Mtim == r.Mtim
+func scanDirectory(directory *os.File, relative string, snapshot *worktreeSnapshot) (string, error) {
+	session := scanSession{snapshot: *snapshot, paths: make(map[string]scannedPathState),
+		directories: make(map[string][]listedEntry), warned: make(map[string]bool)}
+	id, err := session.scanDirectory(directory, relative)
+	*snapshot = session.snapshot
+	return id, err
 }
 
 func (root *openedWorktree) readBlock(source blockSource, expectedID string) ([]byte, error) {

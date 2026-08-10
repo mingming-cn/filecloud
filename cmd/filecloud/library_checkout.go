@@ -218,6 +218,65 @@ func downloadCheckoutTree(ctx context.Context, options bindOptions, root string)
 	return paths, nil
 }
 
+func loadRemoteTrackedPaths(ctx context.Context, options bindOptions, binding clientBinding) (map[string]bool, error) {
+	cacheRoot, err := openVerifiedCacheRoot(options.clientDir)
+	if err != nil {
+		return nil, err
+	}
+	defer cacheRoot.Close()
+	options.cacheRoot = cacheRoot
+	commit, err := downloadTargetCommit(ctx, options, binding.SyncBase, binding.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("load legacy tracked paths: %w", err)
+	}
+	if commit.Root != binding.SyncBaseRoot {
+		return nil, errors.New("legacy binding Sync Base commit has a different root")
+	}
+	tracked := make(map[string]bool)
+	var walk func(string, string, int) error
+	walk = func(id, prefix string, depth int) error {
+		if depth > 256 {
+			return errors.New("Sync Base directory tree exceeds depth limit")
+		}
+		data, err := cachedRemoteObject(ctx, options, "directories", id)
+		if err != nil {
+			return err
+		}
+		directory, err := object.VerifyDirectory(data, id)
+		if err != nil {
+			return errors.New("Sync Base directory is not valid canonical content")
+		}
+		for _, entry := range directory.Entries {
+			path := entry.Name
+			if prefix != "" {
+				path = prefix + "/" + entry.Name
+			}
+			if len(path) > 1024 {
+				return errors.New("Sync Base path exceeds limit")
+			}
+			tracked[path] = true
+			if entry.Type == "Directory" {
+				if err := walk(entry.ID, path, depth+1); err != nil {
+					return err
+				}
+				continue
+			}
+			fileData, err := cachedRemoteObject(ctx, options, "files", entry.ID)
+			if err != nil {
+				return err
+			}
+			if _, err := object.VerifyFile(fileData, entry.ID); err != nil {
+				return errors.New("Sync Base file is not valid canonical content")
+			}
+		}
+		return nil
+	}
+	if err := walk(commit.Root, "", 0); err != nil {
+		return nil, fmt.Errorf("load legacy tracked paths: %w", err)
+	}
+	return tracked, nil
+}
+
 func cachedRemoteObject(ctx context.Context, options bindOptions, kind, id string) ([]byte, error) {
 	validate := func(data []byte) error {
 		var err error

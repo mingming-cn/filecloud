@@ -51,7 +51,7 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 		return continueSyncCheckout(ctx, db, options, binding, *checkout, stdout, config)
 	}
 
-	snapshot, err := scanWorktree(options.worktreeRoot)
+	snapshot, err := scanWorktreeWithConfig(options.worktreeRoot, options.scanConfig)
 	if err != nil {
 		return fmt.Errorf("scan worktree: %w", err)
 	}
@@ -232,7 +232,7 @@ func publishPending(ctx context.Context, db *sql.DB, options bindOptions, bindin
 			return fmt.Errorf("prepare Head publication: %w", err)
 		}
 	}
-	verified, err := scanWorktree(options.worktreeRoot)
+	verified, err := scanWorktreeWithConfig(options.worktreeRoot, options.scanConfig)
 	if err != nil || verified.root != pending.CandidateRoot {
 		return errors.New("worktree changed before Head publication")
 	}
@@ -330,7 +330,7 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 				return fmt.Errorf("prepare sync recovery: %w", err)
 			}
 		}
-		stable, err := scanWorktree(options.worktreeRoot)
+		stable, err := scanWorktreeWithConfig(options.worktreeRoot, options.scanConfig)
 		if err != nil || stable.root != binding.SyncBaseRoot {
 			if clearErr := clearUnstartedCheckout(ctx, db, binding.Worktree); clearErr != nil {
 				return errors.Join(errors.New("local worktree changed before remote apply"), err, clearErr)
@@ -367,7 +367,9 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 	if err != nil {
 		return err
 	}
-	verified, err := scanWorktreeIgnoring(options.worktreeRoot, ignored)
+	scanConfig := options.scanConfig
+	scanConfig.ignoredRootNames = ignored
+	verified, err := scanWorktreeWithConfig(options.worktreeRoot, scanConfig)
 	if err != nil || verified.root != pending.TargetRoot {
 		return errors.Join(errors.New("applied remote snapshot did not match its fixed target"), err)
 	}
@@ -383,7 +385,9 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 	if err != nil {
 		return err
 	}
-	verified, err = scanWorktreeIgnoring(options.worktreeRoot, ignored)
+	scanConfig = options.scanConfig
+	scanConfig.ignoredRootNames = ignored
+	verified, err = scanWorktreeWithConfig(options.worktreeRoot, scanConfig)
 	if err != nil || verified.root != pending.TargetRoot {
 		return errors.Join(errors.New("remote target changed before finalization"), err)
 	}

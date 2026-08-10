@@ -1016,6 +1016,199 @@ func TestLibrarySyncRemoteApplyRetainsFixedTargetAndDetectsHeadAdvance(t *testin
 	assertTestConverged(t, environment, subscriberDir, subscriberTree)
 }
 
+func TestLegacyEmptyIndexDerivesTrackedUnsupportedPathsFromSyncBase(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		replace func(string) error
+	}{
+		{"symlink", func(path string) error { return os.Symlink("target", path) }},
+		{"fifo", func(path string) error { return syscall.Mkfifo(path, 0o600) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+			var puts atomic.Int32
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut {
+					puts.Add(1)
+				}
+				environment.handler.ServeHTTP(w, r)
+			}))
+			defer proxy.Close()
+			clientDir, worktree := newClientPaths(t)
+			tracked := filepath.Join(worktree, "tracked")
+			if err := os.WriteFile(tracked, []byte("tracked"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			args := append(bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testClientDeviceID), "--import-local")
+			if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			before := readTestBinding(t, clientDir, worktree)
+			db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec("DELETE FROM path_index WHERE worktree = ?", worktree); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(tracked); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.replace(tracked); err != nil {
+				t.Fatal(err)
+			}
+			puts.Store(0)
+			err = syncTestWorktree(t, clientDir, worktree)
+			if err == nil || !strings.Contains(err.Error(), "unsupported") {
+				t.Fatalf("legacy tracked %s error=%v", test.name, err)
+			}
+			assertFailedScanState(t, environment, clientDir, worktree, before, 0, puts.Load())
+		})
+	}
+}
+
+func TestSyncTrackedFIFODoesNotPublishDeletion(t *testing.T) {
+	environment, clientDir, worktree, _, _, puts, _ := newSyncPair(t)
+	before := readTestBinding(t, clientDir, worktree)
+	indexCount := countClientRows(t, clientDir, "path_index", worktree)
+	path := filepath.Join(worktree, "base")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	puts.Store(0)
+	err := syncTestWorktree(t, clientDir, worktree)
+	if err == nil || !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("tracked FIFO error=%v", err)
+	}
+	assertFailedScanState(t, environment, clientDir, worktree, before, indexCount, puts.Load())
+}
+
+func TestSyncTrackedOpenFailureDoesNotPublishDeletion(t *testing.T) {
+	environment, clientDir, worktree, _, _, puts, _ := newSyncPair(t)
+	before := readTestBinding(t, clientDir, worktree)
+	indexCount := countClientRows(t, clientDir, "path_index", worktree)
+	puts.Store(0)
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", clientDir, "--worktree", worktree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{
+			checkFilesystem: func(*os.File) error { return nil }, now: time.Now,
+			scanFault: func(event scanFault) error {
+				if event.phase == "before-open" && event.path == "base" {
+					return syscall.EACCES
+				}
+				return nil
+			},
+		})
+	if err == nil || !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("tracked open failure=%v", err)
+	}
+	assertFailedScanState(t, environment, clientDir, worktree, before, indexCount, puts.Load())
+}
+
+func TestSyncContinuousMutationExhaustionPreservesState(t *testing.T) {
+	environment, clientDir, worktree, _, _, puts, _ := newSyncPair(t)
+	before := readTestBinding(t, clientDir, worktree)
+	indexCount := countClientRows(t, clientDir, "path_index", worktree)
+	mutations := 0
+	puts.Store(0)
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", clientDir, "--worktree", worktree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{
+			checkFilesystem: func(*os.File) error { return nil }, now: time.Now,
+			scanFault: func(event scanFault) error {
+				if event.phase == "after-file-read-1" && event.path == "base" {
+					mutations++
+					return os.WriteFile(filepath.Join(worktree, "base"), []byte(strings.Repeat("x", mutations+4)), 0o600)
+				}
+				return nil
+			},
+		})
+	if err == nil || !strings.Contains(err.Error(), "unstable worktree") || mutations != scanRetryBudget {
+		t.Fatalf("continuous mutation error=%v mutations=%d", err, mutations)
+	}
+	assertFailedScanState(t, environment, clientDir, worktree, before, indexCount, puts.Load())
+}
+
+func assertFailedScanState(t *testing.T, environment libraryCLIEnvironment, clientDir, worktree string, before clientBinding, indexCount int, puts int32) {
+	t.Helper()
+	if after := readTestBinding(t, clientDir, worktree); after != before {
+		t.Fatalf("binding changed: before=%+v after=%+v", before, after)
+	}
+	if count := countClientRows(t, clientDir, "pending_publications", worktree); count != 0 {
+		t.Fatalf("pending publication rows=%d", count)
+	}
+	if count := countClientRows(t, clientDir, "path_index", worktree); count != indexCount {
+		t.Fatalf("path index rows=%d want=%d", count, indexCount)
+	}
+	if puts != 0 {
+		t.Fatalf("PUT requests=%d", puts)
+	}
+	head, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	if err != nil || head.CommitID == nil || *head.CommitID != before.SyncBase {
+		t.Fatalf("Head changed: head=%+v err=%v", head, err)
+	}
+}
+
+func TestSyncWarnsAndIgnoresUntrackedUnsupportedPath(t *testing.T) {
+	_, clientDir, worktree, _, _, puts, _ := newSyncPair(t)
+	if err := syscall.Mkfifo(filepath.Join(worktree, "pipe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", clientDir, "--worktree", worktree},
+		strings.NewReader(""), &stdout, &stderr, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }, now: time.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "warning:") || !strings.Contains(stderr.String(), "pipe") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "already synchronized") {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+	if count := puts.Load(); count != 0 {
+		t.Fatalf("PUT requests=%d", count)
+	}
+}
+
+func TestSyncUnstableScanDoesNotPublishOrChangeClientState(t *testing.T) {
+	environment, clientDir, worktree, _, _, puts, _ := newSyncPair(t)
+	before := readTestBinding(t, clientDir, worktree)
+	changed := false
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", clientDir, "--worktree", worktree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{
+			checkFilesystem: func(*os.File) error { return nil }, now: time.Now,
+			scanFault: func(event scanFault) error {
+				if event.phase == "after-file-scan" && event.path == "base" && !changed {
+					changed = true
+					return os.WriteFile(filepath.Join(worktree, "base"), []byte("changed"), 0o600)
+				}
+				return nil
+			},
+		})
+	if err == nil || !strings.Contains(err.Error(), "unstable worktree") {
+		t.Fatalf("unstable sync error=%v", err)
+	}
+	after := readTestBinding(t, clientDir, worktree)
+	if after.SyncBase != before.SyncBase || after.SyncBaseRoot != before.SyncBaseRoot || after.HeadETag != before.HeadETag {
+		t.Fatalf("binding changed: before=%+v after=%+v", before, after)
+	}
+	if count := countClientRows(t, clientDir, "pending_publications", worktree); count != 0 {
+		t.Fatalf("pending publication rows=%d", count)
+	}
+	if count := puts.Load(); count != 0 {
+		t.Fatalf("PUT requests=%d", count)
+	}
+	head, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	if headErr != nil || head.CommitID == nil || *head.CommitID != before.SyncBase {
+		t.Fatalf("Head changed: head=%+v err=%v", head, headErr)
+	}
+}
+
 func newSyncPair(t *testing.T) (libraryCLIEnvironment, string, string, string, string, *atomic.Int32, *atomic.Int32) {
 	t.Helper()
 	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})

@@ -53,6 +53,7 @@ type libraryClientConfig struct {
 	afterSyncRecoveryRestore        func(string) error
 	beforeFlock                     func()
 	afterLock                       func()
+	scanFault                       func(scanFault) error
 }
 
 func normalizeLibraryClientConfig(config libraryClientConfig) libraryClientConfig {
@@ -78,6 +79,7 @@ type bindOptions struct {
 	worktreeRoot                                        *openedWorktree
 	cacheRoot                                           *os.File
 	importLocal                                         bool
+	scanConfig                                          worktreeScanConfig
 }
 
 type clientBinding struct {
@@ -192,14 +194,15 @@ func parseLibraryBind(ctx context.Context, args []string, stdin io.Reader, stder
 				return bindOptions{}, errors.Join(emptyErr, pendingErr, worktreeRoot.Close())
 			}
 		}
-	} else if _, err := scanWorktree(worktreeRoot); err != nil {
+	} else if _, err := scanWorktreeWithConfig(worktreeRoot, worktreeScanConfig{fault: config.scanFault}); err != nil {
 		clear(token)
 		return bindOptions{}, errors.Join(err, worktreeRoot.Close())
 	}
 	base.Scheme = strings.ToLower(base.Scheme)
 	base.Host = strings.ToLower(base.Host)
 	return bindOptions{clientDir: canonicalClientDir, serverURL: strings.TrimSuffix(base.String(), "/"), libraryID: *libraryID,
-		worktree: canonicalWorktree, deviceID: *deviceID, base: base, token: token, worktreeRoot: worktreeRoot, importLocal: *importLocal}, nil
+		worktree: canonicalWorktree, deviceID: *deviceID, base: base, token: token, worktreeRoot: worktreeRoot, importLocal: *importLocal,
+		scanConfig: worktreeScanConfig{fault: config.scanFault}}, nil
 }
 
 func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, config libraryClientConfig) (retErr error) {
@@ -234,7 +237,7 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 	}
 	snapshot := worktreeSnapshot{root: emptyRoot}
 	if !recoveringCheckout {
-		snapshot, err = scanWorktree(options.worktreeRoot)
+		snapshot, err = scanWorktreeWithConfig(options.worktreeRoot, options.scanConfig)
 		if err != nil {
 			return fmt.Errorf("scan worktree: %w", err)
 		}
@@ -341,7 +344,7 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 	}
 
 	if head.CommitID != nil && *head.CommitID == intent.CandidateCommit {
-		return finalizeImportedBinding(ctx, db, options, *intent, head, stdout, config)
+		return finalizeImportedBinding(ctx, db, options, *intent, head, snapshot, stdout, config)
 	}
 	if head.CommitID == nil || len(commit.Parents) != 1 || *head.CommitID != commit.Parents[0] || head.ETag != intent.ExpectedETag {
 		return errors.New("library Head changed during local import; merge is not supported yet")
@@ -372,7 +375,7 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 	if published.CommitID == nil || *published.CommitID != intent.CandidateCommit {
 		return errors.Join(publishErr, errors.New("library Head changed during local import; merge is not supported yet"))
 	}
-	return finalizeImportedBinding(ctx, db, options, *intent, published, stdout, config)
+	return finalizeImportedBinding(ctx, db, options, *intent, published, snapshot, stdout, config)
 }
 
 func canonicalEmptyDirectory() ([]byte, string, error) {
@@ -384,7 +387,7 @@ func canonicalEmptyDirectory() ([]byte, string, error) {
 }
 
 func rescanRoot(options bindOptions, expected string) (worktreeSnapshot, error) {
-	snapshot, err := scanWorktree(options.worktreeRoot)
+	snapshot, err := scanWorktreeWithConfig(options.worktreeRoot, options.scanConfig)
 	if err != nil {
 		return worktreeSnapshot{}, fmt.Errorf("worktree changed during bind: %w", err)
 	}
@@ -619,19 +622,21 @@ func finalizeInitialWinner(ctx context.Context, db *sql.DB, options bindOptions,
 			return fmt.Errorf("finalize binding: %w", err)
 		}
 	}
-	if _, err := rescanRoot(options, intent.CandidateRoot); err != nil {
+	snapshot, err := rescanRoot(options, intent.CandidateRoot)
+	if err != nil {
 		return err
 	}
 	binding := clientBinding{ServerURL: options.serverURL, LibraryID: options.libraryID, Worktree: options.worktree,
 		UserID: intent.UserID, DeviceID: options.deviceID, SyncBase: *head.CommitID, SyncBaseRoot: intent.CandidateRoot, HeadETag: head.ETag}
-	if err := finalizeBinding(ctx, db, binding, options.token); err != nil {
+	if err := finalizeBinding(ctx, db, binding, options.token, snapshot.paths); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintf(stdout, "library bound: %s\n", options.worktree)
+	_, err = fmt.Fprintf(stdout, "library bound: %s\n", options.worktree)
 	return err
 }
 
-func finalizeImportedBinding(ctx context.Context, db *sql.DB, options bindOptions, intent bindIntent, head remoteHead, stdout io.Writer, config libraryClientConfig) error {
+func finalizeImportedBinding(ctx context.Context, db *sql.DB, options bindOptions, intent bindIntent, head remoteHead,
+	snapshot worktreeSnapshot, stdout io.Writer, config libraryClientConfig) error {
 	if head.CommitID == nil || *head.CommitID != intent.CandidateCommit {
 		return errors.New("library Head does not match pending bind intent")
 	}
@@ -639,7 +644,7 @@ func finalizeImportedBinding(ctx context.Context, db *sql.DB, options bindOption
 	if err != nil || commit.Root != intent.CandidateRoot || commit.AuthorUserID != intent.UserID || commit.DeviceID != intent.DeviceID {
 		return errors.New("pending bind intent is corrupt")
 	}
-	if _, err := rescanRoot(options, intent.CandidateRoot); err != nil {
+	if snapshot, err = rescanRoot(options, intent.CandidateRoot); err != nil {
 		return err
 	}
 	if config.beforeFinalize != nil {
@@ -647,12 +652,12 @@ func finalizeImportedBinding(ctx context.Context, db *sql.DB, options bindOption
 			return fmt.Errorf("finalize binding: %w", err)
 		}
 	}
-	if _, err := rescanRoot(options, intent.CandidateRoot); err != nil {
+	if snapshot, err = rescanRoot(options, intent.CandidateRoot); err != nil {
 		return err
 	}
 	binding := clientBinding{ServerURL: options.serverURL, LibraryID: options.libraryID, Worktree: options.worktree,
 		UserID: intent.UserID, DeviceID: options.deviceID, SyncBase: *head.CommitID, SyncBaseRoot: intent.CandidateRoot, HeadETag: head.ETag}
-	if err := finalizeBinding(ctx, db, binding, options.token); err != nil {
+	if err := finalizeBinding(ctx, db, binding, options.token, snapshot.paths); err != nil {
 		return err
 	}
 	_, err = fmt.Fprintf(stdout, "library bound: %s\n", options.worktree)
@@ -740,9 +745,41 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, root.Close()) }()
+	tracked, err := loadTrackedPaths(ctx, db, binding.Worktree)
+	if err != nil {
+		return err
+	}
 	options := bindOptions{clientDir: canonicalClientDir, serverURL: binding.ServerURL, libraryID: binding.LibraryID,
-		worktree: binding.Worktree, deviceID: binding.DeviceID, base: base, token: token, worktreeRoot: root}
+		worktree: binding.Worktree, deviceID: binding.DeviceID, base: base, token: token, worktreeRoot: root,
+		scanConfig: worktreeScanConfig{trackedPaths: tracked, warning: stderr, fault: config.scanFault, ignoreUntrackedUnsupported: true}}
+	if len(tracked) == 0 {
+		tracked, err = loadRemoteTrackedPaths(ctx, options, binding)
+		if err != nil {
+			return err
+		}
+		options.scanConfig.trackedPaths = tracked
+	}
 	return syncLibrary(ctx, db, options, binding, stdout, config)
+}
+
+func loadTrackedPaths(ctx context.Context, db *sql.DB, worktree string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, "SELECT path FROM path_index WHERE worktree = ?", worktree)
+	if err != nil {
+		return nil, fmt.Errorf("read tracked worktree paths: %w", err)
+	}
+	defer rows.Close()
+	tracked := make(map[string]bool)
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("read tracked worktree path: %w", err)
+		}
+		tracked[path] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read tracked worktree paths: %w", err)
+	}
+	return tracked, nil
 }
 
 func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writer, config libraryClientConfig) (retErr error) {
@@ -1268,7 +1305,7 @@ func replaceBindIntent(ctx context.Context, db *sql.DB, intent bindIntent) error
 	return nil
 }
 
-func finalizeBinding(ctx context.Context, db *sql.DB, binding clientBinding, accessToken []byte) error {
+func finalizeBinding(ctx context.Context, db *sql.DB, binding clientBinding, accessToken []byte, paths []checkoutPath) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin binding transaction: %w", err)
@@ -1278,6 +1315,12 @@ func finalizeBinding(ctx context.Context, db *sql.DB, binding clientBinding, acc
 		binding.ServerURL, binding.LibraryID, binding.Worktree, binding.UserID, binding.DeviceID, binding.SyncBase, binding.SyncBaseRoot,
 		binding.HeadETag, accessToken); err != nil {
 		return errors.Join(fmt.Errorf("save client binding: %w", err), tx.Rollback())
+	}
+	for _, path := range paths {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO path_index(worktree, path, type, object_id, canonical_mtime, actual_mtime, size)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`, binding.Worktree, path.path, path.kind, path.id, path.mtime, path.mtime, path.size); err != nil {
+			return errors.Join(fmt.Errorf("save imported path index: %w", err), tx.Rollback())
+		}
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM bind_intents WHERE worktree = ? AND server_url = ? AND library_id = ?",
 		binding.Worktree, binding.ServerURL, binding.LibraryID); err != nil {

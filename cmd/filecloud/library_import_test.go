@@ -49,6 +49,10 @@ func TestLibraryBindImportsLocalSnapshotAndSyncNoOps(t *testing.T) {
 	if binding.SyncBase != *head.CommitID {
 		t.Fatalf("SyncBase=%s Head=%s", binding.SyncBase, *head.CommitID)
 	}
+	assertIndexedPaths(t, clientDir, worktree, map[string]string{
+		"empty": "File", "nested": "Directory", "nested/empty-dir": "Directory", "nested/unicode-界.txt": "File",
+		"below": "File", "boundary": "File", "above": "File",
+	})
 	commit, err := object.VerifyCommit(getTestObject(t, environment.server.URL, environment.token, "commits", *head.CommitID), *head.CommitID)
 	if err != nil || len(commit.Parents) != 1 || commit.Root != binding.SyncBaseRoot {
 		t.Fatalf("import commit=%+v err=%v", commit, err)
@@ -89,6 +93,39 @@ func TestLibraryBindImportsLocalSnapshotAndSyncNoOps(t *testing.T) {
 	changedHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
 	if err != nil || changedHead.ETag == beforeETag || changedHead.CommitID == nil || *changedHead.CommitID == *head.CommitID {
 		t.Fatalf("changed sync did not advance Head: %+v err=%v", changedHead, err)
+	}
+}
+
+func assertIndexedPaths(t *testing.T, clientDir, worktree string, expected map[string]string) {
+	t.Helper()
+	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query("SELECT path, type FROM path_index WHERE worktree = ?", worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	actual := make(map[string]string)
+	for rows.Next() {
+		var path, kind string
+		if err := rows.Scan(&path, &kind); err != nil {
+			t.Fatal(err)
+		}
+		actual[path] = kind
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(actual) != len(expected) {
+		t.Fatalf("indexed paths=%v want=%v", actual, expected)
+	}
+	for path, kind := range expected {
+		if actual[path] != kind {
+			t.Fatalf("indexed path %q=%q want=%q", path, actual[path], kind)
+		}
 	}
 }
 
