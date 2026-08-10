@@ -1299,6 +1299,27 @@ func TestFSJournalRootReplacementRejected(t *testing.T) {
 	}
 }
 
+func TestPromotionTargetParentIdentityCodecIsCanonical(t *testing.T) {
+	encoded := encodePromotionTargetParent(0x1234, 0x5678)
+	device, inode, err := decodePromotionTargetParent(encoded)
+	if err != nil || device != 0x1234 || inode != 0x5678 {
+		t.Fatalf("promotion target parent identity=%q device=%x inode=%x err=%v", encoded, device, inode, err)
+	}
+	for name, value := range map[string]string{
+		"trailing":  encoded + "0",
+		"short":     encoded[:len(encoded)-1],
+		"zero":      encodePromotionTargetParent(0, 1),
+		"uppercase": strings.ToUpper(encoded),
+		"untagged":  "0000000000001234:0000000000005678",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := decodePromotionTargetParent(value); err == nil {
+				t.Fatalf("noncanonical promotion target parent identity %q accepted", value)
+			}
+		})
+	}
+}
+
 func TestFSActionRecoveryRejectsCorruptPath(t *testing.T) {
 	clientDir, rootPath := t.TempDir(), t.TempDir()
 	db, err := initializeClientDB(t.Context(), clientDir, syncDirectory)
@@ -2842,6 +2863,7 @@ func TestPublicSyncFSActionCrashHelper(t *testing.T) {
 		t.Skip("subprocess helper")
 	}
 	collisionInjected := false
+	casefoldAliasInjected := false
 	mutationInjected := false
 	mixedPromotionDisturbed := false
 	mixedRecoveryNames := make(map[string]string)
@@ -2854,6 +2876,14 @@ func TestPublicSyncFSActionCrashHelper(t *testing.T) {
 			collisionInjected = true
 			if err := os.WriteFile(filepath.Join(os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE"), filepath.FromSlash(action.Target)),
 				[]byte("racing"), 0o600); err != nil {
+				return err
+			}
+		}
+		if role == "casefold-alias-relocation" && point == "before_action" && action.ExpectedObject != "" &&
+			action.OriginActionID == "" && !casefoldAliasInjected {
+			casefoldAliasInjected = true
+			parent, leaf := filepath.Split(filepath.Join(os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE"), filepath.FromSlash(action.Target)))
+			if err := os.WriteFile(filepath.Join(parent, strings.ToUpper(leaf)), []byte("alias"), 0o600); err != nil {
 				return err
 			}
 		}
@@ -2887,8 +2917,11 @@ func TestPublicSyncFSActionCrashHelper(t *testing.T) {
 		if matches && (role == "promotion" || role == "pre-promotion-mutation") {
 			matches = action.ExpectedObject != "" && action.OriginActionID == ""
 		}
-		if matches && (role == "promotion-collision" || role == "late-promotion") {
+		if matches && (role == "promotion-collision" || role == "late-promotion" || role == "casefold-alias-relocation") {
 			matches = action.ExpectedObject != "" && action.OriginActionID != ""
+		}
+		if matches && role == "fallback-root-create" {
+			matches = strings.HasPrefix(action.InternalTarget, fsPromotionFallbackOwnerPrefix)
 		}
 		if target := os.Getenv("FILECLOUD_PUBLIC_CRASH_TARGET"); target != "" {
 			matches = matches && action.Target == target
@@ -2907,6 +2940,20 @@ func TestPublicSyncFSActionCrashHelper(t *testing.T) {
 		config.afterSyncRecoveryRename = func(path, recoveryName string) error {
 			mixedRecoveryNames[path] = recoveryName
 			return nil
+		}
+	}
+	if os.Getenv("FILECLOUD_PUBLIC_CRASH_ROLE") == "casefold-alias-relocation" {
+		config.afterSyncRecoveryRename = func(string, string) error {
+			if mutationInjected {
+				return nil
+			}
+			mutationInjected = true
+			held := os.NewFile(3, "held-conflict")
+			if held == nil {
+				return errors.New("inherited conflict descriptor is absent")
+			}
+			_, err := held.WriteAt([]byte("late!"), 0)
+			return errors.Join(err, held.Sync())
 		}
 	}
 	if os.Getenv("FILECLOUD_PUBLIC_CRASH_ROLE") == "pre-promotion-mutation" {

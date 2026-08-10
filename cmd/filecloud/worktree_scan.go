@@ -514,7 +514,7 @@ func joinScanPath(parent, name string) string {
 }
 
 func formatScanTime(value syscall.Timespec) string {
-	return time.Unix(value.Sec, value.Nsec).UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+	return canonicalProtocolMtime(time.Unix(value.Sec, value.Nsec))
 }
 
 func canonicalFile(path string, size int64, blocks []string) ([]byte, string, error) {

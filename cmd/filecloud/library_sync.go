@@ -852,6 +852,20 @@ func transitionPublishedSuccessor(ctx context.Context, db *sql.DB, options bindO
 	if err != nil {
 		return err
 	}
+	if len(promotions) != 0 {
+		cacheRoot, err := openVerifiedCacheRoot(options.clientDir)
+		if err != nil {
+			return err
+		}
+		options.cacheRoot = cacheRoot
+		capturedBinding := binding
+		capturedBinding.SyncBase, capturedBinding.SyncBaseRoot = pending.CapturedCommit, pending.CapturedRoot
+		authorityErr := _authoritativePromotionReplay(ctx, options, capturedBinding, *head.CommitID, promotions, budget)
+		closeErr := cacheRoot.Close()
+		if authorityErr != nil || closeErr != nil {
+			return errors.Join(authorityErr, closeErr)
+		}
+	}
 	checkout := pendingCheckout{ServerURL: binding.ServerURL, LibraryID: binding.LibraryID, Worktree: binding.Worktree,
 		UserID: binding.UserID, DeviceID: binding.DeviceID, TargetCommit: *head.CommitID, HeadETag: head.ETag,
 		ApplyState: "pending", ConflictPromotions: encodedPromotions}
@@ -1080,7 +1094,11 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 	scanConfig.ignoredPaths = latePaths
 	verified, err := scanWorktreeWithConfig(options.worktreeRoot, scanConfig)
 	if err != nil || verified.root != pending.TargetRoot {
-		return errors.Join(errors.New("applied remote snapshot did not match its fixed target"), err)
+		var lateErr error
+		if len(latePaths) != 0 {
+			lateErr = errors.New("late conflict paths require rerun sync")
+		}
+		return errors.Join(errors.New("applied remote snapshot did not match its fixed target"), lateErr, err)
 	}
 	if config.beforeFinalize != nil {
 		if err := config.beforeFinalize(); err != nil {
@@ -1106,7 +1124,11 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 	scanConfig.ignoredPaths = latePaths
 	verified, err = scanWorktreeWithConfig(options.worktreeRoot, scanConfig)
 	if err != nil || verified.root != pending.TargetRoot {
-		return errors.Join(errors.New("remote target changed before finalization"), err)
+		var lateErr error
+		if len(latePaths) != 0 {
+			lateErr = errors.New("late conflict paths require rerun sync")
+		}
+		return errors.Join(errors.New("remote target changed before finalization"), lateErr, err)
 	}
 	finalRecoveries, err := loadSyncRecoveries(ctx, db, binding.Worktree)
 	if err != nil {
@@ -1408,22 +1430,18 @@ func validateCompletedPromotion(ctx context.Context, db *sql.DB, root *openedWor
 		(promotion.ActionID != rootAction.ActionID && (promotion.OriginActionID != rootAction.ActionID || promotion.Attempt <= 0)) {
 		return fsAction{}, fmt.Errorf("conflict provenance source %q has a stale or mismatched promotion action linkage", expected.source)
 	}
-	if err := validateRootPromotionTarget(expected.target, rootAction.Target); err != nil {
+	if err := validateRootPromotionTarget(expected.target, rootAction.Target, expected.namingSeed, expected.source); err != nil {
 		return fsAction{}, err
 	}
 	if rootAction.Target == expected.target && (rootAction.ExpectedObject != expected.id ||
 		rootAction.ExpectedMtime != expected.mtime || rootAction.ExpectedSize != expected.size) {
 		return fsAction{}, fmt.Errorf("conflict provenance source %q has mismatched fixed-target content linkage", expected.source)
 	}
-	canonicalTarget := rootAction.Target
-	for attempt := 0; attempt < promotion.Attempt; attempt++ {
-		canonicalTarget, err = nextConflictChainPath(canonicalTarget)
-		if err != nil {
-			return fsAction{}, err
-		}
+	if err := validateRootPromotionTarget(rootAction.Target, promotion.Target, expected.namingSeed, expected.source); err != nil {
+		return fsAction{}, errors.Join(errors.New("linked promotion target is outside its deterministic collision sequence"), err)
 	}
-	if canonicalTarget != promotion.Target {
-		return fsAction{}, errors.New("linked promotion target is outside its deterministic collision sequence")
+	if promotion.Attempt > 0 && promotion.Target == rootAction.Target {
+		return fsAction{}, errors.New("linked promotion target did not advance its deterministic collision sequence")
 	}
 	if promotion.State == fsStateIntent {
 		if err := completeFSAction(ctx, db, root, promotion, config.fsActionFault); err != nil {
@@ -1431,49 +1449,66 @@ func validateCompletedPromotion(ctx context.Context, db *sql.DB, root *openedWor
 		}
 		promotion.State = fsStateCompleted
 	}
-	targetParent, targetLeaf, err := promotionTargetParent(ctx, db, root, recovery.worktree, promotion.Target)
-	if err != nil {
-		return fsAction{}, err
+	for relocation := 0; relocation < _conflictMaxOrdinal; relocation++ {
+		targetParent, targetLeaf, err := promotionTargetParent(ctx, db, root, recovery.worktree, promotion.Target)
+		if err != nil {
+			return fsAction{}, err
+		}
+		file, info, openErr := openScannableAt(targetParent, targetLeaf, promotion.Target)
+		if openErr != nil {
+			return fsAction{}, errors.Join(openErr, targetParent.Close())
+		}
+		stat, statOK := info.Sys().(*syscall.Stat_t)
+		var parentStat unix.Stat_t
+		parentStatErr := unix.Fstat(int(targetParent.Fd()), &parentStat)
+		snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+		id, scanErr := scanRegularFile(file, promotion.Target, info, &snapshot)
+		mtime := canonicalProtocolMtime(info.ModTime())
+		aliases, aliasErr := parentCasefoldAliases(targetParent, targetLeaf)
+		matches := id == promotion.ExpectedObject && info.Size() == promotion.ExpectedSize && mtime == promotion.ExpectedMtime
+		if scanErr != nil || parentStatErr != nil || aliasErr != nil || !statOK ||
+			uint64(stat.Dev) != promotion.ExpectedDevice || stat.Ino != promotion.ExpectedInode {
+			return fsAction{}, errors.Join(errors.New("completed conflict promotion target changed identity"),
+				scanErr, parentStatErr, aliasErr, file.Close(), targetParent.Close())
+		}
+		if matches && len(aliases) == 0 {
+			return promotion, errors.Join(file.Close(), targetParent.Close())
+		}
+		if matches {
+			if err := file.Close(); err != nil {
+				targetParent.Close()
+				return fsAction{}, err
+			}
+			for _, alias := range aliases {
+				if err := preservePromotionCollision(ctx, db, root, promotion, targetParent, alias, config.fsActionFault); err != nil {
+					targetParent.Close()
+					return fsAction{}, err
+				}
+			}
+			if err := targetParent.Close(); err != nil {
+				return fsAction{}, err
+			}
+			continue
+		}
+		closeErr := errors.Join(file.Close(), targetParent.Close())
+		if closeErr != nil {
+			return fsAction{}, closeErr
+		}
+		checkout, err := loadCheckoutPathCAS(ctx, db, recovery.worktree, expected.target)
+		if err != nil {
+			return fsAction{}, err
+		}
+		next, err := journalLatePromotion(ctx, db, root, link, promotion, uint64(parentStat.Dev), parentStat.Ino,
+			"", id, mtime, info.Size(), uint64(stat.Dev), stat.Ino, config.fsActionFault)
+		if err != nil {
+			return fsAction{}, fmt.Errorf("preserve invalid completed promotion %q: %w", promotion.Target, err)
+		}
+		if err := resetPromotedCheckoutIfNeeded(ctx, db, root, recovery.worktree, expected.target, &checkout); err != nil {
+			return fsAction{}, err
+		}
+		promotion = next
 	}
-	file, info, openErr := openScannableAt(targetParent, targetLeaf, promotion.Target)
-	if openErr != nil {
-		return fsAction{}, errors.Join(openErr, targetParent.Close())
-	}
-	stat, statOK := info.Sys().(*syscall.Stat_t)
-	var parentStat unix.Stat_t
-	parentStatErr := unix.Fstat(int(targetParent.Fd()), &parentStat)
-	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
-	id, scanErr := scanRegularFile(file, promotion.Target, info, &snapshot)
-	mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
-	closeErr := errors.Join(file.Close(), targetParent.Close())
-	if scanErr != nil || closeErr != nil || parentStatErr != nil || !statOK ||
-		uint64(stat.Dev) != promotion.ExpectedDevice || stat.Ino != promotion.ExpectedInode {
-		return fsAction{}, errors.Join(errors.New("completed conflict promotion target changed identity"),
-			scanErr, closeErr, parentStatErr)
-	}
-	if id == promotion.ExpectedObject && info.Size() == promotion.ExpectedSize && mtime == promotion.ExpectedMtime {
-		return promotion, nil
-	}
-	if promotion.Attempt == 0 {
-		return promotion, nil
-	}
-	successor, err := nextConflictChainPath(promotion.Target)
-	if err != nil {
-		return fsAction{}, err
-	}
-	checkout, err := loadCheckoutPathCAS(ctx, db, recovery.worktree, expected.target)
-	if err != nil {
-		return fsAction{}, err
-	}
-	next, err := journalLatePromotion(ctx, db, root, link, promotion, uint64(parentStat.Dev), parentStat.Ino,
-		successor, id, mtime, info.Size(), uint64(stat.Dev), stat.Ino, config.fsActionFault)
-	if err != nil {
-		return fsAction{}, fmt.Errorf("preserve changed completed promotion %q: %w", promotion.Target, err)
-	}
-	if err := resetPromotedCheckoutIfNeeded(ctx, db, root, recovery.worktree, expected.target, &checkout); err != nil {
-		return fsAction{}, err
-	}
-	return next, nil
+	return fsAction{}, errors.New("completed conflict promotion relocation sequence exhausted")
 }
 
 func validatePromotionOwnership(ctx context.Context, db fsActionQueryer, worktree string, journal []fsAction) error {
@@ -1568,7 +1603,7 @@ func validatePromotionOwnership(ctx context.Context, db fsActionQueryer, worktre
 			sourcePath += "/" + child
 		}
 		parent, leaf := splitFSActionPath(sourcePath)
-		if root.Parent != parent || root.Source != leaf || validateRootPromotionTarget(expected.target, root.Target) != nil ||
+		if root.Parent != parent || root.Source != leaf || validateRootPromotionTarget(expected.target, root.Target, expected.namingSeed, expected.source) != nil ||
 			(root.Target == expected.target && (root.ExpectedObject != expected.id || root.ExpectedMtime != expected.mtime ||
 				root.ExpectedSize != expected.size)) ||
 			(child == "" && (recovery.kind != "File" || root.ExpectedDevice != recovery.device || root.ExpectedInode != recovery.inode)) {
@@ -1615,8 +1650,102 @@ func validatePromotionOwnership(ctx context.Context, db fsActionQueryer, worktre
 	return nil
 }
 
+func rehydratePendingPromotionSeedAuthority(ctx context.Context, db *sql.DB, options bindOptions,
+	binding clientBinding) error {
+	var target string
+	var encoded []byte
+	err := db.QueryRowContext(ctx, `SELECT target_commit,conflict_promotions FROM pending_checkouts
+		WHERE worktree=?`, binding.Worktree).Scan(&target, &encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	promotions, err := _decodeConflictPromotions(encoded)
+	if err != nil || binding.SyncBase == target {
+		return err
+	}
+	seeded := false
+	for _, promotion := range promotions {
+		seeded = seeded || promotion.namingSeed != ""
+	}
+	if !seeded {
+		return nil
+	}
+	cacheRoot, err := openVerifiedCacheRoot(options.clientDir)
+	if err != nil {
+		return err
+	}
+	options.cacheRoot = cacheRoot
+	replayErr := _authoritativePromotionReplay(ctx, options, binding, target, promotions, _newReplayBudget())
+	return errors.Join(replayErr, cacheRoot.Close())
+}
+
+func validatePendingPromotionSeedAuthority(ctx context.Context, db *sql.DB, worktree string) error {
+	var target string
+	var binding clientBinding
+	var encoded []byte
+	err := db.QueryRowContext(ctx, `SELECT c.target_commit,c.conflict_promotions,b.server_url,b.library_id,b.worktree,
+		b.user_id,b.device_id,b.sync_base_commit,b.sync_base_root,b.head_etag FROM pending_checkouts c
+		JOIN bindings b ON b.worktree=c.worktree AND b.user_id=c.user_id AND b.device_id=c.device_id
+		WHERE c.worktree=?`, worktree).Scan(&target, &encoded, &binding.ServerURL, &binding.LibraryID, &binding.Worktree,
+		&binding.UserID, &binding.DeviceID, &binding.SyncBase, &binding.SyncBaseRoot, &binding.HeadETag)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	promotions, err := _decodeConflictPromotions(encoded)
+	if err != nil {
+		return err
+	}
+	seeded := false
+	for _, promotion := range promotions {
+		seeded = seeded || promotion.namingSeed != ""
+	}
+	if !seeded || binding.SyncBase == target {
+		return nil
+	}
+	var sequence int
+	var databasePath string
+	rows, err := db.QueryContext(ctx, "PRAGMA database_list")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var name string
+		var path sql.NullString
+		if err := rows.Scan(&sequence, &name, &path); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "main" && path.Valid {
+			databasePath = path.String
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if databasePath == "" {
+		return errors.New("pending promotion seed authority has no durable client cache")
+	}
+	cacheRoot, err := openVerifiedCacheRoot(filepath.Dir(databasePath))
+	if err != nil {
+		return err
+	}
+	defer cacheRoot.Close()
+	options := bindOptions{clientDir: filepath.Dir(databasePath), serverURL: binding.ServerURL,
+		libraryID: binding.LibraryID, worktree: binding.Worktree, deviceID: binding.DeviceID, cacheRoot: cacheRoot}
+	return _authoritativePromotionReplay(ctx, options, binding, target, promotions, _newReplayBudget())
+}
+
 func validatePendingPromotionTargets(ctx context.Context, db *sql.DB, worktree string) error {
 	if err := validatePendingCheckoutState(ctx, db, worktree); err != nil {
+		return err
+	}
+	if err := validatePendingPromotionSeedAuthority(ctx, db, worktree); err != nil {
 		return err
 	}
 	journal, err := loadFSActions(ctx, db, worktree)
@@ -1703,7 +1832,7 @@ func resetPromotedCheckoutIfNeeded(ctx context.Context, db *sql.DB, root *opened
 		stat, ok := info.Sys().(*syscall.Stat_t)
 		snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
 		id, scanErr := scanRegularFile(file, path, info, &snapshot)
-		mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+		mtime := canonicalProtocolMtime(info.ModTime())
 		closeErr := errors.Join(file.Close(), parent.Close())
 		registeredIdentity := (uint64(stat.Dev) == loaded.targetDevice && stat.Ino == loaded.targetInode) ||
 			(uint64(stat.Dev) == loaded.tempDevice && stat.Ino == loaded.tempInode)
@@ -1769,6 +1898,10 @@ func consumeSyncRecovery(ctx context.Context, db *sql.DB, recovery syncRecovery)
 			return fail(errors.New("cannot consume sync recovery with incomplete promotion actions"))
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM fs_actions WHERE worktree=? AND origin_action_id=?`, recovery.worktree, rootID); err != nil {
+			return fail(err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM fs_actions WHERE worktree=? AND internal_target=? AND op='create_directory' AND state='completed'`,
+			recovery.worktree, fsPromotionFallbackOwnerPrefix+rootID); err != nil {
 			return fail(err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM fs_actions WHERE worktree=? AND action_id=?`, recovery.worktree, rootID); err != nil {
@@ -1925,6 +2058,39 @@ func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 	return nil
 }
 
+func addFallbackRootOccupancy(root *openedWorktree, selected string, late map[string]bool) error {
+	ordinal := 1
+	if selected != _fallbackConflictRoot {
+		text, ok := strings.CutPrefix(selected, _fallbackConflictRoot+" ")
+		var err error
+		ordinal, err = strconv.Atoi(text)
+		if !ok || err != nil || ordinal < 2 || ordinal > _conflictMaxOrdinal {
+			return errors.New("selected fallback root is invalid")
+		}
+	}
+	if _, err := root.directory.Seek(0, 0); err != nil {
+		return err
+	}
+	names, err := root.directory.Readdirnames(-1)
+	if err != nil {
+		return err
+	}
+	folded := make(map[string]bool, ordinal)
+	for number := 1; number <= ordinal; number++ {
+		candidate := _fallbackConflictRoot
+		if number > 1 {
+			candidate += " " + strconv.Itoa(number)
+		}
+		folded[cases.Fold().String(candidate)] = true
+	}
+	for _, name := range names {
+		if folded[cases.Fold().String(name)] {
+			late[name] = true
+		}
+	}
+	return nil
+}
+
 func reconcilePromotedConflictFiles(ctx context.Context, db *sql.DB, options bindOptions, targets []checkoutPath,
 	config libraryClientConfig) (map[string]bool, error) {
 	promotions, err := loadConflictPromotions(ctx, db, options.worktree)
@@ -1950,9 +2116,18 @@ func reconcilePromotedConflictFiles(ctx context.Context, db *sql.DB, options bin
 	late := make(map[string]bool)
 	for _, action := range journal {
 		byID[action.ActionID] = action
-		if action.OriginActionID != "" && action.Op == fsOpRename && action.ExpectedObject != "" &&
-			action.State == fsStateCompleted {
+		if _, fallbackRootCreate := fallbackRootCreateOwner(action); fallbackRootCreate && action.State == fsStateCompleted {
+			late[action.Source] = true
+		}
+		if action.Op != fsOpRename || action.ExpectedObject == "" || action.State != fsStateCompleted {
+			continue
+		}
+		if action.OriginActionID != "" {
 			late[action.Target] = true
+			targetParent, _ := splitFSActionPath(action.Target)
+			if targetParent != action.Parent && validFallbackRootName(targetParent) {
+				late[targetParent] = true
+			}
 		}
 	}
 	recoveryByPath := make(map[string]syncRecovery, len(recoveries))
@@ -1965,7 +2140,7 @@ func reconcilePromotedConflictFiles(ctx context.Context, db *sql.DB, options bin
 		if !ok || !recovery.completed {
 			return nil, errors.New("late promotion linkage has no completed recovery")
 		}
-		_, expected, err := linkedPromotionProvenance(recovery, *link, promotions)
+		sourcePath, expected, err := linkedPromotionProvenance(recovery, *link, promotions)
 		if err != nil {
 			return nil, err
 		}
@@ -1973,60 +2148,34 @@ func reconcilePromotedConflictFiles(ctx context.Context, db *sql.DB, options bin
 		if !ok || current.State != fsStateCompleted {
 			return nil, errors.New("late promotion recovery has stale current linkage")
 		}
-		if current.Target != expected.target {
-			late[current.Target] = true
-		}
-		parentPath, leaf := splitFSActionPath(current.Target)
-		parent, err := openFSActionParent(options.worktreeRoot, parentPath, 0, 0)
+		stable, err := validateCompletedPromotion(ctx, db, options.worktreeRoot, recovery, link, sourcePath, expected, config)
 		if err != nil {
 			return nil, err
 		}
-		file, info, err := openScannableAt(parent, leaf, current.Target)
-		if err != nil {
-			parent.Close()
-			return nil, err
+		if stable.Target != expected.target {
+			late[stable.Target] = true
 		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
-		id, scanErr := scanRegularFile(file, current.Target, info, &snapshot)
-		mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
-		closeErr := file.Close()
-		if scanErr != nil || closeErr != nil || !ok {
-			parent.Close()
-			return nil, errors.Join(scanErr, closeErr, errors.New("inspect promoted conflict identity"))
+	}
+	journal, err = loadFSActions(ctx, db, options.worktree)
+	if err != nil {
+		return nil, err
+	}
+	selectedFallbackRoots := make(map[string]bool)
+	for _, action := range journal {
+		if _, fallbackRootCreate := fallbackRootCreateOwner(action); fallbackRootCreate && action.State == fsStateCompleted {
+			late[action.Source] = true
 		}
-		if uint64(stat.Dev) == current.ExpectedDevice && stat.Ino == current.ExpectedInode &&
-			id == current.ExpectedObject && info.Size() == current.ExpectedSize && mtime == current.ExpectedMtime {
-			if err := parent.Close(); err != nil {
-				return nil, err
+		if action.OriginActionID != "" && action.Op == fsOpRename && action.ExpectedObject != "" && action.State == fsStateCompleted {
+			late[action.Target] = true
+			targetParent, _ := splitFSActionPath(action.Target)
+			if targetParent != action.Parent && validFallbackRootName(targetParent) {
+				late[targetParent] = true
+				selectedFallbackRoots[targetParent] = true
 			}
-			continue
 		}
-		successor, err := nextConflictChainPath(current.Target)
-		if err != nil {
-			parent.Close()
-			return nil, err
-		}
-		var parentStat unix.Stat_t
-		if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
-			parent.Close()
-			return nil, err
-		}
-		if err := parent.Close(); err != nil {
-			return nil, err
-		}
-		checkout, err := loadCheckoutPathCAS(ctx, db, options.worktree, expected.target)
-		if err != nil {
-			return nil, err
-		}
-		next, err := journalLatePromotion(ctx, db, options.worktreeRoot, link, current,
-			uint64(parentStat.Dev), parentStat.Ino, successor, id, mtime, info.Size(), uint64(stat.Dev), stat.Ino,
-			config.fsActionFault)
-		if err != nil {
-			return nil, fmt.Errorf("preserve late conflict %q as %q: %w", current.Target, successor, err)
-		}
-		late[next.Target] = true
-		if err := resetPromotedCheckoutIfNeeded(ctx, db, options.worktreeRoot, options.worktree, expected.target, &checkout); err != nil {
+	}
+	for selected := range selectedFallbackRoots {
+		if err := addFallbackRootOccupancy(options.worktreeRoot, selected, late); err != nil {
 			return nil, err
 		}
 	}
@@ -2038,55 +2187,257 @@ func reconcilePromotedConflictFiles(ctx context.Context, db *sql.DB, options bin
 	return late, nil
 }
 
-func nextConflictChainPath(current string) (string, error) {
-	parentPath, leaf := splitFSActionPath(current)
+type _conflictNameFamily struct {
+	fallback                  bool
+	parent, stem, marker, ext string
+	ordinal                   int
+}
+
+func _parseConflictNameFamily(path string) (_conflictNameFamily, error) {
+	parent, leaf := splitFSActionPath(path)
+	if !_validConflictPromotionPath(path) {
+		return _conflictNameFamily{}, errors.New("promoted conflict path is invalid")
+	}
+	if marker := strings.LastIndex(leaf, _conflictMarkerPrefix); marker >= 13 && strings.HasSuffix(leaf, ")") {
+		prefix, number := leaf[:marker], leaf[marker+len(_conflictMarkerPrefix):len(leaf)-1]
+		decoded, hexErr := hex.DecodeString(prefix[:12])
+		ordinal, numberErr := strconv.Atoi(number)
+		if hexErr == nil && len(decoded) == 6 && prefix[12] == '-' && strings.ToLower(prefix[:12]) == prefix[:12] &&
+			numberErr == nil && ordinal >= 1 && ordinal <= _conflictMaxOrdinal && number == strconv.Itoa(ordinal) {
+			return _conflictNameFamily{fallback: true, parent: parent, stem: prefix[13:], ordinal: ordinal}, nil
+		}
+	}
 	stem, extension := leaf, ""
 	if index := strings.LastIndexByte(leaf, '.'); index > 0 {
 		stem, extension = leaf[:index], leaf[index:]
 	}
-	close := strings.LastIndex(stem, ")")
-	if close < 0 || !strings.Contains(stem[:close], " (Filecloud conflict ") {
-		return "", errors.New("promoted conflict path does not use the canonical template")
+	markerAt := strings.LastIndex(stem, _conflictMarkerPrefix)
+	if markerAt < 0 {
+		return _conflictNameFamily{}, errors.New("promoted conflict path does not use a canonical conflict family")
 	}
-	base := stem[:close+1]
-	number := 2
-	if suffix := strings.TrimSpace(stem[close+1:]); suffix != "" {
-		value, err := strconv.Atoi(suffix)
-		if err != nil || value < 2 || value >= 9999 {
-			return "", errors.New("promoted conflict path has an invalid collision suffix")
+	close := strings.IndexByte(stem[markerAt:], ')')
+	if close < 0 {
+		return _conflictNameFamily{}, errors.New("promoted conflict path has an invalid marker")
+	}
+	close += markerAt
+	marker := stem[markerAt : close+1]
+	fields := strings.Fields(strings.TrimSuffix(strings.TrimPrefix(marker, _conflictMarkerPrefix), ")"))
+	if len(fields) != 2 || len(fields[0]) != 8 || strings.ToLower(fields[0]) != fields[0] {
+		return _conflictNameFamily{}, errors.New("promoted conflict path has an invalid marker")
+	}
+	device, deviceErr := hex.DecodeString(fields[0])
+	created, createdErr := time.Parse("20060102T150405Z", fields[1])
+	if deviceErr != nil || len(device) != 4 || createdErr != nil || created.UTC().Format("20060102T150405Z") != fields[1] {
+		return _conflictNameFamily{}, errors.New("promoted conflict path has an invalid marker")
+	}
+	ordinal := 1
+	suffix := stem[close+1:]
+	if suffix != "" {
+		if !strings.HasPrefix(suffix, " ") {
+			return _conflictNameFamily{}, errors.New("promoted conflict path has an invalid collision suffix")
 		}
-		number = value + 1
+		var err error
+		ordinal, err = strconv.Atoi(suffix[1:])
+		if err != nil || ordinal < 2 || ordinal > _conflictMaxOrdinal || suffix[1:] != strconv.Itoa(ordinal) {
+			return _conflictNameFamily{}, errors.New("promoted conflict path has an invalid collision suffix")
+		}
 	}
-	leaf = base + " " + strconv.Itoa(number) + extension
+	return _conflictNameFamily{parent: parent, stem: stem[:markerAt], marker: marker, ext: extension, ordinal: ordinal}, nil
+}
+
+func nextConflictChainPath(current string) (string, error) {
+	family, err := _parseConflictNameFamily(current)
+	if err != nil {
+		return "", err
+	}
+	if family.ordinal >= _conflictMaxOrdinal {
+		return "", errors.New("promoted conflict collision sequence exhausted")
+	}
+	ordinal := family.ordinal + 1
+	available := _conflictLeafBudget(family.parent)
+	var leaf string
+	if family.fallback {
+		_, currentLeaf := splitFSActionPath(current)
+		seed := currentLeaf[:12]
+		marker := _conflictMarkerPrefix + strconv.Itoa(ordinal) + ")"
+		fixed := seed + "-"
+		if available < len(fixed)+len(marker) {
+			return "", errors.New("late fallback conflict path exceeds protocol limits")
+		}
+		leaf = fixed + truncateUTF8(family.stem, available-len(fixed)-len(marker)) + marker
+	} else {
+		suffix := " " + strconv.Itoa(ordinal)
+		if available < len(family.marker)+len(suffix)+len(family.ext) {
+			return "", errors.New("late conflict path exceeds protocol limits")
+		}
+		leaf = truncateUTF8(family.stem, available-len(family.marker)-len(suffix)-len(family.ext)) +
+			family.marker + suffix + family.ext
+	}
 	path := leaf
-	if parentPath != "" {
-		path = parentPath + "/" + leaf
+	if family.parent != "" {
+		path = family.parent + "/" + leaf
 	}
 	if !validRecoveryVisibleName(leaf) || len(path) > _mergeMaxPath {
-		return "", errors.New("late conflict path exceeds Issue #17 limits; Issue #19 owns fallback")
+		return "", errors.New("late conflict path is invalid")
 	}
 	return path, nil
 }
 
-func validateRootPromotionTarget(expected, target string) error {
-	if !_validConflictPromotionPath(expected) || !_validConflictPromotionPath(target) {
-		return errors.New("promotion root target is invalid")
+func conflictPromotionFamilyPath(path string) (familyPath, suffix string, err error) {
+	if !_validConflictPromotionPath(path) {
+		return "", "", errors.New("promoted conflict path is invalid")
+	}
+	parts := strings.Split(path, "/")
+	for index := range parts {
+		prefix := strings.Join(parts[:index+1], "/")
+		if _, parseErr := _parseConflictNameFamily(prefix); parseErr != nil {
+			continue
+		}
+		familyPath = prefix
+		suffix = ""
+		if index+1 < len(parts) {
+			suffix = "/" + strings.Join(parts[index+1:], "/")
+		}
+	}
+	if familyPath == "" {
+		return "", "", errors.New("promoted conflict path does not use a canonical conflict family")
+	}
+	return familyPath, suffix, nil
+}
+
+func nextPromotionChainPath(current, namingSeed string, sourcePaths ...string) (string, error) {
+	next, chainErr := nextConflictChainPath(current)
+	if chainErr == nil {
+		return next, nil
+	}
+	familyPath, suffix, err := conflictPromotionFamilyPath(current)
+	if err != nil {
+		return "", err
+	}
+	family, err := _parseConflictNameFamily(familyPath)
+	if err != nil {
+		return "", err
+	}
+	parent, leaf := splitFSActionPath(current)
+	if len(sourcePaths) != 0 && sourcePaths[0] != "" {
+		_, leaf = splitFSActionPath(sourcePaths[0])
+	} else if suffix == "" {
+		leaf = family.stem + family.ext
+	}
+	if family.fallback {
+		if suffix == "" {
+			return "", chainErr
+		}
+		_, familyLeaf := splitFSActionPath(familyPath)
+		familySeedPrefix := familyLeaf[:12]
+		if namingSeed == "" {
+			namingSeed = familySeedPrefix + strings.Repeat("0", 52)
+		} else if !strings.HasPrefix(namingSeed, familySeedPrefix) {
+			return "", errors.New("promotion fallback family does not match NamingSeedCommitId")
+		}
+	}
+	if !object.ValidID(namingSeed) || strings.ToLower(namingSeed) != namingSeed {
+		return "", errors.New("promotion successor needs unavailable NamingSeedCommitId")
+	}
+	if !family.fallback && suffix != "" {
+		stem, extension := leaf, ""
+		if index := strings.LastIndexByte(leaf, '.'); index > 0 {
+			stem, extension = leaf[:index], leaf[index:]
+		}
+		available := _conflictLeafBudget(parent)
+		if available >= len(family.marker)+len(extension) {
+			candidate := truncateUTF8(stem, available-len(family.marker)-len(extension)) + family.marker + extension
+			path := candidate
+			if parent != "" {
+				path = parent + "/" + candidate
+			}
+			if _validConflictPromotionPath(path) {
+				return path, nil
+			}
+		}
+	}
+	candidate, err := _fallbackConflictName(leaf, _fallbackConflictRoot, namingSeed, 1)
+	if err != nil {
+		return "", err
+	}
+	return _fallbackConflictRoot + "/" + candidate, nil
+}
+
+func fallbackRootOrdinal(name string) (int, bool) {
+	if name == _fallbackConflictRoot {
+		return 1, true
+	}
+	ordinalText, ok := strings.CutPrefix(name, _fallbackConflictRoot+" ")
+	ordinal, err := strconv.Atoi(ordinalText)
+	return ordinal, ok && err == nil && ordinal >= 2 && ordinal <= _conflictMaxOrdinal && ordinalText == strconv.Itoa(ordinal)
+}
+
+func validFallbackRootName(name string) bool {
+	_, ok := fallbackRootOrdinal(name)
+	return ok
+}
+
+func validateRootPromotionTarget(expected, target string, namingSeeds ...string) error {
+	if _, _, err := conflictPromotionFamilyPath(expected); err != nil {
+		return errors.Join(errors.New("promotion root target has no canonical conflict-name family"), err)
+	}
+	seed, sourcePath := "", ""
+	if len(namingSeeds) != 0 {
+		seed = namingSeeds[0]
+	}
+	if len(namingSeeds) > 1 {
+		sourcePath = namingSeeds[1]
 	}
 	path := expected
-	for attempt := 0; attempt < 9999; attempt++ {
+	targetParent, _ := splitFSActionPath(target)
+	for attempt := 0; attempt < _conflictMaxOrdinal; attempt++ {
 		if path == target {
 			return nil
 		}
+		previousParent, _ := splitFSActionPath(path)
 		var err error
-		path, err = nextConflictChainPath(path)
+		path, err = nextPromotionChainPath(path, seed, sourcePath)
 		if err != nil {
 			return errors.Join(errors.New("promotion root target is outside its deterministic conflict-name family"), err)
+		}
+		pathParent, _ := splitFSActionPath(path)
+		if pathParent == _fallbackConflictRoot && previousParent != pathParent && validFallbackRootName(targetParent) {
+			_, leaf := splitFSActionPath(sourcePath)
+			leaf, err = _fallbackConflictName(leaf, targetParent, seed, 1)
+			if err != nil {
+				return err
+			}
+			path = targetParent + "/" + leaf
 		}
 	}
 	return errors.New("promotion root target is outside its deterministic conflict-name family")
 }
 
-func nextConflictVisiblePath(parent *os.File, parentPath, current string) (string, error) {
+func parentCasefoldAliases(parent *os.File, exact string) ([]string, error) {
+	if _, err := parent.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	names, err := parent.Readdirnames(-1)
+	if err != nil {
+		return nil, err
+	}
+	folded := cases.Fold().String(exact)
+	aliases := make([]string, 0)
+	for _, name := range names {
+		if name != exact && cases.Fold().String(name) == folded {
+			aliases = append(aliases, name)
+		}
+	}
+	sort.Strings(aliases)
+	return aliases, nil
+}
+
+func parentHasCasefoldAlias(parent *os.File, exact string) (bool, error) {
+	aliases, err := parentCasefoldAliases(parent, exact)
+	return len(aliases) != 0, err
+}
+
+func nextConflictVisiblePath(parent *os.File, parentPath, current string, provenance ...string) (string, error) {
 	currentParent, _ := splitFSActionPath(current)
 	if currentParent == "" && parentPath != "" {
 		current = parentPath + "/" + current
@@ -2104,9 +2455,16 @@ func nextConflictVisiblePath(parent *os.File, parentPath, current string) (strin
 	for _, name := range names {
 		occupied[cases.Fold().String(name)] = true
 	}
+	seed, sourcePath := "", ""
+	if len(provenance) != 0 {
+		seed = provenance[0]
+	}
+	if len(provenance) > 1 {
+		sourcePath = provenance[1]
+	}
 	path := current
-	for attempt := 0; attempt < 9999; attempt++ {
-		path, err = nextConflictChainPath(path)
+	for attempt := 0; attempt < _conflictMaxOrdinal; attempt++ {
+		path, err = nextPromotionChainPath(path, seed, sourcePath)
 		if err != nil {
 			return "", err
 		}
@@ -2145,13 +2503,27 @@ func checkoutPathCASArgs(value checkoutPathCAS) []any {
 		value.rollbackName, value.createActionID}
 }
 
-func registerPromotedCheckoutPath(ctx context.Context, db *sql.DB, root *openedWorktree, worktree, path string) error {
+func registerPromotedCheckoutPath(ctx context.Context, db *sql.DB, root *openedWorktree, worktree, path string,
+	expected _conflictPromotion) error {
 	loaded, err := loadCheckoutPathCAS(ctx, db, worktree, path)
 	if err != nil {
 		return err
 	}
-	if loaded.kind != "File" || loaded.rollbackName != "" {
-		return errors.New("promoted checkout path is not in its expected state")
+	if loaded.kind != "File" || loaded.id != expected.id || loaded.mtime != expected.mtime || loaded.size != expected.size ||
+		loaded.rollbackName != "" {
+		return errors.New("stale checkout state for promoted conflict path")
+	}
+	parent, leaf, err := promotionTargetParent(ctx, db, root, worktree, path)
+	if err != nil {
+		return err
+	}
+	alias, aliasErr := parentHasCasefoldAlias(parent, leaf)
+	closeErr := parent.Close()
+	if aliasErr != nil || closeErr != nil {
+		return errors.Join(aliasErr, closeErr)
+	}
+	if alias {
+		return errors.New("promoted checkout path has a case-fold alias; rerun sync")
 	}
 	targetStat, err := statAt(root.directory, path)
 	if err != nil {
@@ -2240,7 +2612,7 @@ func promoteCapturedConflictFiles(ctx context.Context, db *sql.DB, root *openedW
 				return err
 			}
 			if action.Target == promotion.target {
-				if err := registerPromotedCheckoutPath(ctx, db, root, worktree, promotion.target); err != nil {
+				if err := registerPromotedCheckoutPath(ctx, db, root, worktree, promotion.target, promotion); err != nil {
 					return err
 				}
 			}
@@ -2258,7 +2630,7 @@ func promoteCapturedConflictFiles(ctx context.Context, db *sql.DB, root *openedW
 			parent.Close()
 			return errors.Join(scanErr, closeErr, errors.New("inspect captured conflict source"))
 		}
-		sourceMtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+		sourceMtime := canonicalProtocolMtime(info.ModTime())
 		destination := promotion.target
 		target, fixed := targetByPath[promotion.target]
 		fixed = fixed && target.kind == "File" && target.id == promotion.id && target.mtime == promotion.mtime &&
@@ -2270,14 +2642,14 @@ func promoteCapturedConflictFiles(ctx context.Context, db *sql.DB, root *openedW
 				parent.Close()
 				return err
 			}
-			destination, err = nextConflictVisiblePath(targetParent, targetParentPath, targetLeaf)
+			destination, err = nextConflictVisiblePath(targetParent, targetParentPath, targetLeaf, promotion.namingSeed, promotion.source)
 			targetCloseErr := targetParent.Close()
 			if err != nil || targetCloseErr != nil {
 				parent.Close()
 				return errors.Join(err, targetCloseErr)
 			}
 		}
-		if err := validateRootPromotionTarget(promotion.target, destination); err != nil {
+		if err := validateRootPromotionTarget(promotion.target, destination, promotion.namingSeed, promotion.source); err != nil {
 			parent.Close()
 			return err
 		}
@@ -2293,8 +2665,23 @@ func promoteCapturedConflictFiles(ctx context.Context, db *sql.DB, root *openedW
 			recovery, config.fsActionFault); err != nil {
 			return fmt.Errorf("promote captured conflict %q to %q: %w", promotion.source, destination, err)
 		}
-		if fixed {
-			if err := registerPromotedCheckoutPath(ctx, db, root, worktree, promotion.target); err != nil {
+		currentLinks, err := loadSyncRecoveryPromotions(ctx, db, worktree)
+		if err != nil {
+			return err
+		}
+		var currentLink *syncRecoveryPromotion
+		for index := range currentLinks {
+			if currentLinks[index].sourcePath == promotion.source {
+				currentLink = &currentLinks[index]
+				break
+			}
+		}
+		stable, err := validateCompletedPromotion(ctx, db, root, *recovery, currentLink, sourcePath, promotion, config)
+		if err != nil {
+			return err
+		}
+		if fixed && stable.Target == promotion.target {
+			if err := registerPromotedCheckoutPath(ctx, db, root, worktree, promotion.target, promotion); err != nil {
 				return err
 			}
 		}
@@ -2313,7 +2700,7 @@ func promoteCapturedConflictFiles(ctx context.Context, db *sql.DB, root *openedW
 		if scanErr != nil || closeErr != nil {
 			return errors.Join(scanErr, closeErr)
 		}
-		mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+		mtime := canonicalProtocolMtime(info.ModTime())
 		args := append([]any{id, mtime}, syncRecoveryCASArgs(recovery)...)
 		result, err := db.ExecContext(ctx, "UPDATE sync_recoveries SET object_id=?,canonical_mtime=? WHERE "+_syncRecoveryCAS, args...)
 		if err != nil {
@@ -2369,7 +2756,7 @@ func verifyNamedRecovery(parent *os.File, name string, expected syncRecovery) er
 	if !ok || (expected.device != 0 && (uint64(stat.Dev) != expected.device || stat.Ino != expected.inode)) {
 		return errors.New("captured path identity changed")
 	}
-	mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+	mtime := canonicalProtocolMtime(info.ModTime())
 	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
 	var id string
 	if expected.kind == "File" && info.Mode().IsRegular() {
@@ -2486,7 +2873,7 @@ func snapshotRecoveryRemoval(parent *os.File, name string, expected syncRecovery
 	defer file.Close()
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !info.IsDir() || uint64(stat.Dev) != expected.device || stat.Ino != expected.inode ||
-		info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z") != expected.mtime {
+		canonicalProtocolMtime(info.ModTime()) != expected.mtime {
 		return nil, errors.New("captured directory identity, type, or mtime changed")
 	}
 	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
@@ -3027,7 +3414,7 @@ func sameRollbackFileState(left, right unix.Stat_t) bool {
 }
 
 func canonicalStatMtime(stat unix.Stat_t) string {
-	return time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec).UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+	return canonicalProtocolMtime(time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec))
 }
 
 func readCachedRollbackFile(cacheRoot *os.File, id string) (object.File, error) {

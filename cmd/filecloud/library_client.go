@@ -62,6 +62,7 @@ type libraryClientConfig struct {
 	scanFault                       func(scanFault) error
 	fsActionFault                   fsActionFault
 	fsTransactionFault              func(string) error
+	fallbackOccupied                func(string) bool
 }
 
 func normalizeLibraryClientConfig(config libraryClientConfig) libraryClientConfig {
@@ -86,6 +87,7 @@ type bindOptions struct {
 	token                                               []byte
 	worktreeRoot                                        *openedWorktree
 	cacheRoot                                           *os.File
+	fallbackOccupied                                    func(string) bool
 	importLocal                                         bool
 	confirmDelete                                       string
 	confirmDeleteSet                                    bool
@@ -580,7 +582,7 @@ func canonicalCommit(owner, deviceID, root string, parents []string, now func() 
 		Root         string   `json:"Root"`
 		Type         string   `json:"Type"`
 		Version      int      `json:"Version"`
-	}{owner, now().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z"), deviceID, "sync", parents, root, "Commit", 1})
+	}{owner, canonicalProtocolMtime(now()), deviceID, "sync", parents, root, "Commit", 1})
 	if err != nil {
 		return nil, "", fmt.Errorf("construct commit: %w", err)
 	}
@@ -775,6 +777,11 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 	if err != nil {
 		return err
 	}
+	authorityOptions := bindOptions{clientDir: canonicalClientDir, serverURL: binding.ServerURL,
+		libraryID: binding.LibraryID, worktree: binding.Worktree, deviceID: binding.DeviceID, base: base, token: token}
+	if err := rehydratePendingPromotionSeedAuthority(ctx, db, authorityOptions, binding); err != nil {
+		return fmt.Errorf("rehydrate checkout promotion authority: %w", err)
+	}
 	root, err := openWorktreeRoot(canonicalWorktree, config.checkFilesystem)
 	if err != nil {
 		return err
@@ -792,7 +799,7 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 	options := bindOptions{clientDir: canonicalClientDir, serverURL: binding.ServerURL, libraryID: binding.LibraryID,
 		worktree: binding.Worktree, deviceID: binding.DeviceID, base: base, token: token, worktreeRoot: root,
-		confirmDelete: *confirmDelete, confirmDeleteSet: confirmDeleteSet,
+		confirmDelete: *confirmDelete, confirmDeleteSet: confirmDeleteSet, fallbackOccupied: config.fallbackOccupied,
 		scanConfig: worktreeScanConfig{trackedPaths: tracked, warning: stderr, fault: config.scanFault, ignoreUntrackedUnsupported: true}}
 	if len(tracked) == 0 {
 		tracked, err = loadRemoteTrackedPaths(ctx, options, binding)

@@ -31,6 +31,8 @@ const (
 
 var _emptyConflictPromotions = []byte{'F', 'C', 'P', '1', 0, 0, 0, 0}
 
+var _conflictPromotionsV2 = []byte{'F', 'C', 'P', '2'}
+
 type checkoutPath struct {
 	path, kind, id, mtime string
 	size                  int64
@@ -54,11 +56,12 @@ func _validateConflictPromotions(values []_conflictPromotion) error {
 	targets := make(map[string]bool, len(values))
 	for _, value := range values {
 		if !_validConflictPromotionPath(value.source) || !_validConflictPromotionPath(value.target) ||
-			value.source == value.target || !object.ValidID(value.id) || value.size < 0 {
+			value.source == value.target || !object.ValidID(value.id) || value.size < 0 ||
+			value.namingSeed != "" && (!object.ValidID(value.namingSeed) || strings.ToLower(value.namingSeed) != value.namingSeed) {
 			return errors.New("conflict provenance contains invalid fields")
 		}
-		parsed, err := time.Parse("2006-01-02T15:04:05Z", value.mtime)
-		if err != nil || parsed.Format("2006-01-02T15:04:05Z") != value.mtime {
+		_, err := parseCanonicalProtocolMtime(value.mtime)
+		if err != nil {
 			return errors.New("conflict provenance contains invalid mtime")
 		}
 		source, target := cases.Fold().String(value.source), cases.Fold().String(value.target)
@@ -78,9 +81,22 @@ func _encodeConflictPromotions(values []_conflictPromotion) ([]byte, error) {
 	if err := _validateConflictPromotions(values); err != nil {
 		return nil, err
 	}
+	v2 := len(values) != 0 && values[0].namingSeed != ""
+	for _, value := range values {
+		if (value.namingSeed != "") != v2 {
+			return nil, errors.New("conflict provenance mixes legacy and seeded records")
+		}
+	}
+	fields := func(value _conflictPromotion) []string {
+		result := []string{value.source, value.target, value.id, value.mtime}
+		if v2 {
+			result = append(result, value.namingSeed)
+		}
+		return result
+	}
 	size := 8
 	for _, value := range values {
-		for _, field := range []string{value.source, value.target, value.id, value.mtime} {
+		for _, field := range fields(value) {
 			if len(field) > 65535 || size > _maxConflictPromotionsBytes-2-len(field) {
 				return nil, errors.New("conflict provenance exceeds synchronization budget")
 			}
@@ -93,10 +109,13 @@ func _encodeConflictPromotions(values []_conflictPromotion) ([]byte, error) {
 	}
 	result := make([]byte, size)
 	copy(result, _emptyConflictPromotions[:4])
+	if v2 {
+		copy(result, _conflictPromotionsV2)
+	}
 	binary.BigEndian.PutUint32(result[4:8], uint32(len(values)))
 	offset := 8
 	for _, value := range values {
-		for _, field := range []string{value.source, value.target, value.id, value.mtime} {
+		for _, field := range fields(value) {
 			binary.BigEndian.PutUint16(result[offset:offset+2], uint16(len(field)))
 			offset += 2
 			copy(result[offset:], field)
@@ -109,9 +128,11 @@ func _encodeConflictPromotions(values []_conflictPromotion) ([]byte, error) {
 }
 
 func _decodeConflictPromotions(data []byte) ([]_conflictPromotion, error) {
-	if len(data) < 8 || len(data) > _maxConflictPromotionsBytes || !bytes.Equal(data[:4], _emptyConflictPromotions[:4]) {
+	if len(data) < 8 || len(data) > _maxConflictPromotionsBytes ||
+		!bytes.Equal(data[:4], _emptyConflictPromotions[:4]) && !bytes.Equal(data[:4], _conflictPromotionsV2) {
 		return nil, errors.New("conflict provenance has an invalid encoding")
 	}
+	v2 := bytes.Equal(data[:4], _conflictPromotionsV2)
 	count := binary.BigEndian.Uint32(data[4:8])
 	if count > _mergeMaxObjects {
 		return nil, errors.New("conflict provenance exceeds synchronization budget")
@@ -119,7 +140,11 @@ func _decodeConflictPromotions(data []byte) ([]_conflictPromotion, error) {
 	values := make([]_conflictPromotion, 0, int(count))
 	offset := 8
 	for range count {
-		fields := make([]string, 4)
+		fieldCount := 4
+		if v2 {
+			fieldCount = 5
+		}
+		fields := make([]string, fieldCount)
 		for index := range fields {
 			if len(data)-offset < 2 {
 				return nil, errors.New("conflict provenance is truncated")
@@ -135,14 +160,21 @@ func _decodeConflictPromotions(data []byte) ([]_conflictPromotion, error) {
 		if len(data)-offset < 8 {
 			return nil, errors.New("conflict provenance is truncated")
 		}
-		values = append(values, _conflictPromotion{source: fields[0], target: fields[1], id: fields[2],
-			mtime: fields[3], size: int64(binary.BigEndian.Uint64(data[offset : offset+8]))})
+		value := _conflictPromotion{source: fields[0], target: fields[1], id: fields[2],
+			mtime: fields[3], size: int64(binary.BigEndian.Uint64(data[offset : offset+8]))}
+		if v2 {
+			value.namingSeed = fields[4]
+		}
+		values = append(values, value)
 		offset += 8
 	}
 	if offset != len(data) {
 		return nil, errors.New("conflict provenance has trailing data")
 	}
 	canonical, err := _encodeConflictPromotions(append([]_conflictPromotion(nil), values...))
+	if v2 && len(values) == 0 {
+		err = errors.New("empty conflict provenance must use FCP1")
+	}
 	if err != nil || !bytes.Equal(canonical, data) {
 		return nil, errors.Join(errors.New("conflict provenance is not canonical"), err)
 	}
@@ -494,6 +526,9 @@ func cachedRemoteObject(ctx context.Context, options bindOptions, kind, id strin
 		return err
 	}
 	return cachedDownload(ctx, options, kind, id, func() ([]byte, error) {
+		if options.base == nil {
+			return nil, errors.New("authoritative cached object is absent")
+		}
 		request, err := authenticatedRequest(ctx, http.MethodGet, options.base.JoinPath("v1/libraries", options.libraryID, "objects", kind, id).String(), options.token, nil)
 		if err != nil {
 			return nil, err
@@ -1082,9 +1117,12 @@ func setCheckoutMtime(ctx context.Context, db *sql.DB, options bindOptions, valu
 }
 
 func setOpenFileMtime(file *os.File, value string) error {
-	parsed, err := time.Parse(time.RFC3339Nano, value)
+	parsed, err := parseCanonicalProtocolMtime(value)
 	if err != nil {
-		return err
+		parsed, err = time.Parse(time.RFC3339Nano, value)
+		if err != nil || parsed.UTC().Format(time.RFC3339Nano) != value {
+			return errors.New("mtime is neither canonical protocol UTC nor exact rollback evidence")
+		}
 	}
 	timestamp := unix.NsecToTimespec(parsed.UnixNano())
 	if err := unix.UtimesNanoAt(int(file.Fd()), "", []unix.Timespec{timestamp, timestamp}, unix.AT_EMPTY_PATH); err != nil {
@@ -1189,7 +1227,7 @@ func checkoutTempRecord(ctx context.Context, db *sql.DB, worktree, path string) 
 		return "", 0, 0, false, err
 	}
 	if name != "" && !validCheckoutTempName(name) {
-		return "", 0, 0, false, errors.New("pending checkout has invalid registered temporary name")
+		return "", 0, 0, false, errors.New("stale checkout state: pending checkout has invalid registered temporary name")
 	}
 	return name, device, inode, true, nil
 }
@@ -1220,7 +1258,7 @@ func registerCheckoutTemp(ctx context.Context, db *sql.DB, worktree string, valu
 	}
 	changed, err := result.RowsAffected()
 	if err != nil || changed != 1 {
-		return errors.New("register checkout temporary file did not update fixed target path")
+		return errors.New("stale checkout state: register checkout temporary file did not update fixed target path")
 	}
 	return nil
 }
@@ -1318,7 +1356,7 @@ func verifyInstalledFile(ctx context.Context, db *sql.DB, options bindOptions, v
 	if err := verifyCheckoutFileIdentity(fd, expectedDevice, expectedInode); err != nil {
 		return nil, fmt.Errorf("installed checkout file identity changed before recovery: %w", err)
 	}
-	if info.ModTime().UTC().Format("2006-01-02T15:04:05Z") != value.mtime {
+	if canonicalProtocolMtime(info.ModTime()) != value.mtime {
 		parentPath, _ := splitFSActionPath(value.path)
 		if err := journalMtime(ctx, db, options.worktreeRoot, options.worktree, fsPhasePreBase, parentPath,
 			name, "File", value.mtime, expectedDevice, expectedInode, config.fsActionFault); err != nil {
@@ -1413,7 +1451,7 @@ func checkoutTempNames(ctx context.Context, db *sql.DB, worktree string) ([]regi
 			return nil, err
 		}
 		if !validCheckoutTempName(temp) {
-			return nil, errors.New("pending checkout has invalid registered temporary name")
+			return nil, errors.New("stale checkout state: pending checkout has invalid registered temporary name")
 		}
 		directory := filepath.Dir(filepath.FromSlash(path))
 		if directory == "." {
@@ -1473,7 +1511,7 @@ func cleanupCheckoutTemps(ctx context.Context, db *sql.DB, root *openedWorktree,
 			snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
 			expectedObject, err = scanRegularFile(file, temp.path, info, &snapshot)
 			expectedSize = info.Size()
-			expectedMtime = info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+			expectedMtime = canonicalProtocolMtime(info.ModTime())
 			if closeErr := file.Close(); err != nil || closeErr != nil {
 				parent.Close()
 				return errors.Join(err, closeErr)

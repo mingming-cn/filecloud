@@ -13,15 +13,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/object"
+	"golang.org/x/text/cases"
 )
 
 func TestLibrarySyncNoOpSendsNoPUTAndCreatesNoCommit(t *testing.T) {
@@ -1186,6 +1190,67 @@ func TestRecursiveMergeDirectoryMtimeFollowsMergedContent(t *testing.T) {
 	}
 }
 
+func TestLibrarySyncStructuralConflictWithConflictedDescendantRestarts(t *testing.T) {
+	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	child := "inside (Filecloud conflict deadbeef 20240102T030405Z).txt"
+	for _, root := range []string{publisherTree, subscriberTree} {
+		if err := os.MkdirAll(filepath.Join(root, "item"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "item", child), []byte("base"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for index := 0; index < 30; index++ {
+			if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("stable-%02d", index)), []byte("stable"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(publisherTree, "item")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(publisherTree, "item"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "item", child), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var interrupted atomic.Bool
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			fsActionFault: func(point string, action fsAction) error {
+				if point == "after_completed" && action.ExpectedObject != "" && action.OriginActionID == "" && interrupted.CompareAndSwap(false, true) {
+					return errors.New("interrupt nested conflict promotion")
+				}
+				return nil
+			}})
+	if err == nil || !strings.Contains(err.Error(), "interrupt nested conflict promotion") {
+		t.Fatalf("promotion interruption=%v", err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(subscriberTree, "item")); err != nil || string(data) != "remote" {
+		t.Fatalf("remote structural target=%q/%v", data, err)
+	}
+	directories, err := filepath.Glob(filepath.Join(subscriberTree, "item (Filecloud conflict *)"))
+	if err != nil || len(directories) != 1 {
+		t.Fatalf("structural conflict directories=%v err=%v", directories, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(directories[0], child)); err != nil || string(data) != "local" {
+		t.Fatalf("conflicted descendant=%q/%v", data, err)
+	}
+}
+
 func TestRecursiveMergeStructuralConflictTruthTable(t *testing.T) {
 	const (
 		baseFile   = "1111111111111111111111111111111111111111111111111111111111111111"
@@ -1329,6 +1394,17 @@ func TestRootPromotionTargetValidation(t *testing.T) {
 			t.Fatalf("valid target %q: %v", target, err)
 		}
 	}
+	for name, pair := range map[string][2]string{
+		"ordinary zero-step":  {"unrelated/new.txt", "unrelated/new.txt"},
+		"malformed zero-step": {"base (Filecloud conflict invalid)", "base (Filecloud conflict invalid)"},
+		"ambiguous fallback":  {"Filecloud Conflicts/0123456789ab-name (Filecloud conflict 01)", "Filecloud Conflicts/0123456789ab-name (Filecloud conflict 01)"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateRootPromotionTarget(pair[0], pair[1]); err == nil {
+				t.Fatalf("invalid zero-step family %q was accepted", pair[0])
+			}
+		})
+	}
 	for name, target := range map[string]string{
 		"arbitrary prefix":         "nested/copy-" + strings.TrimPrefix(expected, "nested/"),
 		"lookalike":                strings.Replace(expected, "Filecloud conflict", "Filecloud conflict-copy", 1),
@@ -1347,6 +1423,45 @@ func TestRootPromotionTargetValidation(t *testing.T) {
 				t.Fatalf("invalid root target %q was accepted", target)
 			}
 		})
+	}
+}
+
+func TestConflictPromotionUsesDeepestCanonicalFamily(t *testing.T) {
+	normal := "dir (Filecloud conflict aaaaaaaa 20250203T040506Z)"
+	fallback := "Filecloud Conflicts/0123456789ab-dir (Filecloud conflict 1)"
+	file := "file (Filecloud conflict bbbbbbbb 20250203T040507Z).txt"
+	for _, ancestor := range []string{normal, fallback} {
+		seed := strings.Repeat("1", 64)
+		if ancestor == fallback {
+			seed = "0123456789ab" + strings.Repeat("1", 52)
+		}
+		for _, leaf := range []string{file, "0123456789ab-file (Filecloud conflict 1)"} {
+			expected := ancestor + "/" + leaf
+			family, suffix, err := conflictPromotionFamilyPath(expected)
+			if err != nil || family != expected || suffix != "" {
+				t.Fatalf("deepest family %q/%q err=%v", family, suffix, err)
+			}
+			next, err := nextPromotionChainPath(expected, seed)
+			if err != nil || validateRootPromotionTarget(expected, next, seed) != nil {
+				t.Fatalf("successor %q err=%v", next, err)
+			}
+			ancestorNext, err := nextConflictChainPath(ancestor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateRootPromotionTarget(expected, ancestorNext+"/"+leaf, strings.Repeat("1", 64)); err == nil {
+				t.Fatal("earlier family component advanced")
+			}
+		}
+	}
+	descendant := normal + "/nested/plain.txt"
+	next, err := nextPromotionChainPath(descendant, strings.Repeat("1", 64))
+	want := normal + "/nested/plain (Filecloud conflict aaaaaaaa 20250203T040506Z).txt"
+	if err != nil || next != want || validateRootPromotionTarget(descendant, next, strings.Repeat("1", 64)) != nil {
+		t.Fatalf("descendant successor=%q want=%q err=%v", next, want, err)
+	}
+	if err := validateRootPromotionTarget(descendant, normal+"/other/"+filepath.Base(next), strings.Repeat("1", 64)); err == nil {
+		t.Fatal("tampered descendant parent accepted")
 	}
 }
 
@@ -1393,6 +1508,25 @@ func TestRecursiveMergeConflictProvenanceIgnoresLegalContentAmbiguity(t *testing
 	}
 }
 
+func TestConflictPromotionLineageKeepsPerMergeSeeds(t *testing.T) {
+	firstSeed := strings.Repeat("a", 64)
+	secondSeed := strings.Repeat("b", 64)
+	lineage := map[string]_conflictPromotion{
+		"first":  {source: "first", target: "first", id: strings.Repeat("1", 64), mtime: "2025-01-02T00:00:00Z", size: 5},
+		"second": {source: "second", target: "second", id: strings.Repeat("2", 64), mtime: "2025-01-03T00:00:00Z", size: 6},
+	}
+	merger := &_treeMerger{localSeedID: firstSeed, lineage: lineage}
+	merger.moveLineage("first", "first (Filecloud conflict aaaaaaaa 20250203T040506Z)")
+	merger.localSeedID = secondSeed
+	merger.moveLineage("second", "second (Filecloud conflict aaaaaaaa 20250203T040507Z)")
+	promotions := _movedConflictPromotions(lineage)
+	encoded, err := _encodeConflictPromotions(promotions)
+	decoded, decodeErr := _decodeConflictPromotions(encoded)
+	if err != nil || decodeErr != nil || len(decoded) != 2 || decoded[0].namingSeed != firstSeed || decoded[1].namingSeed != secondSeed {
+		t.Fatalf("per-merge FCP2 seeds=%+v encode=%v decode=%v", decoded, err, decodeErr)
+	}
+}
+
 func TestConflictPromotionCodecAndTargetValidation(t *testing.T) {
 	first := _conflictPromotion{source: "a", target: "a (Filecloud conflict aaaaaaaa 20250203T040506Z)",
 		id: strings.Repeat("1", 64), mtime: "2025-01-02T00:00:00Z", size: 5}
@@ -1409,18 +1543,50 @@ func TestConflictPromotionCodecAndTargetValidation(t *testing.T) {
 		})
 	}
 	encoded, err := _encodeConflictPromotions([]_conflictPromotion{second, first})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || string(encoded[:4]) != "FCP1" {
+		t.Fatalf("legacy provenance header=%q err=%v", encoded[:min(4, len(encoded))], err)
 	}
 	decoded, err := _decodeConflictPromotions(encoded)
 	if err != nil || len(decoded) != 2 || decoded[0] != first || decoded[1] != second {
 		t.Fatalf("canonical provenance=%+v err=%v", decoded, err)
+	}
+	reencoded, err := _encodeConflictPromotions(decoded)
+	if err != nil || !bytes.Equal(reencoded, encoded) {
+		t.Fatalf("legacy canonical re-encoding=%x err=%v", reencoded, err)
+	}
+	if _, err := _decodeConflictPromotions([]byte{'F', 'C', 'P', '2', 0, 0, 0, 0}); err == nil {
+		t.Fatal("noncanonical empty FCP2 provenance was accepted")
 	}
 	if _, err := _decodeConflictPromotions(append(encoded, 0)); err == nil {
 		t.Fatal("noncanonical trailing provenance was accepted")
 	}
 	if _, err := _decodeConflictPromotions(make([]byte, _maxConflictPromotionsBytes+1)); err == nil {
 		t.Fatal("oversized provenance was accepted")
+	}
+	seededFirst, seededSecond := first, second
+	seededFirst.namingSeed = strings.Repeat("a", 64)
+	seededSecond.namingSeed = strings.Repeat("b", 64)
+	seeded, err := _encodeConflictPromotions([]_conflictPromotion{seededSecond, seededFirst})
+	if err != nil || string(seeded[:4]) != "FCP2" {
+		t.Fatalf("seeded provenance header=%q err=%v", seeded[:min(4, len(seeded))], err)
+	}
+	seededDecoded, err := _decodeConflictPromotions(seeded)
+	if err != nil || len(seededDecoded) != 2 || seededDecoded[0] != seededFirst || seededDecoded[1] != seededSecond {
+		t.Fatalf("seeded provenance=%+v err=%v", seededDecoded, err)
+	}
+	tampered := append([]byte(nil), seeded...)
+	seedAt := bytes.Index(tampered, []byte(strings.Repeat("a", 64)))
+	if seedAt < 0 {
+		t.Fatal("FCP2 seed bytes absent")
+	}
+	tampered[seedAt] = 'A'
+	if _, err := _decodeConflictPromotions(tampered); err == nil {
+		t.Fatal("tampered FCP2 seed accepted")
+	}
+	mixed := seededFirst
+	mixed.namingSeed = ""
+	if _, err := _encodeConflictPromotions([]_conflictPromotion{mixed, seededSecond}); err == nil {
+		t.Fatal("mixed FCP1/FCP2 records accepted")
 	}
 	paths := []checkoutPath{{path: first.target, kind: "File", id: first.id, mtime: first.mtime, size: first.size}}
 	if err := _validatePromotionTargets([]_conflictPromotion{first}, paths); err != nil {
@@ -1436,27 +1602,235 @@ func TestConflictCopyNameIssue19Boundaries(t *testing.T) {
 	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID,
 		CreatedAt: "2025-02-03T04:05:06Z"}
 	for name, value := range map[string][2]string{
-		"240 byte segment": {strings.Repeat("n", 240), ""},
-		"1024 byte relative path": {strings.Repeat("f", 60), strings.Repeat("a", 240) + "/" +
-			strings.Repeat("b", 240) + "/" + strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240)},
+		"240 byte segment":   {strings.Repeat("n", 240), ""},
+		"241 byte segment":   {strings.Repeat("n", 241), ""},
+		"multibyte boundary": {strings.Repeat("界", 80), ""},
+		"reserved source":    {"CON", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := _conflictCopyName(value[0], value[1], seed, nil); err == nil || !strings.Contains(err.Error(), "Issue #19") {
-				t.Fatalf("overflow error=%v", err)
+			got, err := _conflictCopyName(value[0], value[1], seed, nil)
+			if err != nil || len(got) > 240 || !utf8.ValidString(got) || !validRecoveryVisibleName(got) {
+				t.Fatalf("bounded name=%q bytes=%d error=%v", got, len(got), err)
 			}
 		})
 	}
+	exactParent := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
+		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240)
+	exact, err := _conflictCopyName(strings.Repeat("f", 60), exactParent, seed, nil)
+	if err != nil || len(exactParent)+1+len(exact) != 1024 {
+		t.Fatalf("exact path bytes=%d name=%q err=%v", len(exactParent)+1+len(exact), exact, err)
+	}
+	if _, err := _conflictCopyName("name. ", "", seed, nil); !errors.Is(err, errConflictPathNeedsFallback) {
+		t.Fatalf("trailing source did not select fallback: %v", err)
+	}
+	if fallback, err := _fallbackConflictName("name. ", _fallbackConflictRoot, strings.Repeat("1", 64), 1); err != nil ||
+		!validRecoveryVisibleName(fallback) {
+		t.Fatalf("trailing source fallback=%q err=%v", fallback, err)
+	}
+	parent := exactParent + "/" + strings.Repeat("a", 13)
+	if _, err := _conflictCopyName("f", parent, seed, nil); !errors.Is(err, errConflictPathNeedsFallback) {
+		t.Fatalf("path pressure error=%v", err)
+	}
+	if normalized, err := _conflictCopyName("cafe\u0301.txt", "", seed, nil); err != nil || strings.Contains(normalized, "e\u0301") {
+		t.Fatalf("NFC conflict name=%q err=%v", normalized, err)
+	}
 }
 
-func TestLibrarySyncConflictNameOverflowIsPutNeutral(t *testing.T) {
-	for name, relative := range map[string]string{
-		"240 byte segment": strings.Repeat("n", 240),
-		"1024 byte relative path": strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
-			strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("f", 60),
+func TestConflictCopyNameLongExtensionUsesLegalOrdinalOne(t *testing.T) {
+	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID,
+		CreatedAt: "2025-02-03T04:05:06Z"}
+	leaf := "x." + strings.Repeat("a", 190)
+	name, err := _conflictCopyName(leaf, "", seed, nil)
+	want := "x (Filecloud conflict aaaaaaaa 20250203T040506Z)." + strings.Repeat("a", 190)
+	if err != nil || name != want || len(name) != 239 {
+		t.Fatalf("long extension name=%q bytes=%d err=%v", name, len(name), err)
+	}
+	current := name
+	failedOrdinal := 0
+	for ordinal := 2; ordinal <= _conflictMaxOrdinal; ordinal++ {
+		next, nextErr := nextConflictChainPath(current)
+		if nextErr != nil {
+			failedOrdinal = ordinal
+			break
+		}
+		current = next
+	}
+	if failedOrdinal != 10 {
+		t.Fatalf("first unavailable ordinal=%d want=10", failedOrdinal)
+	}
+	if _, err := nextPromotionChainPath(current, "", leaf); err == nil {
+		t.Fatal("legacy FCP1 normal-to-fallback transition was accepted without a seed")
+	}
+	fallback, err := nextPromotionChainPath(current, strings.Repeat("1", 64), leaf)
+	wantFallback := "Filecloud Conflicts/111111111111-x." + strings.Repeat("a", 190) + " (Filecloud conflict 1)"
+	if err != nil || fallback != wantFallback {
+		t.Fatalf("runtime fallback=%q want=%q err=%v", fallback, wantFallback, err)
+	}
+	fallbackDescendant := "111111111111-dir (Filecloud conflict 1)/plain.txt"
+	if _, err := nextPromotionChainPath(fallbackDescendant, strings.Repeat("2", 64), "plain.txt"); err == nil {
+		t.Fatal("fallback family with a different FCP2 seed was accepted")
+	}
+}
+
+func TestConflictNameFamiliesRetruncateOnOrdinalGrowth(t *testing.T) {
+	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID,
+		CreatedAt: "2025-02-03T04:05:06Z"}
+	first, err := _conflictCopyName(strings.Repeat("x", 240)+".txt", "", seed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := first
+	for ordinal := 2; ordinal <= 100; ordinal++ {
+		current, err = nextConflictChainPath(current)
+		if err != nil || len(current) > 240 || !validRecoveryVisibleName(current) {
+			t.Fatalf("ordinal %d path=%q bytes=%d err=%v", ordinal, current, len(current), err)
+		}
+	}
+	fallback := "Filecloud Conflicts/0123456789ab-" + strings.Repeat("界", 60) + " (Filecloud conflict 9)"
+	fallback, err = nextConflictChainPath(fallback)
+	if err != nil || !strings.HasSuffix(fallback, " (Filecloud conflict 10)") || len(filepath.Base(fallback)) > 240 {
+		t.Fatalf("fallback successor=%q err=%v", fallback, err)
+	}
+	if err := validateRootPromotionTarget("Filecloud Conflicts/0123456789ab-name (Filecloud conflict 1)",
+		"Filecloud Conflicts/0123456789ab-name (Filecloud conflict 3)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRootPromotionTarget("Filecloud Conflicts/0123456789ab-name (Filecloud conflict 1)",
+		"Filecloud Conflicts/ffffffffffff-name (Filecloud conflict 2)"); err == nil {
+		t.Fatal("cross-seed fallback family accepted")
+	}
+}
+
+func TestFallbackConflictOrdinalExhaustionDoesNotWrap(t *testing.T) {
+	seed := strings.Repeat("1", 64)
+	last := "Filecloud Conflicts/" + seed[:12] + "-name (Filecloud conflict 9999)"
+	if _, err := nextConflictChainPath(last); err == nil {
+		t.Fatal("fallback leaf ordinal wrapped after 9999")
+	}
+	mtime := "2026-01-01T00:00:00Z"
+	fileID := strings.Repeat("2", 64)
+	request := _fallbackConflict{source: "nested/name", leaf: "name",
+		entry: object.DirectoryEntry{Name: "name", Type: "File", ID: fileID, ModifiedAt: mtime}}
+
+	rootEntries := make([]scanEntry, 0, _conflictMaxOrdinal)
+	for ordinal := 1; ordinal <= _conflictMaxOrdinal; ordinal++ {
+		name := _fallbackConflictRoot
+		if ordinal > 1 {
+			name += " " + strconv.Itoa(ordinal)
+		}
+		rootEntries = append(rootEntries, scanEntry{name: name, kind: "File", id: fileID, modified: mtime})
+	}
+	sort.Slice(rootEntries, func(i, j int) bool { return rootEntries[i].name < rootEntries[j].name })
+	rootData, rootID, err := canonicalDirectory("", rootEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootMerger := &_treeMerger{directories: map[string][]byte{rootID: rootData}, synthesized: make(map[string][]byte),
+		active: make(map[string]bool), seen: make(map[string]bool), budget: _newReplayBudget(), localSeedID: seed,
+		lineage:   map[string]_conflictPromotion{"nested/name": {source: "nested/name", target: "nested/name"}},
+		fallbacks: []_fallbackConflict{request}}
+	if _, err := rootMerger.applyFallbacks(rootID); err == nil || !strings.Contains(err.Error(), "root collision sequence exhausted") {
+		t.Fatalf("fallback root exhaustion error=%v", err)
+	}
+
+	fallbackEntries := make([]scanEntry, 0, _conflictMaxOrdinal)
+	for ordinal := 1; ordinal <= _conflictMaxOrdinal; ordinal++ {
+		name, err := _fallbackConflictName("name", _fallbackConflictRoot, seed, ordinal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fallbackEntries = append(fallbackEntries, scanEntry{name: name, kind: "File", id: fileID, modified: mtime})
+	}
+	sort.Slice(fallbackEntries, func(i, j int) bool { return fallbackEntries[i].name < fallbackEntries[j].name })
+	fallbackData, fallbackID, err := canonicalDirectory(_fallbackConflictRoot, fallbackEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	occupiedRootData, occupiedRootID, err := canonicalDirectory("", []scanEntry{{name: _fallbackConflictRoot,
+		kind: "Directory", id: fallbackID, modified: mtime}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafMerger := &_treeMerger{directories: map[string][]byte{occupiedRootID: occupiedRootData, fallbackID: fallbackData},
+		synthesized: make(map[string][]byte), active: make(map[string]bool), seen: make(map[string]bool),
+		budget: _newReplayBudget(), localSeedID: seed,
+		lineage:   map[string]_conflictPromotion{"nested/name": {source: "nested/name", target: "nested/name"}},
+		fallbacks: []_fallbackConflict{request}}
+	if _, err := leafMerger.applyFallbacks(occupiedRootID); err == nil || !strings.Contains(err.Error(), "collision sequence exhausted") {
+		t.Fatalf("fallback leaf exhaustion error=%v", err)
+	}
+}
+
+func TestFallbackConflictRequestsUseCanonicalSourceOrder(t *testing.T) {
+	emptyData, emptyID, err := canonicalEmptyDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedID := strings.Repeat("1", 64)
+	makeMerger := func() *_treeMerger {
+		return &_treeMerger{directories: map[string][]byte{emptyID: emptyData}, synthesized: make(map[string][]byte),
+			active: make(map[string]bool), seen: make(map[string]bool), budget: _newReplayBudget(), localSeedID: seedID,
+			lineage: map[string]_conflictPromotion{
+				"z/f": {source: "z/f", target: "z/f"},
+				"a/f": {source: "a/f", target: "a/f"},
+			}, fallbacks: []_fallbackConflict{
+				{source: "z/f", leaf: "f", entry: object.DirectoryEntry{Name: "f", Type: "File", ID: strings.Repeat("2", 64), ModifiedAt: "2026-01-01T00:00:00Z"}},
+				{source: "a/f", leaf: "f", entry: object.DirectoryEntry{Name: "f", Type: "File", ID: strings.Repeat("3", 64), ModifiedAt: "2026-01-02T00:00:00Z"}},
+			}}
+	}
+	first := makeMerger()
+	rootID, err := first.applyFallbacks(emptyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := first.loadDirectory(rootID)
+	if err != nil || len(root.Entries) != 1 || root.Entries[0].ModifiedAt != "2026-01-02T00:00:00Z" {
+		t.Fatalf("fallback root=%+v err=%v", root, err)
+	}
+	fallback, err := first.loadDirectory(root.Entries[0].ID)
+	if err != nil || len(fallback.Entries) != 2 ||
+		fallback.Entries[0].Name != "111111111111-f (Filecloud conflict 1)" || fallback.Entries[0].ID != strings.Repeat("3", 64) ||
+		fallback.Entries[1].Name != "111111111111-f (Filecloud conflict 2)" || fallback.Entries[1].ID != strings.Repeat("2", 64) {
+		t.Fatalf("fallback entries=%+v err=%v", fallback.Entries, err)
+	}
+	second := makeMerger()
+	replayed, err := second.applyFallbacks(emptyID)
+	if err != nil || replayed != rootID {
+		t.Fatalf("fallback replay root=%s/%s err=%v", rootID, replayed, err)
+	}
+}
+
+func TestLibrarySyncLongConflictNamesConverge(t *testing.T) {
+	longFallback := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
+		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("a", 13) + "/f"
+	for _, test := range []struct {
+		name, relative, existingRoot, existingKind, wantRoot string
+		fallback                                             bool
+	}{
+		{name: "240 byte segment", relative: strings.Repeat("n", 240)},
+		{name: "root fallback absent", relative: longFallback, fallback: true, wantRoot: "Filecloud Conflicts"},
+		{name: "root fallback exact directory reuse", relative: longFallback, fallback: true,
+			existingRoot: "Filecloud Conflicts", existingKind: "Directory", wantRoot: "Filecloud Conflicts"},
+		{name: "root fallback exact file collision", relative: longFallback, fallback: true,
+			existingRoot: "Filecloud Conflicts", existingKind: "File", wantRoot: "Filecloud Conflicts 2"},
+		{name: "root fallback casefold alias", relative: longFallback, fallback: true,
+			existingRoot: "FILECLOUD CONFLICTS", existingKind: "Directory", wantRoot: "Filecloud Conflicts 2"},
 	} {
-		t.Run(name, func(t *testing.T) {
-			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts, _ := newSyncPair(t)
-			publisherPath := filepath.Join(publisherTree, filepath.FromSlash(relative))
+		t.Run(test.name, func(t *testing.T) {
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, commits := newSyncPair(t)
+			if test.existingRoot != "" {
+				existing := filepath.Join(publisherTree, test.existingRoot)
+				if test.existingKind == "Directory" {
+					if err := os.Mkdir(existing, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					existing = filepath.Join(existing, "preserved")
+				}
+				if err := os.WriteFile(existing, []byte("preserved"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			publisherPath := filepath.Join(publisherTree, filepath.FromSlash(test.relative))
 			if err := os.MkdirAll(filepath.Dir(publisherPath), 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -1475,35 +1849,102 @@ func TestLibrarySyncConflictNameOverflowIsPutNeutral(t *testing.T) {
 			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
 				t.Fatal(err)
 			}
-			subscriberPath := filepath.Join(subscriberTree, filepath.FromSlash(relative))
+			subscriberPath := filepath.Join(subscriberTree, filepath.FromSlash(test.relative))
 			if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
-			beforeIndex := countClientRows(t, subscriberDir, "path_index", subscriberTree)
-			beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
-				[]byte(environment.token))
-			if err != nil {
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
 				t.Fatal(err)
 			}
-			puts.Store(0)
-			err = syncTestWorktree(t, subscriberDir, subscriberTree)
-			if err == nil || !strings.Contains(err.Error(), "Issue #19") {
-				t.Fatalf("overflow sync error=%v", err)
+			pattern := filepath.Join(filepath.Dir(subscriberPath), "* (Filecloud conflict *)")
+			if test.fallback {
+				pattern = filepath.Join(subscriberTree, test.wantRoot, "* (Filecloud conflict *)")
 			}
-			afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
-				[]byte(environment.token))
-			data, readErr := os.ReadFile(subscriberPath)
-			if puts.Load() != 0 || readTestBinding(t, subscriberDir, subscriberTree) != beforeBinding ||
-				countClientRows(t, subscriberDir, "path_index", subscriberTree) != beforeIndex ||
-				countClientRows(t, subscriberDir, "pending_publications", subscriberTree) != 0 || headErr != nil ||
-				beforeHead.CommitID == nil || afterHead.CommitID == nil || *beforeHead.CommitID != *afterHead.CommitID ||
-				beforeHead.ETag != afterHead.ETag || readErr != nil || string(data) != "local" {
-				t.Fatalf("overflow changed state puts=%d head=%+v/%+v data=%q read=%v headErr=%v",
-					puts.Load(), beforeHead, afterHead, data, readErr, headErr)
+			matches, err := filepath.Glob(pattern)
+			remote, remoteErr := os.ReadFile(subscriberPath)
+			if err != nil || len(matches) != 1 || remoteErr != nil || string(remote) != "remote" {
+				t.Fatalf("matches=%v glob=%v remote=%q/%v", matches, err, remote, remoteErr)
 			}
+			local, err := os.ReadFile(matches[0])
+			if err != nil || string(local) != "local" || len(filepath.Base(matches[0])) > 240 {
+				t.Fatalf("local conflict=%q/%v path=%q", local, err, matches[0])
+			}
+			if test.existingRoot != "" {
+				existing := filepath.Join(subscriberTree, test.existingRoot)
+				if test.existingKind == "Directory" {
+					existing = filepath.Join(existing, "preserved")
+				}
+				if preserved, err := os.ReadFile(existing); err != nil || string(preserved) != "preserved" {
+					t.Fatalf("existing fallback collision changed=%q/%v", preserved, err)
+				}
+			}
+			commits.Store(0)
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil || commits.Load() != 0 {
+				t.Fatalf("repeated sync error=%v commits=%d", err, commits.Load())
+			}
+			assertTestConverged(t, environment, subscriberDir, subscriberTree)
 		})
 	}
+}
+
+func TestLibrarySyncLongDirectoryConflictUsesRootFallback(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, commits := newSyncPair(t)
+	relative := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
+		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("a", 13) + "/f"
+	publisherPath := filepath.Join(publisherTree, filepath.FromSlash(relative))
+	if err := os.MkdirAll(filepath.Join(publisherPath, "nested", "empty"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(publisherPath, "nested", "local.txt"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(publisherPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(publisherPath, []byte("remote file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := syncTestWorktree(t, publisherDir, publisherTree)
+	var required *deleteConfirmationRequiredError
+	if errors.As(err, &required) {
+		err = confirmTestDeletion(t, publisherDir, publisherTree, required.candidate[:deleteCandidatePrefixLen], libraryClientConfig{})
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscriberPath := filepath.Join(subscriberTree, filepath.FromSlash(relative))
+	if err := os.WriteFile(filepath.Join(subscriberPath, "nested", "local.txt"), []byte("local directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = syncTestWorktree(t, subscriberDir, subscriberTree)
+	required = nil
+	if errors.As(err, &required) {
+		err = confirmTestDeletion(t, subscriberDir, subscriberTree, required.candidate[:deleteCandidatePrefixLen], libraryClientConfig{})
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(subscriberTree, "Filecloud Conflicts", "* (Filecloud conflict *)"))
+	remote, remoteErr := os.ReadFile(subscriberPath)
+	if err != nil || len(matches) != 1 || remoteErr != nil || string(remote) != "remote file" {
+		t.Fatalf("fallback directories=%v glob=%v remote=%q/%v", matches, err, remote, remoteErr)
+	}
+	local, localErr := os.ReadFile(filepath.Join(matches[0], "nested", "local.txt"))
+	empty, emptyErr := os.Stat(filepath.Join(matches[0], "nested", "empty"))
+	if localErr != nil || string(local) != "local directory" || emptyErr != nil || !empty.IsDir() {
+		t.Fatalf("fallback subtree local=%q/%v empty=%v/%v", local, localErr, empty, emptyErr)
+	}
+	commits.Store(0)
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil || commits.Load() != 0 {
+		t.Fatalf("repeated directory fallback sync error=%v commits=%d", err, commits.Load())
+	}
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
 }
 
 func TestLibrarySyncBothCreatedDivergentFileCreatesConflictCopy(t *testing.T) {
@@ -2163,6 +2604,208 @@ func TestLibrarySyncLatePromotionCrashMatrix(t *testing.T) {
 	}
 }
 
+func TestLibrarySyncLatePromotionPushesContiguousOccupiedChain(t *testing.T) {
+	for _, test := range []struct {
+		name, relative         string
+		occupied               int
+		crashFallback          bool
+		fallbackRoot, rootKind string
+		wantFallbackRoot       string
+		crashPoint             string
+		rootRaceAlias          bool
+	}{
+		{name: "ordinal-2-and-3", relative: "base", occupied: 2},
+		{name: "normal-to-fallback-before-intent", relative: "x." + strings.Repeat("a", 190), occupied: 8, crashFallback: true,
+			wantFallbackRoot: "Filecloud Conflicts", crashPoint: "before_intent_commit"},
+		{name: "normal-to-fallback-after-intent", relative: "x." + strings.Repeat("a", 190), occupied: 8, crashFallback: true,
+			wantFallbackRoot: "Filecloud Conflicts", crashPoint: "after_intent_commit"},
+		{name: "normal-to-fallback-after-rename", relative: "x." + strings.Repeat("a", 190), occupied: 8, crashFallback: true,
+			wantFallbackRoot: "Filecloud Conflicts", crashPoint: "after_action"},
+		{name: "normal-to-fallback-after-parent-sync", relative: "x." + strings.Repeat("a", 190), occupied: 8, crashFallback: true,
+			wantFallbackRoot: "Filecloud Conflicts", crashPoint: "after_parent_sync"},
+		{name: "normal-to-fallback-after-completion", relative: "x." + strings.Repeat("a", 190), occupied: 8, crashFallback: true,
+			wantFallbackRoot: "Filecloud Conflicts", crashPoint: "after_completed"},
+		{name: "fallback exact directory reuse", relative: "x." + strings.Repeat("a", 190), occupied: 8, crashFallback: true,
+			fallbackRoot: "Filecloud Conflicts", rootKind: "Directory", wantFallbackRoot: "Filecloud Conflicts"},
+		{name: "fallback exact file advances", relative: "x." + strings.Repeat("a", 190), occupied: 8, crashFallback: true,
+			fallbackRoot: "Filecloud Conflicts", rootKind: "File", wantFallbackRoot: "Filecloud Conflicts 2"},
+		{name: "fallback casefold alias advances", relative: "x." + strings.Repeat("a", 190), occupied: 8, crashFallback: true,
+			fallbackRoot: "FILECLOUD CONFLICTS", rootKind: "Directory", wantFallbackRoot: "Filecloud Conflicts 2"},
+		{name: "fallback casefold race advances", relative: "x." + strings.Repeat("a", 190), occupied: 8, crashFallback: true,
+			wantFallbackRoot: "Filecloud Conflicts 2", rootRaceAlias: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			publisherPath := filepath.Join(publisherTree, filepath.FromSlash(test.relative))
+			subscriberPath := filepath.Join(subscriberTree, filepath.FromSlash(test.relative))
+			if err := os.WriteFile(publisherPath, []byte("base"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(publisherPath, []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			held, err := os.OpenFile(subscriberPath, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			var stop atomic.Bool
+			err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+				strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+					fsActionFault: func(point string, action fsAction) error {
+						if point == "after_completed" && action.ExpectedObject != "" && action.OriginActionID == "" && stop.CompareAndSwap(false, true) {
+							return errors.New("hold completed promotion")
+						}
+						return nil
+					}})
+			if err == nil || !strings.Contains(err.Error(), "hold completed promotion") {
+				t.Fatalf("initial promotion interruption=%v", err)
+			}
+			if test.fallbackRoot != "" {
+				path := filepath.Join(subscriberTree, test.fallbackRoot)
+				if test.rootKind == "Directory" {
+					if err := os.Mkdir(path, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(path, []byte("root collision"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			promotions, loadErr := loadConflictPromotions(t.Context(), db, subscriberTree)
+			closeErr := db.Close()
+			if loadErr != nil || closeErr != nil || len(promotions) != 1 || promotions[0].source != test.relative {
+				t.Fatalf("promotion provenance=%+v load=%v close=%v", promotions, loadErr, closeErr)
+			}
+			promotion := promotions[0]
+			chain := []string{promotion.target}
+			for index := 0; index <= test.occupied; index++ {
+				next, err := nextPromotionChainPath(chain[len(chain)-1], promotion.namingSeed, promotion.source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				chain = append(chain, next)
+			}
+			if test.crashFallback && !strings.HasPrefix(filepath.Base(chain[len(chain)-1]), promotion.namingSeed[:12]+"-") {
+				t.Fatalf("normal chain did not transition to fallback: %q", chain[len(chain)-1])
+			}
+			for index := 1; index <= test.occupied; index++ {
+				if err := os.WriteFile(filepath.Join(subscriberTree, filepath.FromSlash(chain[index])),
+					[]byte(fmt.Sprintf("occupied-%d", index+1)), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := held.WriteAt([]byte("late!"), 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := held.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			if test.crashFallback {
+				crashPoint := test.crashPoint
+				if crashPoint == "" {
+					crashPoint = "after_intent_commit"
+				}
+				rootCreateCrash := test.fallbackRoot == "" && !test.rootRaceAlias
+				var interrupted, raced atomic.Bool
+				if rootCreateCrash {
+					command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+					command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+						"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+						"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpCreateDirectory,
+						"FILECLOUD_PUBLIC_CRASH_KIND=Directory", "FILECLOUD_PUBLIC_CRASH_POINT="+crashPoint,
+						"FILECLOUD_PUBLIC_CRASH_ROLE=fallback-root-create")
+					assertProcessSIGKILL(t, command.Run())
+				} else {
+					err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+						strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+							fsActionFault: func(point string, action fsAction) error {
+								if test.rootRaceAlias && point == "before_action" && action.Op == fsOpCreateDirectory &&
+									strings.HasPrefix(action.InternalTarget, fsPromotionFallbackOwnerPrefix) && raced.CompareAndSwap(false, true) {
+									if err := os.Mkdir(filepath.Join(subscriberTree, strings.ToUpper(action.Source)), 0o700); err != nil {
+										return err
+									}
+								}
+								parent, _ := splitFSActionPath(action.Target)
+								if point == crashPoint && validFallbackRootName(parent) && interrupted.CompareAndSwap(false, true) {
+									return errors.New("interrupt normal-to-fallback")
+								}
+								return nil
+							}})
+					if err == nil || !strings.Contains(err.Error(), "interrupt normal-to-fallback") || !interrupted.Load() {
+						t.Fatalf("normal-to-fallback interruption=%v interrupted=%v", err, interrupted.Load())
+					}
+				}
+				db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var actualFallback string
+				err = db.QueryRow(`SELECT target_name FROM fs_actions WHERE worktree=? AND origin_action_id<>''
+					AND target_name LIKE 'Filecloud Conflicts%' ORDER BY attempt DESC LIMIT 1`, subscriberTree).Scan(&actualFallback)
+				if errors.Is(err, sql.ErrNoRows) && (rootCreateCrash || crashPoint == "before_intent_commit") {
+					_, originalLeaf := splitFSActionPath(promotion.source)
+					leaf, nameErr := _fallbackConflictName(originalLeaf, test.wantFallbackRoot, promotion.namingSeed, 1)
+					if nameErr != nil {
+						db.Close()
+						t.Fatal(nameErr)
+					}
+					actualFallback = test.wantFallbackRoot + "/" + leaf
+					err = nil
+				}
+				if err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				chain[len(chain)-1] = actualFallback
+				parent, _ := splitFSActionPath(actualFallback)
+				if parent != test.wantFallbackRoot {
+					t.Fatalf("runtime fallback root=%q want=%q", parent, test.wantFallbackRoot)
+				}
+			}
+			for attempt := 0; attempt < 12; attempt++ {
+				err = syncTestWorktree(t, subscriberDir, subscriberTree)
+				if err == nil {
+					break
+				}
+				if !strings.Contains(err.Error(), "rerun sync") {
+					t.Fatalf("strict chain restart %d: %v", attempt, err)
+				}
+			}
+			if err != nil {
+				t.Fatalf("strict chain did not converge: %v", err)
+			}
+			want := append([]string{"local", "late!"}, make([]string, test.occupied)...)
+			for index := 2; index < len(want); index++ {
+				want[index] = fmt.Sprintf("occupied-%d", index)
+			}
+			for index, path := range chain {
+				if data, err := os.ReadFile(filepath.Join(subscriberTree, filepath.FromSlash(path))); err != nil || string(data) != want[index] {
+					t.Fatalf("%q=%q/%v want=%q", path, data, err, want[index])
+				}
+			}
+		})
+	}
+}
+
 func TestLibraryRejectsOrphanPromotionBeforeReplay(t *testing.T) {
 	for _, operation := range []string{"recover", "sync", "unbind"} {
 		t.Run(operation, func(t *testing.T) {
@@ -2320,6 +2963,237 @@ func TestLibraryRejectsOrphanPromotionBeforeReplay(t *testing.T) {
 			if pendingAfter != pendingBefore || recoveriesAfter != recoveriesBefore {
 				t.Fatalf("%s pending state changed: checkouts %d/%d recoveries %d/%d", operation,
 					pendingBefore, pendingAfter, recoveriesBefore, recoveriesAfter)
+			}
+		})
+	}
+}
+
+func TestLibraryRejectsOrdinaryZeroStepPromotionTargetBeforeReplay(t *testing.T) {
+	for _, operation := range []string{"recover", "sync", "unbind"} {
+		t.Run(operation, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if err := os.Mkdir(filepath.Join(publisherTree, "unrelated"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(publisherTree, "unrelated", "base.txt"), []byte("base"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(publisherTree, "unrelated", "base.txt"), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, "unrelated", "base.txt"), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_intent_commit",
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+			assertProcessSIGKILL(t, command.Run())
+			beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			promotions, err := loadConflictPromotions(t.Context(), db, subscriberTree)
+			if err != nil || len(promotions) != 1 {
+				db.Close()
+				t.Fatalf("promotions=%+v err=%v", promotions, err)
+			}
+			oldTarget := promotions[0].target
+			promotions[0].target = "unrelated/new.txt"
+			encoded, err := _encodeConflictPromotions(promotions)
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`UPDATE pending_checkouts SET conflict_promotions=? WHERE worktree=?`, encoded, subscriberTree); err == nil {
+				_, err = db.Exec(`UPDATE checkout_paths SET path=? WHERE worktree=? AND path=?`, "unrelated/new.txt", subscriberTree, oldTarget)
+			}
+			if err == nil {
+				_, err = db.Exec(`UPDATE fs_actions SET target_name=? WHERE worktree=? AND origin_action_id IS NULL AND expected_object<>''`,
+					"unrelated/new.txt", subscriberTree)
+			}
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			var source string
+			if err := db.QueryRow(`SELECT CASE WHEN parent_path='' THEN source_name ELSE parent_path||'/'||source_name END
+				FROM fs_actions WHERE worktree=? AND origin_action_id IS NULL AND expected_object<>''`, subscriberTree).Scan(&source); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			countsBefore := []int{countClientRows(t, subscriberDir, "pending_checkouts", subscriberTree),
+				countClientRows(t, subscriberDir, "sync_recoveries", subscriberTree),
+				countClientRows(t, subscriberDir, "sync_recovery_promotions", subscriberTree),
+				countClientRows(t, subscriberDir, "fs_actions", subscriberTree)}
+			root, err := openWorktreeRoot(subscriberTree, func(*os.File) error { return nil })
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			var operationErr error
+			switch operation {
+			case "recover":
+				operationErr = recoverFSActions(t.Context(), db, subscriberTree, root, nil)
+			case "sync", "unbind":
+				if err := errors.Join(root.Close(), db.Close()); err != nil {
+					t.Fatal(err)
+				}
+				root, db = nil, nil
+				operationErr = runLibraryWithConfig(t.Context(), []string{operation, "--client-dir", subscriberDir, "--worktree", subscriberTree},
+					strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
+			}
+			if operationErr == nil {
+				t.Fatalf("%s ordinary target was accepted", operation)
+			}
+			if root != nil {
+				if err := root.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if db != nil {
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if data, err := os.ReadFile(filepath.Join(subscriberTree, filepath.FromSlash(source))); err != nil || string(data) != "local" {
+				t.Fatalf("%s source=%q/%v", operation, data, err)
+			}
+			if _, err := os.Lstat(filepath.Join(subscriberTree, "unrelated", "new.txt")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s unrelated target exists: %v", operation, err)
+			}
+			if after := readTestBinding(t, subscriberDir, subscriberTree); after != beforeBinding {
+				t.Fatalf("%s binding changed: before=%+v after=%+v", operation, beforeBinding, after)
+			}
+			countsAfter := []int{countClientRows(t, subscriberDir, "pending_checkouts", subscriberTree),
+				countClientRows(t, subscriberDir, "sync_recoveries", subscriberTree),
+				countClientRows(t, subscriberDir, "sync_recovery_promotions", subscriberTree),
+				countClientRows(t, subscriberDir, "fs_actions", subscriberTree)}
+			if !reflect.DeepEqual(countsAfter, countsBefore) {
+				t.Fatalf("%s database counts changed: before=%v after=%v", operation, countsBefore, countsAfter)
+			}
+		})
+	}
+}
+
+func TestLibraryRejectsAlternateValidPromotionSeedBeforeMutation(t *testing.T) {
+	for _, operation := range []string{"recover", "sync", "unbind"} {
+		t.Run(operation, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("base"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_intent_commit",
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+			assertProcessSIGKILL(t, command.Run())
+
+			beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+			beforeEntries, err := os.ReadDir(subscriberTree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			promotions, err := loadConflictPromotions(t.Context(), db, subscriberTree)
+			if err != nil || len(promotions) != 1 || promotions[0].namingSeed == "" {
+				db.Close()
+				t.Fatalf("seeded promotions=%+v err=%v", promotions, err)
+			}
+			alternate := strings.Repeat("0", 64)
+			if alternate == promotions[0].namingSeed {
+				alternate = strings.Repeat("f", 64)
+			}
+			promotions[0].namingSeed = alternate
+			encoded, err := _encodeConflictPromotions(promotions)
+			if err == nil {
+				_, err = db.Exec("UPDATE pending_checkouts SET conflict_promotions=? WHERE worktree=?", encoded, subscriberTree)
+			}
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			countsBefore := []int{countClientRows(t, subscriberDir, "pending_checkouts", subscriberTree),
+				countClientRows(t, subscriberDir, "sync_recoveries", subscriberTree),
+				countClientRows(t, subscriberDir, "sync_recovery_promotions", subscriberTree),
+				countClientRows(t, subscriberDir, "fs_actions", subscriberTree)}
+			root, err := openWorktreeRoot(subscriberTree, func(*os.File) error { return nil })
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			var operationErr error
+			switch operation {
+			case "recover":
+				operationErr = validatePendingPromotionTargets(t.Context(), db, subscriberTree)
+				if operationErr == nil {
+					operationErr = recoverFSActions(t.Context(), db, subscriberTree, root, nil)
+				}
+			case "sync", "unbind":
+				if err := errors.Join(root.Close(), db.Close()); err != nil {
+					t.Fatal(err)
+				}
+				root, db = nil, nil
+				operationErr = runLibraryWithConfig(t.Context(), []string{operation, "--client-dir", subscriberDir,
+					"--worktree", subscriberTree}, strings.NewReader(""), io.Discard, io.Discard,
+					libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
+			}
+			if operationErr == nil || !strings.Contains(operationErr.Error(), "authoritative Candidate replay") {
+				t.Fatalf("%s alternate seed error=%v", operation, operationErr)
+			}
+			if root != nil {
+				if err := root.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if db != nil {
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			afterEntries, err := os.ReadDir(subscriberTree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			countsAfter := []int{countClientRows(t, subscriberDir, "pending_checkouts", subscriberTree),
+				countClientRows(t, subscriberDir, "sync_recoveries", subscriberTree),
+				countClientRows(t, subscriberDir, "sync_recovery_promotions", subscriberTree),
+				countClientRows(t, subscriberDir, "fs_actions", subscriberTree)}
+			if readTestBinding(t, subscriberDir, subscriberTree) != beforeBinding ||
+				!reflect.DeepEqual(beforeEntries, afterEntries) || !reflect.DeepEqual(countsBefore, countsAfter) {
+				t.Fatalf("%s changed state: entries=%v/%v rows=%v/%v", operation, beforeEntries, afterEntries, countsBefore, countsAfter)
 			}
 		})
 	}
@@ -3006,6 +3880,310 @@ func TestLibrarySyncPromotionCollisionPreservesRacingInode(t *testing.T) {
 	}
 	if !contents["local"] || !contents["racing"] {
 		t.Fatalf("promotion collision lost content: %v", contents)
+	}
+}
+
+func TestLibrarySyncCasefoldAliasRaceRelocatesCapturedPromotion(t *testing.T) {
+	longFallback := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
+		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("a", 13) + "/f"
+	for _, relative := range []string{"base", longFallback} {
+		for _, point := range []string{"before_action", "after_action"} {
+			name := point + "/normal"
+			if relative == longFallback {
+				name = point + "/fallback"
+			}
+			t.Run(name, func(t *testing.T) {
+				environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+				publisherPath := filepath.Join(publisherTree, filepath.FromSlash(relative))
+				subscriberPath := filepath.Join(subscriberTree, filepath.FromSlash(relative))
+				if err := os.MkdirAll(filepath.Dir(publisherPath), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(publisherPath, []byte("base"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(publisherPath, []byte("remote"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				held, err := os.OpenFile(subscriberPath, os.O_RDWR, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer held.Close()
+				var changed, injected atomic.Bool
+				var aliasPath string
+				var aliasInode uint64
+				err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+					strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+						afterSyncRecoveryRename: func(string, string) error {
+							if changed.CompareAndSwap(false, true) {
+								_, err := held.WriteAt([]byte("late!"), 0)
+								return err
+							}
+							return nil
+						},
+						fsActionFault: func(got string, action fsAction) error {
+							if got != point || action.ExpectedObject == "" || action.OriginActionID != "" ||
+								!injected.CompareAndSwap(false, true) {
+								return nil
+							}
+							parent, leaf := filepath.Split(filepath.Join(subscriberTree, filepath.FromSlash(action.Target)))
+							aliasPath = filepath.Join(parent, strings.ToUpper(leaf))
+							if aliasPath == filepath.Join(subscriberTree, filepath.FromSlash(action.Target)) {
+								return errors.New("case-fold alias injection did not change spelling")
+							}
+							if err := os.WriteFile(aliasPath, []byte("alias"), 0o600); err != nil {
+								return err
+							}
+							info, err := os.Stat(aliasPath)
+							if err == nil {
+								aliasInode = info.Sys().(*syscall.Stat_t).Ino
+							}
+							return err
+						}})
+				if err == nil || !strings.Contains(err.Error(), "rerun sync") {
+					t.Fatalf("case-fold race error=%v", err)
+				}
+				if !injected.Load() || aliasPath == "" {
+					t.Fatal("case-fold race was not injected")
+				}
+				if _, err := os.Stat(aliasPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("original alias still exists: %v", err)
+				}
+				searchRoot := filepath.Dir(aliasPath)
+				entries, err := os.ReadDir(searchRoot)
+				if err != nil {
+					t.Fatal(err)
+				}
+				contents := make(map[string]bool)
+				aliasMoved := false
+				folded := make(map[string]string)
+				for _, entry := range entries {
+					fold := cases.Fold().String(entry.Name())
+					if previous := folded[fold]; previous != "" && previous != entry.Name() {
+						t.Fatalf("physical casefold duplicates %q and %q", previous, entry.Name())
+					}
+					folded[fold] = entry.Name()
+					info, statErr := entry.Info()
+					if statErr != nil || !info.Mode().IsRegular() {
+						continue
+					}
+					data, readErr := os.ReadFile(filepath.Join(searchRoot, entry.Name()))
+					if readErr != nil {
+						t.Fatal(readErr)
+					}
+					contents[string(data)] = true
+					if info.Sys().(*syscall.Stat_t).Ino == aliasInode && string(data) == "alias" {
+						aliasMoved = true
+					}
+				}
+				if !aliasMoved || !contents["late!"] || !contents["local"] {
+					t.Fatalf("promotion ownership aliasMoved=%v contents=%v", aliasMoved, contents)
+				}
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+					t.Fatal(err)
+				}
+				assertTestConverged(t, environment, subscriberDir, subscriberTree)
+			})
+		}
+	}
+}
+
+func TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget(t *testing.T) {
+	longFallback := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
+		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("a", 13) + "/f"
+	for _, relative := range []string{"base", longFallback} {
+		for _, point := range []string{"before_action", "after_action"} {
+			name := point + "/normal"
+			if relative == longFallback {
+				name = point + "/fallback"
+			}
+			t.Run(name, func(t *testing.T) {
+				environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+				publisherPath := filepath.Join(publisherTree, filepath.FromSlash(relative))
+				subscriberPath := filepath.Join(subscriberTree, filepath.FromSlash(relative))
+				if err := os.MkdirAll(filepath.Dir(publisherPath), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(publisherPath, []byte("base"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(publisherPath, []byte("remote"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				held, err := os.Open(subscriberPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer held.Close()
+				heldInfo, err := held.Stat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var aliasInode uint64
+				var targetPath string
+				var injected atomic.Bool
+				err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+					strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+						fsActionFault: func(got string, action fsAction) error {
+							if got != point || action.ExpectedObject == "" || action.OriginActionID != "" || !injected.CompareAndSwap(false, true) {
+								return nil
+							}
+							targetPath = action.Target
+							parent, leaf := filepath.Split(filepath.Join(subscriberTree, filepath.FromSlash(action.Target)))
+							alias := filepath.Join(parent, strings.ToUpper(leaf))
+							if err := os.WriteFile(alias, []byte("alias"), 0o600); err != nil {
+								return err
+							}
+							info, err := os.Stat(alias)
+							if err == nil {
+								aliasInode = info.Sys().(*syscall.Stat_t).Ino
+							}
+							return err
+						}})
+				if err == nil || !strings.Contains(err.Error(), "rerun sync") || !injected.Load() {
+					t.Fatalf("fixed alias race=%v injected=%v", err, injected.Load())
+				}
+				fixedInfo, err := os.Stat(filepath.Join(subscriberTree, filepath.FromSlash(targetPath)))
+				fixedData, readErr := os.ReadFile(filepath.Join(subscriberTree, filepath.FromSlash(targetPath)))
+				if err != nil || readErr != nil || !os.SameFile(heldInfo, fixedInfo) || string(fixedData) != "local" {
+					t.Fatalf("fixed target identity/content info=%v err=%v data=%q/%v", fixedInfo, err, fixedData, readErr)
+				}
+				aliasFound := false
+				if err := filepath.Walk(subscriberTree, func(path string, info os.FileInfo, err error) error {
+					if err == nil && info.Mode().IsRegular() && info.Sys().(*syscall.Stat_t).Ino == aliasInode {
+						data, readErr := os.ReadFile(path)
+						aliasFound = readErr == nil && string(data) == "alias" && filepath.ToSlash(strings.TrimPrefix(path, subscriberTree+string(filepath.Separator))) != targetPath
+						return readErr
+					}
+					return err
+				}); err != nil || !aliasFound {
+					t.Fatalf("alias side target absent: %v", err)
+				}
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+					t.Fatal(err)
+				}
+				assertTestConverged(t, environment, subscriberDir, subscriberTree)
+			})
+		}
+	}
+}
+
+func TestLibrarySyncCasefoldAliasRelocationCrashMatrix(t *testing.T) {
+	longFallback := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
+		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("a", 13) + "/f"
+	cases := []struct{ relative, point string }{
+		{"base", "after_intent_commit"}, {"base", "after_action"}, {"base", "after_parent_sync"},
+		{"base", "after_completed"}, {longFallback, "after_completed"},
+	}
+	for _, test := range cases {
+		name := test.point + "/normal"
+		if test.relative == longFallback {
+			name = test.point + "/fallback"
+		}
+		t.Run(name, func(t *testing.T) {
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			publisherPath := filepath.Join(publisherTree, filepath.FromSlash(test.relative))
+			subscriberPath := filepath.Join(subscriberTree, filepath.FromSlash(test.relative))
+			if err := os.MkdirAll(filepath.Dir(publisherPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(publisherPath, []byte("base"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(publisherPath, []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			held, err := os.OpenFile(subscriberPath, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.ExtraFiles = []*os.File{held}
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT="+test.point,
+				"FILECLOUD_PUBLIC_CRASH_ROLE=casefold-alias-relocation")
+			assertProcessSIGKILL(t, command.Run())
+			var aliasPath string
+			if err := filepath.Walk(subscriberTree, func(path string, info os.FileInfo, err error) error {
+				if err == nil && info.Mode().IsRegular() {
+					data, readErr := os.ReadFile(path)
+					if readErr == nil && string(data) == "alias" {
+						aliasPath = path
+					}
+				}
+				return err
+			}); err != nil || aliasPath == "" {
+				t.Fatalf("find alias path=%q err=%v", aliasPath, err)
+			}
+			aliasBefore, err := os.Stat(aliasPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for attempt := 0; attempt < 3; attempt++ {
+				err = syncTestWorktree(t, subscriberDir, subscriberTree)
+				if err == nil {
+					break
+				}
+				if !strings.Contains(err.Error(), "rerun sync") {
+					t.Fatalf("restart %d: %v", attempt, err)
+				}
+			}
+			if err != nil {
+				t.Fatalf("alias relocation did not converge: %v", err)
+			}
+			moved := false
+			if err := filepath.Walk(subscriberTree, func(path string, info os.FileInfo, err error) error {
+				if err != nil || !info.Mode().IsRegular() || info.Sys().(*syscall.Stat_t).Ino != aliasBefore.Sys().(*syscall.Stat_t).Ino {
+					return err
+				}
+				data, readErr := os.ReadFile(path)
+				moved = readErr == nil && string(data) == "alias"
+				return readErr
+			}); err != nil || !moved {
+				t.Fatalf("moved alias inode/content absent: %v", err)
+			}
+			assertTestConverged(t, environment, subscriberDir, subscriberTree)
+		})
 	}
 }
 
@@ -5609,6 +6787,301 @@ func TestSyncUnstableScanDoesNotPublishOrChangeClientState(t *testing.T) {
 	head, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
 	if headErr != nil || head.CommitID == nil || *head.CommitID != before.SyncBase {
 		t.Fatalf("Head changed: head=%+v err=%v", head, headErr)
+	}
+}
+
+func TestPublicSyncFallbackLeafOrdinalExhaustionBeforePublication(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts, _ := newSyncPair(t)
+	source := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
+		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("a", 13) + "/f"
+	for _, root := range []string{publisherTree, subscriberTree} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, source)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, source), []byte("base"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	binding := readTestBinding(t, subscriberDir, subscriberTree)
+	if err := os.WriteFile(filepath.Join(publisherTree, source), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, source), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeTree := captureExactTree(t, subscriberTree)
+	beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	puts.Store(0)
+	occupied := make(map[string]bool, _conflictMaxOrdinal)
+	err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			fallbackOccupied: func(name string) bool {
+				occupied[name] = true
+				return len(occupied) <= _conflictMaxOrdinal
+			},
+		})
+	if err == nil || !strings.Contains(err.Error(), "fallback conflict collision sequence exhausted") || len(occupied) != _conflictMaxOrdinal {
+		t.Fatalf("leaf ordinal exhaustion error=%v", err)
+	}
+	assertExactTree(t, subscriberTree, beforeTree)
+	afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	if headErr != nil || beforeHead.ETag != afterHead.ETag || beforeHead.CommitID == nil || afterHead.CommitID == nil ||
+		*beforeHead.CommitID != *afterHead.CommitID || puts.Load() != 0 || readTestBinding(t, subscriberDir, subscriberTree) != binding ||
+		countClientRows(t, subscriberDir, "pending_publications", subscriberTree) != 0 {
+		t.Fatalf("leaf exhaustion changed state: puts=%d head=%+v/%+v", puts.Load(), beforeHead, afterHead)
+	}
+}
+
+func TestIssue19MissingPromotionAuthorityCacheMatrix(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+	command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1", "FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir,
+		"FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree, "FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase,
+		"FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename, "FILECLOUD_PUBLIC_CRASH_KIND=File",
+		"FILECLOUD_PUBLIC_CRASH_POINT=after_intent_commit", "FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+	assertProcessSIGKILL(t, command.Run())
+	beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+	db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkout, err := loadPendingCheckout(t.Context(), db, beforeBinding.ServerURL, testClientLibraryID, subscriberTree)
+	if err != nil || checkout == nil {
+		db.Close()
+		t.Fatalf("pending checkout=%+v err=%v", checkout, err)
+	}
+	cachePath := filepath.Join(subscriberDir, "objects", "commits", checkout.TargetCommit[:2], checkout.TargetCommit[2:])
+	if err := os.Remove(cachePath); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	beforeTree := captureExactTree(t, subscriberTree)
+	beforeRows := []int{countClientRows(t, subscriberDir, "pending_checkouts", subscriberTree), countClientRows(t, subscriberDir, "fs_actions", subscriberTree),
+		countClientRows(t, subscriberDir, "sync_recoveries", subscriberTree), countClientRows(t, subscriberDir, "sync_recovery_promotions", subscriberTree)}
+	root, err := openWorktreeRoot(subscriberTree, func(*os.File) error { return nil })
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	err = validatePendingPromotionTargets(t.Context(), db, subscriberTree)
+	if err == nil || !strings.Contains(err.Error(), "authoritative cached object is absent") {
+		root.Close()
+		db.Close()
+		t.Fatalf("offline recover validation error=%v", err)
+	}
+	if err := errors.Join(root.Close(), db.Close()); err != nil {
+		t.Fatal(err)
+	}
+	assertExactTree(t, subscriberTree, beforeTree)
+	if got := []int{countClientRows(t, subscriberDir, "pending_checkouts", subscriberTree), countClientRows(t, subscriberDir, "fs_actions", subscriberTree),
+		countClientRows(t, subscriberDir, "sync_recoveries", subscriberTree), countClientRows(t, subscriberDir, "sync_recovery_promotions", subscriberTree)}; !reflect.DeepEqual(got, beforeRows) {
+		t.Fatalf("offline recover changed rows: got=%v want=%v", got, beforeRows)
+	}
+	if err := runLibraryWithConfig(t.Context(), []string{"unbind", "--client-dir", subscriberDir, "--worktree", subscriberTree}, strings.NewReader(""), io.Discard, io.Discard,
+		libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}); err == nil || !strings.Contains(err.Error(), "authoritative cached object is absent") {
+		t.Fatalf("offline unbind error=%v", err)
+	}
+	assertExactTree(t, subscriberTree, beforeTree)
+	db, err = openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec("UPDATE bindings SET server_url=? WHERE worktree=?", "http://127.0.0.1:1", subscriberTree)
+	if closeErr := db.Close(); err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	err = syncTestWorktree(t, subscriberDir, subscriberTree)
+	if err == nil {
+		t.Fatal("offline sync accepted missing cache closure")
+	}
+	db, err = openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec("UPDATE bindings SET server_url=? WHERE worktree=?", beforeBinding.ServerURL, subscriberTree)
+	if closeErr := db.Close(); err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	assertExactTree(t, subscriberTree, beforeTree)
+	if got := []int{countClientRows(t, subscriberDir, "pending_checkouts", subscriberTree), countClientRows(t, subscriberDir, "fs_actions", subscriberTree),
+		countClientRows(t, subscriberDir, "sync_recoveries", subscriberTree), countClientRows(t, subscriberDir, "sync_recovery_promotions", subscriberTree)}; !reflect.DeepEqual(got, beforeRows) {
+		t.Fatalf("offline sync changed rows: got=%v want=%v", got, beforeRows)
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		err = syncTestWorktree(t, subscriberDir, subscriberTree)
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), "rerun sync") {
+			t.Fatalf("online rehydrate sync %d: %v", attempt, err)
+		}
+	}
+	if err != nil {
+		t.Fatalf("online rehydrate did not converge: %v", err)
+	}
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("online sync did not rehydrate required cache object: %v", err)
+	}
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+}
+
+func TestIssue19AuthoritativeReplayRejectsEqualContentCrossSourceSwap(t *testing.T) {
+	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	for _, root := range []string{publisherTree, subscriberTree} {
+		for _, name := range []string{"first", "second"} {
+			if err := os.WriteFile(filepath.Join(root, name), []byte("base-"+name), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"first", "second"} {
+		if err := os.WriteFile(filepath.Join(publisherTree, name), []byte("remote-"+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(subscriberTree, name), []byte("same-local"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+	command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1", "FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir,
+		"FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree, "FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase,
+		"FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename, "FILECLOUD_PUBLIC_CRASH_KIND=File",
+		"FILECLOUD_PUBLIC_CRASH_POINT=after_intent_commit", "FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+	assertProcessSIGKILL(t, command.Run())
+	beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+	beforeTree := captureExactTree(t, subscriberTree)
+	db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePendingPromotionTargets(t.Context(), db, subscriberTree); err != nil {
+		db.Close()
+		t.Fatalf("exact provenance replay=%v", err)
+	}
+	checkout, err := loadPendingCheckout(t.Context(), db, beforeBinding.ServerURL, testClientLibraryID, subscriberTree)
+	if err != nil || checkout == nil {
+		db.Close()
+		t.Fatalf("pending checkout=%+v err=%v", checkout, err)
+	}
+	promotions, err := _decodeConflictPromotions(checkout.ConflictPromotions)
+	if err != nil || len(promotions) != 2 || promotions[0].id != promotions[1].id || promotions[0].mtime != promotions[1].mtime || promotions[0].size != promotions[1].size {
+		db.Close()
+		t.Fatalf("equal-content promotions=%+v err=%v", promotions, err)
+	}
+	promotions[0].source, promotions[1].source = promotions[1].source, promotions[0].source
+	encoded, err := _encodeConflictPromotions(promotions)
+	if err == nil {
+		_, err = db.Exec("UPDATE pending_checkouts SET conflict_promotions=? WHERE worktree=?", encoded, subscriberTree)
+	}
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	beforeRows := []int{countClientRows(t, subscriberDir, "pending_checkouts", subscriberTree), countClientRows(t, subscriberDir, "fs_actions", subscriberTree),
+		countClientRows(t, subscriberDir, "sync_recoveries", subscriberTree), countClientRows(t, subscriberDir, "sync_recovery_promotions", subscriberTree)}
+	err = validatePendingPromotionTargets(t.Context(), db, subscriberTree)
+	if closeErr := db.Close(); err == nil || closeErr != nil || !strings.Contains(err.Error(), "does not match authoritative Candidate replay") {
+		t.Fatalf("cross-source swap replay=%v close=%v", err, closeErr)
+	}
+	assertExactTree(t, subscriberTree, beforeTree)
+	if readTestBinding(t, subscriberDir, subscriberTree) != beforeBinding {
+		t.Fatal("cross-source swap changed binding")
+	}
+	if got := []int{countClientRows(t, subscriberDir, "pending_checkouts", subscriberTree), countClientRows(t, subscriberDir, "fs_actions", subscriberTree),
+		countClientRows(t, subscriberDir, "sync_recoveries", subscriberTree), countClientRows(t, subscriberDir, "sync_recovery_promotions", subscriberTree)}; !reflect.DeepEqual(got, beforeRows) {
+		t.Fatalf("cross-source swap changed rows: got=%v want=%v", got, beforeRows)
+	}
+}
+
+func TestPublicSyncFallbackRootOrdinalExhaustionBeforePublication(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts, _ := newSyncPair(t)
+	source := "x." + strings.Repeat("a", 190)
+	if err := os.WriteFile(filepath.Join(publisherTree, source), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testOtherDeviceID, CreatedAt: "2026-08-09T12:00:00Z"}
+	occupied := make([]string, 0, 9)
+	for range 9 {
+		name, err := _conflictCopyName(source, "", seed, occupied)
+		if err != nil {
+			t.Fatal(err)
+		}
+		occupied = append(occupied, name)
+		if err := os.WriteFile(filepath.Join(subscriberTree, name), []byte("occupied"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for ordinal := 1; ordinal <= _conflictMaxOrdinal; ordinal++ {
+		name := _fallbackConflictRoot
+		if ordinal > 1 {
+			name += " " + strconv.Itoa(ordinal)
+		}
+		if err := os.WriteFile(filepath.Join(subscriberTree, name), []byte("occupied"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(publisherTree, source), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, source), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeBinding, beforeRoot := readTestBinding(t, subscriberDir, subscriberTree), scanTestRoot(t, subscriberTree)
+	beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	puts.Store(0)
+	err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			now: func() time.Time { return time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC) }})
+	if err == nil || !strings.Contains(err.Error(), "fallback conflict root collision sequence exhausted") {
+		t.Fatalf("root ordinal exhaustion error=%v", err)
+	}
+	afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	if headErr != nil || beforeHead.ETag != afterHead.ETag || beforeHead.CommitID == nil || afterHead.CommitID == nil ||
+		*beforeHead.CommitID != *afterHead.CommitID || puts.Load() != 0 || readTestBinding(t, subscriberDir, subscriberTree) != beforeBinding ||
+		scanTestRoot(t, subscriberTree) != beforeRoot || countClientRows(t, subscriberDir, "pending_publications", subscriberTree) != 0 {
+		t.Fatalf("root exhaustion changed state: puts=%d head=%+v/%+v", puts.Load(), beforeHead, afterHead)
 	}
 }
 

@@ -232,17 +232,19 @@ stateDiagram-v2
 | 修改/新增 | 删除 | 原路径遵循 Remote 删除，Local 写冲突副本 |
 | 删除 | 删除 | 删除 |
 
-冲突名格式固定为 `<stem> (Filecloud conflict <DeviceId前8位小写十六进制> <YYYYMMDDTHHMMSSZ>)<ext>`，时间取本地候选 Commit 的 `CreatedAt`。若碰撞，追加 ` 2`、` 3`。每次追加后都重新执行 Unicode、段长和总路径检查。Issue #19 实现前不截短 stem，也不回退到资料库根冲突目录；任何溢出在 pending 与上传前明确失败。冲突副本也进入合并 Commit，因此会同步到其他设备。
+冲突名格式固定为 `<truncated-stem> (Filecloud conflict <DeviceId前8位小写十六进制> <YYYYMMDDTHHMMSSZ>)[ <n>]<ext>`，`n=1` 省略数字，`n>=2` 使用十进制。输入先转 NFC，扩展名沿用最后一个非首位 `.` 的语义；marker、后缀和扩展名不截短，每个 ordinal 都按 UTF-8 边界重新预算 stem，并同时满足 240-byte 段和 1024-byte 路径限制。冲突副本进入合并 Commit，因此会同步到其他设备。
 
 mtime 规则：只有一侧路径状态改变时采用该侧；双方 FileId 或 DirectoryId 相同而只有 mtime 不同时采用字典序较大的规范 UTC 时间；双方内容冲突时原路径和冲突副本各保留各自 mtime。递归合并目录后，仅结果 DirectoryId 只等于单独一侧时采用该侧 mtime；结果同时等于两侧或产生新 DirectoryId 时采用 Local/Remote 规范 mtime 中字典序较大的值。目录 mtime 在全部子项 checkout 后最后设置。该规则不依赖本地时钟正确性，只要求确定性。
 
-当前递归合并按规范字节顺序处理名称集合，目录即使双方 DirectoryId 都变化也按名称递归；双方新建目录以空目录为 Base。双方文件 ID 相同而仅 mtime 不同时取较大规范时间；双方同路径 FileId 不同时保留 Remote 原路径，并按本地父 Commit 的规范 DeviceId、CreatedAt 生成 Local 冲突副本。初次合并使用 Captured Commit，连续 HeadConflict 使用旧 Candidate；新结果 Candidate 永不作为自身命名输入。新建或重建目录 entry 的 mtime 取两侧较大值，完整复用一侧 entry 时保留该侧 mtime。遍历限制为目录深 256、路径 1024 bytes，并共享有界对象/entry 工作预算；缓存和远端对象每次按规范内容与 ID 验证。
+当前递归合并按规范字节顺序处理名称集合，目录即使双方 DirectoryId 都变化也按名称递归；双方新建目录以空目录为 Base。双方文件 ID 相同而仅 mtime 不同时取较大规范时间；双方同路径 FileId 不同时保留 Remote 原路径，并按本地父 Commit 的规范 DeviceId、CreatedAt 生成 Local 冲突副本。`NamingSeedCommitId` 是新 merge Commit 的第二 parent，必须是完整 64 位小写 hex；初次合并使用 Captured Commit，连续 HeadConflict 使用旧 Candidate，名称需要短 seed 时只取前 12 位。新结果 Candidate 永不作为自身命名输入，重放必须携带已验证 seed Commit 及其 ID。新建或重建目录 entry 的 mtime 取两侧较大值，完整复用一侧 entry 时保留该侧 mtime。遍历限制为目录深 256、路径 1024 bytes，并共享有界对象/entry 工作预算；缓存和远端对象每次按规范内容与 ID 验证。
 
 删除与修改、目录删除与子树修改以及文件/目录类型冲突按同一三方规则处理：Remote 决定原路径，Local 的不同完整对象或子树使用确定冲突名；Local 删除而 Remote 修改时只保留 Remote，双方删除时路径消失。双方 FileId 相同但 mtime 不同时只保留一项并取较大规范时间；双方 Directory 始终递归，Base 不是 Directory 时以规范空目录作为递归 Base。结构目录副本通过前缀重映射其全部捕获文件 lineage，目录和空目录由 Candidate 路径及 mtime 重建，不增加 Directory promotion 或持久化 schema。重复同步已收敛树时不再生成冲突副本。重命名仍仅由树差异表现为删除加新增，不做 rename 检测。
 
-同目录出现大小写折叠或规范名称碰撞仍作为结构边界失败。Issue #19 完成前，冲突名超过 240 bytes 或完整路径超过 1024 bytes 时返回明确边界，不截短、不创建根回退目录，也不保存 pending 或上传对象。
+同目录出现大小写折叠或规范名称碰撞仍作为结构边界失败。若原父路径连完整冲突 marker 都无法容纳，递归阶段只收集请求并先完成正常根合并；第二阶段按 source 规范路径字节排序，把 Local 完整对象插入根冲突目录。根目录依次尝试 exact NFC `Filecloud Conflicts`、`Filecloud Conflicts 2` 至 `9999`：exact Directory 可复用并保留原项，exact 非 Directory 或只有 case-fold alias 时跳到下一项。fallback leaf 为 `<NamingSeedCommitId前12位>-<truncated-original-NFC-leaf> (Filecloud conflict <n>)>`，`n` 从 1 起始且始终显式存在，不保留特殊扩展名语义。每次分配更新 exact/case-fold occupancy；目录请求保留完整子树并做 lineage prefix remap。fallback 根 entry mtime 取旧 entry 与全部插入 Local mtime 的最大值。任一 root/leaf ordinal 或预算耗尽都在 pending、PUT、CAS 前失败。
 
-合并 Candidate checkout 时，捕获的本地冲突文件从内部 recovery 直接以 journaled no-replace rename 提升到 Candidate 的固定冲突路径，保留 inode 和旧文件描述符身份。promotion 后再次变化的同一 inode 被提升到下一个确定后缀，固定 Candidate 路径从不可变对象恢复；Sync Base 只推进到固定 Candidate，并明确要求下一轮同步发布 late 可见副本。跨父 rename 的源父身份记录在 `fs_actions`，目标父身份取同一 checkout 的耐久 `checkout_paths`，两侧父目录均在 Completed 前同步。结构目录冲突复用相同的逐文件 promotion；进程崩溃测试覆盖 Intent、rename、父目录同步和 Completed 的耐久阶段，仅声明 Linux 进程崩溃恢复，不声明断电或 APFS/NTFS 语义。
+协议 mtime 唯一形式是 UTC 整秒 `2006-01-02T15:04:05Z`；格式化先转 UTC 并 truncate 到秒，解析只接受 exact round-trip。扫描始终完整哈希内容，因此同一整秒内的文件系统亚秒差异不改变 DirectoryId/CommitId，而保留 mtime 的字节变化仍改变 FileId。rollback root 的原始纳秒是实际文件系统恢复证据，不进入协议 mtime helper。
+
+合并 Candidate checkout 时，捕获的本地冲突文件从内部 recovery 直接以 journaled no-replace rename 提升到 Candidate 的固定冲突路径，保留 inode 和旧文件描述符身份。promotion 后再次变化的同一 inode 被提升到下一个确定后缀，固定 Candidate 路径从不可变对象恢复；Sync Base 只推进到固定 Candidate，并明确要求下一轮同步发布 late 可见副本。跨父 rename 的源父身份记录在 `fs_actions`；目标父属于固定 Candidate 时取同一 checkout 的耐久 `checkout_paths`，运行时切换到根 fallback 时则在 promotion action 中以严格规范编码固定目标父身份。缺失的 fallback 根由绑定到 promotion root 的可见 `create_directory` journal 动作创建；exact Directory 可复用，exact 非 Directory 或 case-fold alias 只推进 ordinal，不收养或覆盖。两侧父目录均在 Completed 前同步。结构目录冲突复用相同的逐文件 promotion；进程崩溃测试覆盖 root create、Intent、跨父 rename、父目录同步和 Completed 的耐久阶段，仅声明 Linux 进程崩溃恢复，不声明断电或 APFS/NTFS 语义。
 
 ## 路径规则
 

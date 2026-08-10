@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestScanRegularFileRetriesConcurrentRewrite(t *testing.T) {
@@ -144,6 +145,44 @@ func TestScanFinalValidationUsesCTimeWhenMTimeRestored(t *testing.T) {
 	var unstable *unstableWorktreeError
 	if !errors.As(err, &unstable) || !strings.Contains(err.Error(), "final validation") {
 		t.Fatalf("mtime-restored rewrite error=%v", err)
+	}
+}
+
+func TestScanCanonicalMtimeIgnoresSubsecondPrecisionButNotContent(t *testing.T) {
+	root, path := newScannerTestRoot(t, map[string]string{"file": "aaaa"})
+	second := time.Date(2026, 2, 3, 4, 5, 6, 100_000_000, time.UTC)
+	if err := os.Chtimes(path("file"), second, second); err != nil {
+		t.Fatal(err)
+	}
+	first, err := scanWorktree(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	laterNano := second.Add(800 * time.Millisecond)
+	if err := os.Chtimes(path("file"), laterNano, laterNano); err != nil {
+		t.Fatal(err)
+	}
+	secondScan, err := scanWorktree(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.root != secondScan.root || len(first.objects) != len(secondScan.objects) {
+		t.Fatalf("subsecond-only change root=%s/%s objects=%d/%d", first.root, secondScan.root,
+			len(first.objects), len(secondScan.objects))
+	}
+	if err := os.WriteFile(path("file"), []byte("bbbb"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path("file"), laterNano, laterNano); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := scanWorktree(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.root == secondScan.root || changed.paths[0].id == secondScan.paths[0].id || changed.paths[0].mtime != secondScan.paths[0].mtime {
+		t.Fatalf("content-preserving-mtime root=%s/%s file=%s/%s mtime=%s/%s", changed.root, secondScan.root,
+			changed.paths[0].id, secondScan.paths[0].id, changed.paths[0].mtime, secondScan.paths[0].mtime)
 	}
 }
 
