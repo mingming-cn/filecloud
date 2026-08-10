@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,17 +20,147 @@ import (
 
 	"github.com/mingming-cn/filecloud/internal/object"
 	"golang.org/x/sys/unix"
+	"golang.org/x/text/cases"
 )
 
 const (
-	checkoutTempPrefix     = ".filecloud-internal-checkout-"
-	checkoutTempRandomSize = 16
+	checkoutTempPrefix          = ".filecloud-internal-checkout-"
+	checkoutTempRandomSize      = 16
+	_maxConflictPromotionsBytes = 32 << 20
 )
+
+var _emptyConflictPromotions = []byte{'F', 'C', 'P', '1', 0, 0, 0, 0}
 
 type checkoutPath struct {
 	path, kind, id, mtime string
 	size                  int64
 	device, inode         uint64
+}
+
+func _validConflictPromotionPath(path string) bool {
+	if path == "" || len(path) > _mergeMaxPath || !validateFSRelativeParent(path) {
+		return false
+	}
+	for _, component := range strings.Split(path, "/") {
+		if !validRecoveryVisibleName(component) {
+			return false
+		}
+	}
+	return true
+}
+
+func _validateConflictPromotions(values []_conflictPromotion) error {
+	sources := make(map[string]bool, len(values))
+	targets := make(map[string]bool, len(values))
+	for _, value := range values {
+		if !_validConflictPromotionPath(value.source) || !_validConflictPromotionPath(value.target) ||
+			value.source == value.target || !object.ValidID(value.id) || value.size < 0 {
+			return errors.New("conflict provenance contains invalid fields")
+		}
+		parsed, err := time.Parse("2006-01-02T15:04:05Z", value.mtime)
+		if err != nil || parsed.Format("2006-01-02T15:04:05Z") != value.mtime {
+			return errors.New("conflict provenance contains invalid mtime")
+		}
+		source, target := cases.Fold().String(value.source), cases.Fold().String(value.target)
+		if sources[source] || targets[target] {
+			return errors.New("conflict provenance contains duplicate source or target paths")
+		}
+		sources[source], targets[target] = true, true
+	}
+	return nil
+}
+
+func _encodeConflictPromotions(values []_conflictPromotion) ([]byte, error) {
+	if len(values) > _mergeMaxObjects {
+		return nil, errors.New("conflict provenance exceeds synchronization budget")
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].source < values[j].source })
+	if err := _validateConflictPromotions(values); err != nil {
+		return nil, err
+	}
+	size := 8
+	for _, value := range values {
+		for _, field := range []string{value.source, value.target, value.id, value.mtime} {
+			if len(field) > 65535 || size > _maxConflictPromotionsBytes-2-len(field) {
+				return nil, errors.New("conflict provenance exceeds synchronization budget")
+			}
+			size += 2 + len(field)
+		}
+		if size > _maxConflictPromotionsBytes-8 {
+			return nil, errors.New("conflict provenance exceeds synchronization budget")
+		}
+		size += 8
+	}
+	result := make([]byte, size)
+	copy(result, _emptyConflictPromotions[:4])
+	binary.BigEndian.PutUint32(result[4:8], uint32(len(values)))
+	offset := 8
+	for _, value := range values {
+		for _, field := range []string{value.source, value.target, value.id, value.mtime} {
+			binary.BigEndian.PutUint16(result[offset:offset+2], uint16(len(field)))
+			offset += 2
+			copy(result[offset:], field)
+			offset += len(field)
+		}
+		binary.BigEndian.PutUint64(result[offset:offset+8], uint64(value.size))
+		offset += 8
+	}
+	return result, nil
+}
+
+func _decodeConflictPromotions(data []byte) ([]_conflictPromotion, error) {
+	if len(data) < 8 || len(data) > _maxConflictPromotionsBytes || !bytes.Equal(data[:4], _emptyConflictPromotions[:4]) {
+		return nil, errors.New("conflict provenance has an invalid encoding")
+	}
+	count := binary.BigEndian.Uint32(data[4:8])
+	if count > _mergeMaxObjects {
+		return nil, errors.New("conflict provenance exceeds synchronization budget")
+	}
+	values := make([]_conflictPromotion, 0, int(count))
+	offset := 8
+	for range count {
+		fields := make([]string, 4)
+		for index := range fields {
+			if len(data)-offset < 2 {
+				return nil, errors.New("conflict provenance is truncated")
+			}
+			size := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+			offset += 2
+			if size == 0 || size > len(data)-offset {
+				return nil, errors.New("conflict provenance contains an invalid field length")
+			}
+			fields[index] = string(data[offset : offset+size])
+			offset += size
+		}
+		if len(data)-offset < 8 {
+			return nil, errors.New("conflict provenance is truncated")
+		}
+		values = append(values, _conflictPromotion{source: fields[0], target: fields[1], id: fields[2],
+			mtime: fields[3], size: int64(binary.BigEndian.Uint64(data[offset : offset+8]))})
+		offset += 8
+	}
+	if offset != len(data) {
+		return nil, errors.New("conflict provenance has trailing data")
+	}
+	canonical, err := _encodeConflictPromotions(append([]_conflictPromotion(nil), values...))
+	if err != nil || !bytes.Equal(canonical, data) {
+		return nil, errors.Join(errors.New("conflict provenance is not canonical"), err)
+	}
+	return values, nil
+}
+
+func _validatePromotionTargets(values []_conflictPromotion, paths []checkoutPath) error {
+	targets := make(map[string]checkoutPath, len(paths))
+	for _, path := range paths {
+		targets[path.path] = path
+	}
+	for _, value := range values {
+		target, ok := targets[value.target]
+		if !ok || target.kind != "File" || target.id != value.id || target.mtime != value.mtime || target.size != value.size {
+			return fmt.Errorf("conflict provenance target %q does not match Candidate content", value.target)
+		}
+	}
+	return nil
 }
 
 func resumableBindExists(ctx context.Context, clientDir, worktree string) (bool, error) {
@@ -52,23 +184,80 @@ func resumableBindExists(ctx context.Context, clientDir, worktree string) (bool,
 	return count != 0, nil
 }
 
-func loadPendingCheckout(ctx context.Context, db *sql.DB, serverURL, libraryID, worktree string) (*pendingCheckout, error) {
-	var value pendingCheckout
-	err := db.QueryRowContext(ctx, `SELECT server_url, library_id, worktree, user_id, device_id,
-		target_commit, target_root, head_etag, apply_state FROM pending_checkouts
-		WHERE worktree = ? OR (server_url = ? AND library_id = ?) LIMIT 1`, worktree, serverURL, libraryID).Scan(
-		&value.ServerURL, &value.LibraryID, &value.Worktree, &value.UserID, &value.DeviceID,
-		&value.TargetCommit, &value.TargetRoot, &value.HeadETag, &value.ApplyState)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+type pendingCheckoutQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func validatePendingCheckoutRootMtime(state string, mtimeNS, valid int64) error {
+	if (valid != 0 && valid != 1) || (valid == 0 && mtimeNS != 0) ||
+		(state == "pending" && valid != 0) ||
+		((state == "applying" || state == "rolling_back" || state == "finalized") && valid != 1) ||
+		(state != "pending" && state != "applying" && state != "rolling_back" && state != "finalized") {
+		return errors.New("pending checkout state is corrupt")
 	}
+	return nil
+}
+
+func validatePendingCheckoutState(ctx context.Context, db pendingCheckoutQueryer, worktree string) error {
+	rows, err := db.QueryContext(ctx, `SELECT apply_state,rollback_root_mtime_ns,rollback_root_mtime_valid
+		FROM pending_checkouts WHERE worktree=?`, worktree)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return rows.Err()
+	}
+	var state string
+	var mtimeNS, valid int64
+	if err := rows.Scan(&state, &mtimeNS, &valid); err != nil || rows.Next() {
+		return errors.New("pending checkout state is corrupt")
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return validatePendingCheckoutRootMtime(state, mtimeNS, valid)
+}
+
+func loadPendingCheckoutWith(ctx context.Context, db pendingCheckoutQueryer, serverURL, libraryID, worktree string) (*pendingCheckout, error) {
+	rows, err := db.QueryContext(ctx, `SELECT server_url, library_id, worktree, user_id, device_id,
+		target_commit, target_root, head_etag, apply_state, length(conflict_promotions),
+		CASE WHEN length(conflict_promotions) BETWEEN 8 AND 33554432 THEN conflict_promotions END,
+		rollback_root_mtime_ns, rollback_root_mtime_valid FROM pending_checkouts
+		WHERE worktree = ? OR (server_url = ? AND library_id = ?) LIMIT 1`, worktree, serverURL, libraryID)
 	if err != nil {
 		return nil, fmt.Errorf("read pending checkout: %w", err)
 	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	var value pendingCheckout
+	var promotionLength int
+	var mtimeValid int64
+	if err := rows.Scan(&value.ServerURL, &value.LibraryID, &value.Worktree, &value.UserID, &value.DeviceID,
+		&value.TargetCommit, &value.TargetRoot, &value.HeadETag, &value.ApplyState, &promotionLength, &value.ConflictPromotions,
+		&value.RollbackRootMtimeNS, &mtimeValid); err != nil {
+		return nil, fmt.Errorf("read pending checkout: %w", err)
+	}
+	if err := validatePendingCheckoutRootMtime(value.ApplyState, value.RollbackRootMtimeNS, mtimeValid); err != nil {
+		return nil, err
+	}
+	value.RollbackRootMtimeValid = mtimeValid == 1
 	if value.ServerURL != serverURL || value.LibraryID != libraryID || value.Worktree != worktree {
 		return nil, errors.New("pending checkout conflicts with this worktree or library")
 	}
+	if promotionLength != len(value.ConflictPromotions) {
+		return nil, errors.New("pending checkout conflict provenance exceeds synchronization budget")
+	}
+	if _, err := _decodeConflictPromotions(value.ConflictPromotions); err != nil {
+		return nil, fmt.Errorf("read pending checkout conflict provenance: %w", err)
+	}
 	return &value, nil
+}
+
+func loadPendingCheckout(ctx context.Context, db *sql.DB, serverURL, libraryID, worktree string) (*pendingCheckout, error) {
+	return loadPendingCheckoutWith(ctx, db, serverURL, libraryID, worktree)
 }
 
 func savePendingCheckout(ctx context.Context, db *sql.DB, value pendingCheckout) error {
@@ -76,9 +265,17 @@ func savePendingCheckout(ctx context.Context, db *sql.DB, value pendingCheckout)
 	if state == "" {
 		state = "pending"
 	}
+	if len(value.ConflictPromotions) == 0 {
+		value.ConflictPromotions = _emptyConflictPromotions
+	}
+	if _, err := _decodeConflictPromotions(value.ConflictPromotions); err != nil {
+		return fmt.Errorf("save pending checkout conflict provenance: %w", err)
+	}
 	_, err := db.ExecContext(ctx, `INSERT INTO pending_checkouts(server_url, library_id, worktree, user_id, device_id,
-		target_commit, target_root, head_etag, apply_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.ServerURL,
-		value.LibraryID, value.Worktree, value.UserID, value.DeviceID, value.TargetCommit, value.TargetRoot, value.HeadETag, state)
+		target_commit, target_root, head_etag, apply_state, conflict_promotions, rollback_root_mtime_ns, rollback_root_mtime_valid)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.ServerURL, value.LibraryID, value.Worktree, value.UserID, value.DeviceID,
+		value.TargetCommit, value.TargetRoot, value.HeadETag, state, value.ConflictPromotions,
+		value.RollbackRootMtimeNS, value.RollbackRootMtimeValid)
 	if err != nil {
 		return fmt.Errorf("save pending checkout: %w", err)
 	}
@@ -505,6 +702,14 @@ func saveCheckoutPaths(ctx context.Context, db *sql.DB, worktree string, paths [
 }
 
 func materializeCheckout(ctx context.Context, db *sql.DB, options bindOptions, paths []checkoutPath, config libraryClientConfig) error {
+	if err := materializeCheckoutDirectories(ctx, db, options, paths, config); err != nil {
+		return err
+	}
+	return materializeCheckoutFiles(ctx, db, options, paths, config)
+}
+
+func materializeCheckoutDirectories(ctx context.Context, db *sql.DB, options bindOptions, paths []checkoutPath,
+	config libraryClientConfig) error {
 	for _, value := range paths {
 		if value.kind == "Directory" {
 			if err := installCheckoutDirectory(ctx, db, options, value, config); err != nil {
@@ -512,6 +717,11 @@ func materializeCheckout(ctx context.Context, db *sql.DB, options bindOptions, p
 			}
 		}
 	}
+	return nil
+}
+
+func materializeCheckoutFiles(ctx context.Context, db *sql.DB, options bindOptions, paths []checkoutPath,
+	config libraryClientConfig) error {
 	for _, value := range paths {
 		if value.kind == "File" {
 			if err := installCheckoutFile(ctx, db, options, value, config); err != nil {
@@ -872,12 +1082,12 @@ func setCheckoutMtime(ctx context.Context, db *sql.DB, options bindOptions, valu
 }
 
 func setOpenFileMtime(file *os.File, value string) error {
-	parsed, err := time.Parse("2006-01-02T15:04:05Z", value)
+	parsed, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
 		return err
 	}
-	timeval := unix.NsecToTimeval(parsed.UnixNano())
-	if err := unix.Futimes(int(file.Fd()), []unix.Timeval{timeval, timeval}); err != nil {
+	timestamp := unix.NsecToTimespec(parsed.UnixNano())
+	if err := unix.UtimesNanoAt(int(file.Fd()), "", []unix.Timespec{timestamp, timestamp}, unix.AT_EMPTY_PATH); err != nil {
 		return fmt.Errorf("set checkout mtime: %w", err)
 	}
 	return nil

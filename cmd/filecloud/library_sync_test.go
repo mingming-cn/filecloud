@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -170,7 +172,7 @@ func TestLibrarySyncMergesBothSidesChanged(t *testing.T) {
 	}
 }
 
-func TestLibrarySyncConflictBoundaryPreservesExistingPending(t *testing.T) {
+func TestLibrarySyncExistingPendingCreatesConflictCopy(t *testing.T) {
 	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts, _ := newSyncPair(t)
 	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
 		t.Fatal(err)
@@ -182,8 +184,6 @@ func TestLibrarySyncConflictBoundaryPreservesExistingPending(t *testing.T) {
 		t.Fatal("initial pending publication unexpectedly completed")
 	}
 	beforePending := readTestPendingPublication(t, subscriberDir, subscriberTree)
-	beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
-	beforeRoot := scanTestRoot(t, subscriberTree)
 	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -196,17 +196,21 @@ func TestLibrarySyncConflictBoundaryPreservesExistingPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	puts.Store(0)
-	err = syncTestWorktree(t, subscriberDir, subscriberTree)
-	if err == nil || !strings.Contains(err.Error(), "Issue #17") {
-		t.Fatalf("replacement boundary error=%v", err)
+	if err = syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
 	}
 	afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
 		[]byte(environment.token))
-	if afterPending := readTestPendingPublication(t, subscriberDir, subscriberTree); !reflect.DeepEqual(afterPending, beforePending) ||
-		readTestBinding(t, subscriberDir, subscriberTree) != beforeBinding || scanTestRoot(t, subscriberTree) != beforeRoot ||
-		puts.Load() != 0 || headErr != nil || beforeHead.CommitID == nil || afterHead.CommitID == nil ||
-		*beforeHead.CommitID != *afterHead.CommitID || beforeHead.ETag != afterHead.ETag {
-		t.Fatalf("replacement boundary changed state: pending=%+v head=%+v err=%v puts=%d", afterPending, afterHead, headErr, puts.Load())
+	matches, globErr := filepath.Glob(filepath.Join(subscriberTree, "base (Filecloud conflict *)"))
+	if headErr != nil || globErr != nil || beforeHead.CommitID == nil || afterHead.CommitID == nil ||
+		*beforeHead.CommitID == *afterHead.CommitID || len(matches) != 1 || puts.Load() == 0 ||
+		countClientRows(t, subscriberDir, "pending_publications", subscriberTree) != 0 {
+		t.Fatalf("replacement did not publish conflict: head=%+v err=%v matches=%v puts=%d", afterHead, headErr, matches, puts.Load())
+	}
+	commit, verifyErr := getRemoteCommit(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+		[]byte(environment.token), *afterHead.CommitID)
+	if verifyErr != nil || len(commit.Parents) != 2 || commit.Parents[1] != beforePending.CandidateCommit {
+		t.Fatalf("replacement parents=%v verify=%v", commit.Parents, verifyErr)
 	}
 }
 
@@ -304,7 +308,7 @@ func TestLibrarySyncMigratesV20TrivialMergePending(t *testing.T) {
 				t.Fatal(err)
 			}
 			if _, err := db.Exec(`DROP TABLE pending_publications;
-				DELETE FROM client_schema_migrations WHERE version=21`); err != nil {
+				DELETE FROM client_schema_migrations WHERE version IN (21,22)`); err != nil {
 				db.Close()
 				t.Fatal(err)
 			}
@@ -786,15 +790,19 @@ func TestLibrarySyncProtectedRecursiveMergeSurvivesRepeatedHeadAdvances(t *testi
 }
 
 func TestRecursiveMergeReplayUsesCumulativePathBudget(t *testing.T) {
-	data, id, err := canonicalDirectory("", []scanEntry{{name: "a", kind: "File", id: strings.Repeat("0", 64),
+	fileData, fileID, err := canonicalFile("a", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, id, err := canonicalDirectory("", []scanEntry{{name: "a", kind: "File", id: fileID,
 		modified: "2026-08-10T00:00:00Z"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	budget := &_replayBudget{commitLimit: 10, treeLimit: 10, pathLimit: 1, commits: make(map[string]object.Commit),
 		walked: make(map[string]bool)}
-	merger := &_treeMerger{ctx: t.Context(), directories: map[string][]byte{id: data}, synthesized: make(map[string][]byte),
-		active: make(map[string]bool), seen: make(map[string]bool), budget: budget}
+	merger := &_treeMerger{ctx: t.Context(), directories: map[string][]byte{id: data}, files: map[string][]byte{fileID: fileData},
+		synthesized: make(map[string][]byte), active: make(map[string]bool), seen: make(map[string]bool), budget: budget}
 	if paths, err := merger.paths(id, "", 0); err != nil || len(paths) != 1 {
 		t.Fatalf("first bounded traversal paths=%d err=%v", len(paths), err)
 	}
@@ -974,15 +982,1723 @@ func TestRecursiveMergeDirectoryMtimeFollowsMergedContent(t *testing.T) {
 	}
 }
 
+func TestConflictCopyName(t *testing.T) {
+	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID, CreatedAt: "2025-02-03T04:05:06Z"}
+	for _, test := range []struct {
+		name, leaf, want string
+	}{
+		{"no extension", "notes", "notes (Filecloud conflict aaaaaaaa 20250203T040506Z)"},
+		{"dotfile", ".env", ".env (Filecloud conflict aaaaaaaa 20250203T040506Z)"},
+		{"last extension", "archive.tar.gz", "archive.tar (Filecloud conflict aaaaaaaa 20250203T040506Z).gz"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := _conflictCopyName(test.leaf, "", seed, nil)
+			if err != nil || got != test.want {
+				t.Fatalf("name=%q err=%v, want %q", got, err, test.want)
+			}
+		})
+	}
+	occupied := []string{"notes (Filecloud conflict aaaaaaaa 20250203T040506Z)",
+		"NOTES (FILECLOUD CONFLICT AAAAAAAA 20250203T040506Z) 2"}
+	if got, err := _conflictCopyName("notes", "", seed, occupied); err != nil ||
+		got != "notes (Filecloud conflict aaaaaaaa 20250203T040506Z) 3" {
+		t.Fatalf("collision name=%q err=%v", got, err)
+	}
+}
+
+func TestRootPromotionTargetValidation(t *testing.T) {
+	expected := "nested/base (Filecloud conflict aaaaaaaa 20250203T040506Z).txt"
+	second, err := nextConflictChainPath(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := nextConflictChainPath(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{expected, second, third} {
+		if err := validateRootPromotionTarget(expected, target); err != nil {
+			t.Fatalf("valid target %q: %v", target, err)
+		}
+	}
+	for name, target := range map[string]string{
+		"arbitrary prefix":         "nested/copy-" + strings.TrimPrefix(expected, "nested/"),
+		"lookalike":                strings.Replace(expected, "Filecloud conflict", "Filecloud conflict-copy", 1),
+		"wrong parent":             strings.TrimPrefix(expected, "nested/"),
+		"alternate seed":           strings.Replace(expected, "aaaaaaaa", "bbbbbbbb", 1),
+		"alternate timestamp":      strings.Replace(expected, "20250203T040506Z", "20250203T040507Z", 1),
+		"alternate extension":      strings.TrimSuffix(expected, ".txt") + ".bin",
+		"malformed skipped suffix": strings.TrimSuffix(expected, ".txt") + " 2 4.txt",
+		"casefold alias":           strings.ToUpper(expected),
+		"normalized alias":         strings.Replace(expected, "base", "basee\u0301", 1),
+		"outside parent":           "../" + expected,
+		"path overflow":            strings.Repeat("p/", 500) + second,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateRootPromotionTarget(expected, target); err == nil {
+				t.Fatalf("invalid root target %q was accepted", target)
+			}
+		})
+	}
+}
+
+func TestRecursiveMergeConflictProvenanceIgnoresLegalContentAmbiguity(t *testing.T) {
+	makeDirectory := func(entries ...scanEntry) ([]byte, string) {
+		t.Helper()
+		data, id, err := canonicalDirectory("", entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data, id
+	}
+	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID,
+		CreatedAt: "2025-02-03T04:05:06Z"}
+	conflict := "base (Filecloud conflict aaaaaaaa 20250203T040506Z)"
+	baseData, baseID := makeDirectory(
+		scanEntry{name: "base", kind: "File", id: strings.Repeat("1", 64), modified: "2025-01-01T00:00:00Z"},
+		scanEntry{name: conflict, kind: "File", id: strings.Repeat("2", 64), modified: "2025-01-02T00:00:00Z"})
+	localData, localID := makeDirectory(
+		scanEntry{name: "base", kind: "File", id: strings.Repeat("2", 64), modified: "2025-01-02T00:00:00Z"},
+		scanEntry{name: conflict, kind: "File", id: strings.Repeat("2", 64), modified: "2025-01-02T00:00:00Z"})
+	remoteData, remoteID := makeDirectory(
+		scanEntry{name: "base", kind: "File", id: strings.Repeat("3", 64), modified: "2025-01-03T00:00:00Z"},
+		scanEntry{name: conflict, kind: "File", id: strings.Repeat("2", 64), modified: "2025-01-02T00:00:00Z"})
+	lineage := map[string]_conflictPromotion{
+		"base":   {source: "base", target: "base", id: strings.Repeat("2", 64), mtime: "2025-01-02T00:00:00Z", size: 5},
+		conflict: {source: conflict, target: conflict, id: strings.Repeat("2", 64), mtime: "2025-01-02T00:00:00Z", size: 5},
+	}
+	merger := &_treeMerger{directories: map[string][]byte{baseID: baseData, localID: localData, remoteID: remoteData},
+		synthesized: make(map[string][]byte), active: make(map[string]bool), seen: make(map[string]bool),
+		budget: _newReplayBudget(), localSeed: seed, lineage: lineage}
+	if _, err := merger.merge(baseID, localID, remoteID, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	promotions := _movedConflictPromotions(lineage)
+	want := conflict + " 2"
+	if len(promotions) != 1 || promotions[0].source != "base" || promotions[0].target != want {
+		t.Fatalf("conflict promotions=%+v, want base -> %q", promotions, want)
+	}
+	encoded, err := _encodeConflictPromotions(promotions)
+	decoded, decodeErr := _decodeConflictPromotions(encoded)
+	if err != nil || decodeErr != nil || !reflect.DeepEqual(decoded, promotions) {
+		t.Fatalf("provenance round trip=%+v encode=%v decode=%v", decoded, err, decodeErr)
+	}
+}
+
+func TestConflictPromotionCodecAndTargetValidation(t *testing.T) {
+	first := _conflictPromotion{source: "a", target: "a (Filecloud conflict aaaaaaaa 20250203T040506Z)",
+		id: strings.Repeat("1", 64), mtime: "2025-01-02T00:00:00Z", size: 5}
+	second := _conflictPromotion{source: "b", target: "b (Filecloud conflict aaaaaaaa 20250203T040506Z)",
+		id: strings.Repeat("2", 64), mtime: "2025-01-03T00:00:00Z", size: 6}
+	for name, values := range map[string][]_conflictPromotion{
+		"duplicate source": {first, {source: "A", target: second.target, id: second.id, mtime: second.mtime, size: second.size}},
+		"duplicate target": {first, {source: second.source, target: strings.ToUpper(first.target), id: second.id, mtime: second.mtime, size: second.size}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := _encodeConflictPromotions(values); err == nil {
+				t.Fatal("duplicate provenance was accepted")
+			}
+		})
+	}
+	encoded, err := _encodeConflictPromotions([]_conflictPromotion{second, first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := _decodeConflictPromotions(encoded)
+	if err != nil || len(decoded) != 2 || decoded[0] != first || decoded[1] != second {
+		t.Fatalf("canonical provenance=%+v err=%v", decoded, err)
+	}
+	if _, err := _decodeConflictPromotions(append(encoded, 0)); err == nil {
+		t.Fatal("noncanonical trailing provenance was accepted")
+	}
+	if _, err := _decodeConflictPromotions(make([]byte, _maxConflictPromotionsBytes+1)); err == nil {
+		t.Fatal("oversized provenance was accepted")
+	}
+	paths := []checkoutPath{{path: first.target, kind: "File", id: first.id, mtime: first.mtime, size: first.size}}
+	if err := _validatePromotionTargets([]_conflictPromotion{first}, paths); err != nil {
+		t.Fatal(err)
+	}
+	paths[0].size++
+	if err := _validatePromotionTargets([]_conflictPromotion{first}, paths); err == nil {
+		t.Fatal("provenance target size mismatch was accepted")
+	}
+}
+
+func TestConflictCopyNameIssue19Boundaries(t *testing.T) {
+	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID,
+		CreatedAt: "2025-02-03T04:05:06Z"}
+	for name, value := range map[string][2]string{
+		"240 byte segment": {strings.Repeat("n", 240), ""},
+		"1024 byte relative path": {strings.Repeat("f", 60), strings.Repeat("a", 240) + "/" +
+			strings.Repeat("b", 240) + "/" + strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := _conflictCopyName(value[0], value[1], seed, nil); err == nil || !strings.Contains(err.Error(), "Issue #19") {
+				t.Fatalf("overflow error=%v", err)
+			}
+		})
+	}
+}
+
+func TestLibrarySyncConflictNameOverflowIsPutNeutral(t *testing.T) {
+	for name, relative := range map[string]string{
+		"240 byte segment": strings.Repeat("n", 240),
+		"1024 byte relative path": strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
+			strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("f", 60),
+	} {
+		t.Run(name, func(t *testing.T) {
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, puts, _ := newSyncPair(t)
+			publisherPath := filepath.Join(publisherTree, filepath.FromSlash(relative))
+			if err := os.MkdirAll(filepath.Dir(publisherPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(publisherPath, []byte("base"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(publisherPath, []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			subscriberPath := filepath.Join(subscriberTree, filepath.FromSlash(relative))
+			if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+			beforeIndex := countClientRows(t, subscriberDir, "path_index", subscriberTree)
+			beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+				[]byte(environment.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			puts.Store(0)
+			err = syncTestWorktree(t, subscriberDir, subscriberTree)
+			if err == nil || !strings.Contains(err.Error(), "Issue #19") {
+				t.Fatalf("overflow sync error=%v", err)
+			}
+			afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+				[]byte(environment.token))
+			data, readErr := os.ReadFile(subscriberPath)
+			if puts.Load() != 0 || readTestBinding(t, subscriberDir, subscriberTree) != beforeBinding ||
+				countClientRows(t, subscriberDir, "path_index", subscriberTree) != beforeIndex ||
+				countClientRows(t, subscriberDir, "pending_publications", subscriberTree) != 0 || headErr != nil ||
+				beforeHead.CommitID == nil || afterHead.CommitID == nil || *beforeHead.CommitID != *afterHead.CommitID ||
+				beforeHead.ETag != afterHead.ETag || readErr != nil || string(data) != "local" {
+				t.Fatalf("overflow changed state puts=%d head=%+v/%+v data=%q read=%v headErr=%v",
+					puts.Load(), beforeHead, afterHead, data, readErr, headErr)
+			}
+		})
+	}
+}
+
+func TestLibrarySyncBothCreatedDivergentFileCreatesConflictCopy(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "created"), []byte("remote-created"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "created"), []byte("local-created"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(subscriberTree, "created (Filecloud conflict *)"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("conflict copies=%v err=%v", matches, err)
+	}
+	remote, remoteErr := os.ReadFile(filepath.Join(subscriberTree, "created"))
+	local, localErr := os.ReadFile(matches[0])
+	if remoteErr != nil || localErr != nil || string(remote) != "remote-created" || string(local) != "local-created" {
+		t.Fatalf("remote=%q/%v local=%q/%v", remote, remoteErr, local, localErr)
+	}
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+}
+
+func TestLibrarySyncMultipleDivergentFilesInOneRecovery(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	for _, root := range []string{publisherTree, subscriberTree} {
+		if err := os.MkdirAll(filepath.Join(root, "nested", "deep"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"first.txt", "second.txt"} {
+			if err := os.WriteFile(filepath.Join(root, "nested", "deep", name), []byte("base-"+name), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"first.txt", "second.txt"} {
+		if err := os.WriteFile(filepath.Join(publisherTree, "nested", "deep", name), []byte("remote-"+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(subscriberTree, "nested", "deep", name), []byte("local-"+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"first.txt", "second.txt"} {
+		remote, err := os.ReadFile(filepath.Join(subscriberTree, "nested", "deep", name))
+		stem := strings.TrimSuffix(name, filepath.Ext(name))
+		matches, globErr := filepath.Glob(filepath.Join(subscriberTree, "nested", "deep",
+			stem+" (Filecloud conflict *)"+filepath.Ext(name)))
+		if err != nil || globErr != nil || len(matches) != 1 || string(remote) != "remote-"+name {
+			t.Fatalf("%s remote=%q/%v conflicts=%v/%v", name, remote, err, matches, globErr)
+		}
+		local, err := os.ReadFile(matches[0])
+		if err != nil || string(local) != "local-"+name {
+			t.Fatalf("%s local=%q err=%v", name, local, err)
+		}
+	}
+	assertNoSyncInternalPaths(t, subscriberTree)
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+}
+
+func TestLibrarySyncSecondPromotionCrashMatrix(t *testing.T) {
+	for _, point := range []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"} {
+		t.Run(point, func(t *testing.T) {
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			for _, root := range []string{publisherTree, subscriberTree} {
+				if err := os.MkdirAll(filepath.Join(root, "nested", "deep"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				for _, name := range []string{"first", "second"} {
+					if err := os.WriteFile(filepath.Join(root, "nested", "deep", name), []byte("base-"+name), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"first", "second"} {
+				if err := os.WriteFile(filepath.Join(publisherTree, "nested", "deep", name), []byte("remote-"+name), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(subscriberTree, "nested", "deep", name), []byte("local-"+name), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT="+point,
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion", "FILECLOUD_PUBLIC_CRASH_MATCH_INDEX=2")
+			assertProcessSIGKILL(t, command.Run())
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var completedRoots int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM fs_actions WHERE worktree=? AND origin_action_id IS NULL
+				AND expected_object<>'' AND state='completed'`, subscriberTree).Scan(&completedRoots); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if completedRoots < 1 {
+				t.Fatal("second promotion crashed before the first root completed")
+			}
+			for attempt := 0; attempt < 4; attempt++ {
+				err = syncTestWorktree(t, subscriberDir, subscriberTree)
+				if err == nil {
+					break
+				}
+				if !strings.Contains(err.Error(), "rerun sync") {
+					t.Fatalf("restart %d: %v", attempt, err)
+				}
+			}
+			if err != nil {
+				t.Fatalf("second promotion did not converge: %v", err)
+			}
+			for _, name := range []string{"first", "second"} {
+				remote, readErr := os.ReadFile(filepath.Join(subscriberTree, "nested", "deep", name))
+				matches, globErr := filepath.Glob(filepath.Join(subscriberTree, "nested", "deep", name+" (Filecloud conflict *)"))
+				if readErr != nil || globErr != nil || len(matches) != 1 || string(remote) != "remote-"+name {
+					t.Fatalf("%s remote=%q/%v conflicts=%v/%v", name, remote, readErr, matches, globErr)
+				}
+				local, readErr := os.ReadFile(matches[0])
+				if readErr != nil || string(local) != "local-"+name {
+					t.Fatalf("%s local=%q err=%v", name, local, readErr)
+				}
+			}
+			assertNoSyncInternalPaths(t, subscriberTree)
+			assertTestConverged(t, environment, subscriberDir, subscriberTree)
+		})
+	}
+}
+
+func TestLibrarySyncDivergentFileCreatesConflictCopy(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(subscriberTree, "base (Filecloud conflict *)"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("conflict copies=%v err=%v", matches, err)
+	}
+	remote, remoteErr := os.ReadFile(filepath.Join(subscriberTree, "base"))
+	local, localErr := os.ReadFile(matches[0])
+	if remoteErr != nil || localErr != nil || string(remote) != "remote" || string(local) != "local" {
+		t.Fatalf("remote=%q/%v local=%q/%v", remote, remoteErr, local, localErr)
+	}
+	head, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	binding := readTestBinding(t, subscriberDir, subscriberTree)
+	if err != nil || head.CommitID == nil || binding.SyncBase != *head.CommitID || scanTestRoot(t, subscriberTree) != binding.SyncBaseRoot {
+		t.Fatalf("did not converge: head=%+v binding=%+v err=%v", head, binding, err)
+	}
+}
+
+func TestLibrarySyncConflictPromotionPreservesOpenFileIdentity(t *testing.T) {
+	for _, relative := range []string{"base", "nested/base"} {
+		t.Run(relative, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if strings.Contains(relative, "/") {
+				for _, root := range []string{publisherTree, subscriberTree} {
+					if err := os.Mkdir(filepath.Join(root, "nested"), 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(root, relative), []byte("base"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(publisherTree, relative), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, relative), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			held, err := os.OpenFile(filepath.Join(subscriberTree, relative), os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			parent, leaf := filepath.Split(filepath.Join(subscriberTree, relative))
+			stem := strings.TrimSuffix(leaf, filepath.Ext(leaf))
+			matches, err := filepath.Glob(filepath.Join(parent, stem+" (Filecloud conflict *)"+filepath.Ext(leaf)))
+			if err != nil || len(matches) != 1 {
+				t.Fatalf("conflict copies=%v err=%v", matches, err)
+			}
+			if _, err := held.WriteAt([]byte("after"), 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := held.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(matches[0])
+			if err != nil || !strings.HasPrefix(string(data), "after") {
+				t.Fatalf("promoted inode=%q err=%v", data, err)
+			}
+			assertNoSyncInternalPaths(t, subscriberTree)
+		})
+	}
+}
+
+func TestLibrarySyncPromotionCrashMatrix(t *testing.T) {
+	for _, relative := range []string{"base", "nested/base"} {
+		for _, point := range []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"} {
+			t.Run(relative+"/"+point, func(t *testing.T) {
+				environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+				if strings.Contains(relative, "/") {
+					for _, root := range []string{publisherTree, subscriberTree} {
+						if err := os.Mkdir(filepath.Join(root, "nested"), 0o700); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(filepath.Join(root, relative), []byte("base"), 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+						t.Fatal(err)
+					}
+					if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filepath.Join(publisherTree, relative), []byte("remote"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(subscriberTree, relative), []byte("local"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				var held *os.File
+				if point == "after_completed" {
+					var openErr error
+					held, openErr = os.OpenFile(filepath.Join(subscriberTree, relative), os.O_RDWR, 0)
+					if openErr != nil {
+						t.Fatal(openErr)
+					}
+					defer held.Close()
+				}
+				command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+				command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+					"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+					"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+					"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT="+point,
+					"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+				assertProcessSIGKILL(t, command.Run())
+				if held != nil {
+					if _, err := held.WriteAt([]byte("late!"), 0); err != nil {
+						t.Fatal(err)
+					}
+					if err := held.Sync(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				restartErr := syncTestWorktree(t, subscriberDir, subscriberTree)
+				if held == nil && restartErr != nil {
+					t.Fatalf("promotion restart: %v", restartErr)
+				}
+				if held != nil && (restartErr == nil || !strings.Contains(restartErr.Error(), "rerun sync")) {
+					t.Fatalf("late Completed promotion restart error=%v", restartErr)
+				}
+				if held != nil {
+					if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+						t.Fatal(err)
+					}
+				}
+				parent, leaf := filepath.Split(filepath.Join(subscriberTree, relative))
+				matches, err := filepath.Glob(filepath.Join(parent,
+					strings.TrimSuffix(leaf, filepath.Ext(leaf))+" (Filecloud conflict *)*"+filepath.Ext(leaf)))
+				wantMatches := 1
+				if held != nil {
+					wantMatches = 2
+				}
+				if err != nil || len(matches) != wantMatches {
+					t.Fatalf("conflict copies=%v err=%v", matches, err)
+				}
+				contents := make(map[string]bool, len(matches))
+				for _, match := range matches {
+					data, err := os.ReadFile(match)
+					if err != nil {
+						t.Fatal(err)
+					}
+					contents[string(data)] = true
+				}
+				if !contents["local"] || (held != nil && !contents["late!"]) {
+					t.Fatalf("promoted contents=%v", contents)
+				}
+				assertTestConverged(t, environment, subscriberDir, subscriberTree)
+				assertNoSyncInternalPaths(t, subscriberTree)
+			})
+		}
+	}
+}
+
+func TestLibrarySyncMutationBeforeFirstPromotionCrashMatrix(t *testing.T) {
+	for _, relative := range []string{"base", "nested/base"} {
+		for _, point := range []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"} {
+			t.Run(relative+"/"+point, func(t *testing.T) {
+				environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+				if strings.Contains(relative, "/") {
+					for _, root := range []string{publisherTree, subscriberTree} {
+						if err := os.Mkdir(filepath.Join(root, "nested"), 0o700); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(relative)), []byte("base"), 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+						t.Fatal(err)
+					}
+					if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filepath.Join(publisherTree, filepath.FromSlash(relative)), []byte("remote"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(subscriberTree, filepath.FromSlash(relative))
+				if err := os.WriteFile(path, []byte("local"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				held, err := os.OpenFile(path, os.O_RDWR, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer held.Close()
+				beforeInfo, err := held.Stat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				before, ok := beforeInfo.Sys().(*syscall.Stat_t)
+				if !ok {
+					t.Fatal("read held conflict identity")
+				}
+				command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+				command.ExtraFiles = []*os.File{held}
+				command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+					"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+					"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+					"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT="+point,
+					"FILECLOUD_PUBLIC_CRASH_ROLE=pre-promotion-mutation", "FILECLOUD_PUBLIC_MUTATION_PATH="+relative)
+				if !strings.Contains(relative, "/") {
+					command.Env = append(command.Env, "FILECLOUD_PUBLIC_CRASH_COLLISION=1")
+				}
+				assertProcessSIGKILL(t, command.Run())
+
+				db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				promotions, err := loadConflictPromotions(t.Context(), db, subscriberTree)
+				if err != nil || len(promotions) != 1 {
+					db.Close()
+					t.Fatalf("promotions=%+v err=%v", promotions, err)
+				}
+				expected := promotions[0].target
+				wantTarget, err := nextConflictChainPath(expected)
+				selectedTarget := wantTarget
+				if !strings.Contains(relative, "/") && err == nil {
+					selectedTarget, err = nextConflictChainPath(wantTarget)
+					if point != "before_intent_commit" {
+						wantTarget = selectedTarget
+					}
+				}
+				if err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+				var recorded string
+				recordErr := db.QueryRow(`SELECT target_name FROM fs_actions WHERE worktree=? AND op=? AND expected_object<>'' AND origin_action_id IS NULL`,
+					subscriberTree, fsOpRename).Scan(&recorded)
+				if point == "before_intent_commit" {
+					if !errors.Is(recordErr, sql.ErrNoRows) {
+						db.Close()
+						t.Fatalf("uncommitted root target=%q err=%v", recorded, recordErr)
+					}
+				} else if recordErr != nil || recorded != selectedTarget {
+					db.Close()
+					t.Fatalf("recorded root target=%q err=%v want=%q", recorded, recordErr, selectedTarget)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(relative, "/") {
+					second, _ := nextConflictChainPath(expected)
+					parent, leaf := splitFSActionPath(second)
+					collision := filepath.Join(subscriberTree, filepath.FromSlash(parent), strings.ToUpper(leaf))
+					if occupied, err := os.ReadFile(collision); err != nil || string(occupied) != "occupied" {
+						t.Fatalf("casefold collision=%q err=%v", occupied, err)
+					}
+					if err := os.Remove(collision); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				restartErr := syncTestWorktree(t, subscriberDir, subscriberTree)
+				if restartErr == nil || !strings.Contains(restartErr.Error(), "rerun sync") {
+					t.Fatalf("mutation restart error=%v", restartErr)
+				}
+				mutated, err := os.Open(filepath.Join(subscriberTree, filepath.FromSlash(wantTarget)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				afterInfo, statErr := mutated.Stat()
+				if statErr != nil {
+					mutated.Close()
+					t.Fatal(statErr)
+				}
+				after, ok := afterInfo.Sys().(*syscall.Stat_t)
+				data, readErr := io.ReadAll(mutated)
+				closeErr := mutated.Close()
+				if !ok || readErr != nil || closeErr != nil || after.Dev != before.Dev || after.Ino != before.Ino || string(data) != "changed" {
+					t.Fatalf("mutated target identity=%v content=%q err=%v", ok && after.Dev == before.Dev && after.Ino == before.Ino, data, errors.Join(readErr, closeErr))
+				}
+				if fixed, err := os.ReadFile(filepath.Join(subscriberTree, filepath.FromSlash(expected))); err != nil || string(fixed) != "local" {
+					t.Fatalf("fixed Candidate=%q err=%v", fixed, err)
+				}
+				assertNoSyncInternalPaths(t, subscriberTree)
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+					t.Fatal(err)
+				}
+				assertTestConverged(t, environment, subscriberDir, subscriberTree)
+			})
+		}
+	}
+}
+
+func TestLibrarySyncLatePromotionCrashMatrix(t *testing.T) {
+	for _, relative := range []string{"base", "nested/base"} {
+		for _, point := range []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"} {
+			t.Run(relative+"/"+point, func(t *testing.T) {
+				environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+				if strings.Contains(relative, "/") {
+					for _, root := range []string{publisherTree, subscriberTree} {
+						if err := os.Mkdir(filepath.Join(root, "nested"), 0o700); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(filepath.Join(root, relative), []byte("base"), 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+						t.Fatal(err)
+					}
+					if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filepath.Join(publisherTree, relative), []byte("remote"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(subscriberTree, relative), []byte("local"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				held, err := os.OpenFile(filepath.Join(subscriberTree, relative), os.O_RDWR, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer held.Close()
+				setup := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+				setup.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+					"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+					"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+					"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_completed",
+					"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+				assertProcessSIGKILL(t, setup.Run())
+				parent, leaf := filepath.Split(filepath.Join(subscriberTree, relative))
+				matches, err := filepath.Glob(filepath.Join(parent,
+					strings.TrimSuffix(leaf, filepath.Ext(leaf))+" (Filecloud conflict *)"+filepath.Ext(leaf)))
+				if err != nil || len(matches) != 1 {
+					t.Fatalf("initial conflict copies=%v err=%v", matches, err)
+				}
+				promoted, err := filepath.Rel(subscriberTree, matches[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				promoted = filepath.ToSlash(promoted)
+				successor, err := nextConflictChainPath(promoted)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := held.WriteAt([]byte("late!"), 0); err != nil {
+					t.Fatal(err)
+				}
+				if err := held.Sync(); err != nil {
+					t.Fatal(err)
+				}
+				command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+				command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+					"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+					"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+					"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT="+point,
+					"FILECLOUD_PUBLIC_CRASH_ROLE=late-promotion")
+				assertProcessSIGKILL(t, command.Run())
+				wantSuccessor, wantLate := successor, "late!"
+				if point == "after_completed" {
+					if _, err := held.WriteAt([]byte("again"), 0); err != nil {
+						t.Fatal(err)
+					}
+					if err := held.Sync(); err != nil {
+						t.Fatal(err)
+					}
+					wantSuccessor, err = nextConflictChainPath(successor)
+					if err != nil {
+						t.Fatal(err)
+					}
+					wantLate = "again"
+				}
+				for attempt := 0; attempt < 4; attempt++ {
+					err = syncTestWorktree(t, subscriberDir, subscriberTree)
+					if err == nil {
+						break
+					}
+					if !strings.Contains(err.Error(), "rerun sync") {
+						t.Fatalf("late promotion restart %d: %v", attempt, err)
+					}
+				}
+				if err != nil {
+					t.Fatalf("late promotion did not converge: %v", err)
+				}
+				fixed, fixedErr := os.ReadFile(filepath.Join(subscriberTree, filepath.FromSlash(promoted)))
+				late, lateErr := os.ReadFile(filepath.Join(subscriberTree, filepath.FromSlash(wantSuccessor)))
+				if fixedErr != nil || lateErr != nil || string(fixed) != "local" || string(late) != wantLate {
+					t.Fatalf("fixed=%q/%v late=%q/%v", fixed, fixedErr, late, lateErr)
+				}
+				assertNoSyncInternalPaths(t, subscriberTree)
+				assertTestConverged(t, environment, subscriberDir, subscriberTree)
+			})
+		}
+	}
+}
+
+func TestLibraryRejectsOrphanPromotionBeforeReplay(t *testing.T) {
+	for _, operation := range []string{"recover", "sync", "unbind"} {
+		t.Run(operation, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_intent_commit",
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+			assertProcessSIGKILL(t, command.Run())
+
+			beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actions, err := loadFSActions(t.Context(), db, subscriberTree)
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			var legitimate fsAction
+			for _, action := range actions {
+				if action.OriginActionID == "" && action.Op == fsOpRename && action.ExpectedObject != "" {
+					legitimate = action
+					break
+				}
+			}
+			if legitimate.ActionID == "" || legitimate.State != fsStateIntent {
+				db.Close()
+				t.Fatalf("legitimate promotion=%+v", legitimate)
+			}
+			forgedPath := filepath.Join(subscriberTree, "forged")
+			if err := os.WriteFile(forgedPath, []byte("forged"), 0o600); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			held, err := os.Open(forgedPath)
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			defer held.Close()
+			info, err := held.Stat()
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			stat := info.Sys().(*syscall.Stat_t)
+			snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+			id, err := scanRegularFile(held, "forged", info, &snapshot)
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			root, err := openWorktreeRoot(subscriberTree, func(*os.File) error { return nil })
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			forgedID, err := newFSActionID()
+			if err != nil {
+				root.Close()
+				db.Close()
+				t.Fatal(err)
+			}
+			forged := fsAction{Worktree: subscriberTree, ActionID: forgedID, Order: legitimate.Order + 100,
+				Phase: fsPhasePreBase, Op: fsOpRename, Parent: "", ParentDevice: root.device, ParentInode: root.inode,
+				Source: "forged", Target: "forged-sibling", ExpectedKind: "File", ExpectedDevice: uint64(stat.Dev),
+				ExpectedInode: stat.Ino, ExpectedObject: id, ExpectedSize: info.Size(),
+				ExpectedMtime: info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z"), State: fsStateIntent}
+			if err := insertFSActionIntent(t.Context(), db, forged); err != nil {
+				root.Close()
+				db.Close()
+				t.Fatal(err)
+			}
+			var pendingBefore, recoveriesBefore int
+			if err := db.QueryRow("SELECT COUNT(*) FROM pending_checkouts WHERE worktree=?", subscriberTree).Scan(&pendingBefore); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow("SELECT COUNT(*) FROM sync_recoveries WHERE worktree=?", subscriberTree).Scan(&recoveriesBefore); err != nil {
+				t.Fatal(err)
+			}
+
+			var operationErr error
+			switch operation {
+			case "recover":
+				operationErr = recoverFSActions(t.Context(), db, subscriberTree, root, nil)
+			case "sync", "unbind":
+				if closeErr := errors.Join(root.Close(), db.Close()); closeErr != nil {
+					t.Fatal(closeErr)
+				}
+				root, db = nil, nil
+				operationErr = runLibraryWithConfig(t.Context(), []string{operation, "--client-dir", subscriberDir, "--worktree", subscriberTree},
+					strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
+			}
+			if operationErr == nil || !strings.Contains(operationErr.Error(), "orphan") {
+				t.Fatalf("%s orphan error=%v", operation, operationErr)
+			}
+			if root != nil {
+				if err := root.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if db != nil {
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if current, err := held.Stat(); err != nil || current.Sys().(*syscall.Stat_t).Ino != stat.Ino {
+				t.Fatalf("%s forged source identity changed: info=%v err=%v", operation, current, err)
+			}
+			if data, err := os.ReadFile(forgedPath); err != nil || string(data) != "forged" {
+				t.Fatalf("%s forged source=%q err=%v", operation, data, err)
+			}
+			if _, err := os.Lstat(filepath.Join(subscriberTree, "forged-sibling")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s forged target exists: %v", operation, err)
+			}
+			legitimateSource := legitimate.Source
+			if legitimate.Parent != "" {
+				legitimateSource = legitimate.Parent + "/" + legitimate.Source
+			}
+			if _, err := os.Lstat(filepath.Join(subscriberTree, filepath.FromSlash(legitimateSource))); err != nil {
+				t.Fatalf("%s legitimate source changed: %v", operation, err)
+			}
+			if _, err := os.Lstat(filepath.Join(subscriberTree, filepath.FromSlash(legitimate.Target))); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s legitimate target exists: %v", operation, err)
+			}
+			afterBinding := readTestBinding(t, subscriberDir, subscriberTree)
+			if afterBinding != beforeBinding {
+				t.Fatalf("%s binding changed: before=%+v after=%+v", operation, beforeBinding, afterBinding)
+			}
+			db, err = openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var pendingAfter, recoveriesAfter int
+			if err := db.QueryRow("SELECT COUNT(*) FROM pending_checkouts WHERE worktree=?", subscriberTree).Scan(&pendingAfter); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow("SELECT COUNT(*) FROM sync_recoveries WHERE worktree=?", subscriberTree).Scan(&recoveriesAfter); err != nil {
+				t.Fatal(err)
+			}
+			if pendingAfter != pendingBefore || recoveriesAfter != recoveriesBefore {
+				t.Fatalf("%s pending state changed: checkouts %d/%d recoveries %d/%d", operation,
+					pendingBefore, pendingAfter, recoveriesBefore, recoveriesAfter)
+			}
+		})
+	}
+}
+
+func TestDanglingPromotionLinkageRejectedWithEmptyJournal(t *testing.T) {
+	for _, operation := range []string{"recover", "sync", "unbind"} {
+		t.Run(operation, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_completed",
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+			assertProcessSIGKILL(t, command.Run())
+			matches, err := filepath.Glob(filepath.Join(subscriberTree, "base (Filecloud conflict *)"))
+			if err != nil || len(matches) != 1 {
+				t.Fatalf("promotion target=%v err=%v", matches, err)
+			}
+			held, err := os.Open(matches[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			beforeInfo, err := held.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`DELETE FROM fs_actions WHERE worktree=?;
+				UPDATE pending_checkouts SET apply_state='finalized' WHERE worktree=?`, subscriberTree, subscriberTree); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			var recoveryPath, recoveryName, sourcePath, currentID, applyState string
+			if err := db.QueryRow(`SELECT r.path,r.recovery_name,p.source_path,p.current_action_id,c.apply_state
+				FROM sync_recoveries r JOIN sync_recovery_promotions p ON p.worktree=r.worktree AND p.recovery_path=r.path
+				JOIN pending_checkouts c ON c.worktree=r.worktree WHERE r.worktree=?`, subscriberTree).Scan(
+				&recoveryPath, &recoveryName, &sourcePath, &currentID, &applyState); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			root, err := openWorktreeRoot(subscriberTree, func(*os.File) error { return nil })
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			var operationErr error
+			switch operation {
+			case "recover":
+				operationErr = recoverFSActions(t.Context(), db, subscriberTree, root, nil)
+			case "sync", "unbind":
+				if err := errors.Join(root.Close(), db.Close()); err != nil {
+					t.Fatal(err)
+				}
+				root, db = nil, nil
+				operationErr = runLibraryWithConfig(t.Context(), []string{operation, "--client-dir", subscriberDir,
+					"--worktree", subscriberTree}, strings.NewReader(""), io.Discard, io.Discard,
+					libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
+			}
+			if operationErr == nil || !strings.Contains(operationErr.Error(), "linkage is absent") {
+				t.Fatalf("%s dangling linkage error=%v", operation, operationErr)
+			}
+			if root != nil {
+				if err := root.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if db != nil {
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			afterInfo, err := held.Stat()
+			data, readErr := os.ReadFile(matches[0])
+			if err != nil || readErr != nil || afterInfo.Sys().(*syscall.Stat_t).Ino != beforeInfo.Sys().(*syscall.Stat_t).Ino ||
+				string(data) != "local" || readTestBinding(t, subscriberDir, subscriberTree) != beforeBinding {
+				t.Fatalf("%s changed file/binding info=%v/%v data=%q/%v", operation, beforeInfo, afterInfo, data, readErr)
+			}
+			db, err = openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var gotRecoveryPath, gotRecoveryName, gotSourcePath, gotCurrentID, gotApplyState string
+			if err := db.QueryRow(`SELECT r.path,r.recovery_name,p.source_path,p.current_action_id,c.apply_state
+				FROM sync_recoveries r JOIN sync_recovery_promotions p ON p.worktree=r.worktree AND p.recovery_path=r.path
+				JOIN pending_checkouts c ON c.worktree=r.worktree WHERE r.worktree=?`, subscriberTree).Scan(
+				&gotRecoveryPath, &gotRecoveryName, &gotSourcePath, &gotCurrentID, &gotApplyState); err != nil {
+				t.Fatal(err)
+			}
+			if gotRecoveryPath != recoveryPath || gotRecoveryName != recoveryName || gotSourcePath != sourcePath ||
+				gotCurrentID != currentID || gotApplyState != applyState || countClientRows(t, subscriberDir, "fs_actions", subscriberTree) != 0 {
+				t.Fatalf("%s changed database recovery=%q/%q source=%q current=%q state=%q", operation,
+					gotRecoveryPath, gotRecoveryName, gotSourcePath, gotCurrentID, gotApplyState)
+			}
+		})
+	}
+}
+
+func TestPromotionOwnershipRejectsCorruptGraphs(t *testing.T) {
+	const (
+		rootID     = "00112233445566778899aabbccddeeff"
+		descendant = "11223344556677889900aabbccddeeff"
+		mtime      = "2024-01-02T03:04:05Z"
+	)
+	objectID := strings.Repeat("a", 64)
+	target := "base (Filecloud conflict deadbeef 20240102T030405Z)"
+	for _, scenario := range []string{"orphan root", "orphan descendant", "completed orphan", "duplicate owners", "cross-worktree", "missing provenance", "wrong provenance"} {
+		t.Run(scenario, func(t *testing.T) {
+			clientDir, worktree := t.TempDir(), t.TempDir()
+			db, err := initializeClientDB(t.Context(), clientDir, syncDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			recoveryName := syncRecoveryPrefix + "abcdefabcdefabcdefabcdefabcdefab"
+			provenance := []_conflictPromotion{{source: "base", target: target, id: objectID, mtime: mtime, size: 5}}
+			if scenario == "missing provenance" {
+				provenance = nil
+			} else if scenario == "wrong provenance" {
+				provenance[0].target = "other (Filecloud conflict deadbeef 20240102T030405Z)"
+			}
+			encoded, err := _encodeConflictPromotions(provenance)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := savePendingCheckout(t.Context(), db, pendingCheckout{ServerURL: "http://localhost", LibraryID: "library",
+				Worktree: worktree, UserID: "user", DeviceID: "device", TargetCommit: objectID,
+				ApplyState: "applying", ConflictPromotions: encoded, RollbackRootMtimeNS: 1,
+				RollbackRootMtimeValid: true}); err != nil {
+				t.Fatal(err)
+			}
+			state := fsStateIntent
+			if scenario == "completed orphan" {
+				state = fsStateCompleted
+			}
+			root := fsAction{Worktree: worktree, ActionID: rootID, Order: 1, Phase: fsPhasePreBase, Op: fsOpRename,
+				Parent: "", ParentDevice: 1, ParentInode: 2, Source: recoveryName, Target: target, ExpectedKind: "File",
+				ExpectedDevice: 11, ExpectedInode: 12, ExpectedObject: objectID, ExpectedSize: 5,
+				ExpectedMtime: mtime, InternalSource: recoveryName, State: state}
+			journal := []fsAction{root}
+			if scenario == "orphan descendant" || scenario == "duplicate owners" {
+				next, err := nextConflictChainPath(target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				journal = append(journal, fsAction{Worktree: worktree, ActionID: descendant, OriginActionID: rootID,
+					Attempt: 1, Order: 2, Phase: fsPhasePreBase, Op: fsOpRename, Parent: "", ParentDevice: 1,
+					ParentInode: 2, Source: target, Target: next, ExpectedKind: "File", ExpectedDevice: 21,
+					ExpectedInode: 22, ExpectedObject: objectID, ExpectedSize: 5, ExpectedMtime: mtime, State: fsStateIntent})
+			}
+			if scenario != "orphan root" && scenario != "orphan descendant" && scenario != "completed orphan" {
+				linkedID := rootID
+				if scenario == "cross-worktree" {
+					linkedID = "ffeeddccbbaa00998877665544332211"
+				}
+				_, err = db.Exec(`INSERT INTO sync_recoveries(worktree,path,recovery_name,type,object_id,canonical_mtime,
+					size,device,inode,completed,tombstone_name) VALUES(?,?,?,?,?,?,?,?,?,1,'')`,
+					worktree, "base", recoveryName, "File", objectID, mtime, 5, 11, 12)
+				if err == nil {
+					_, err = db.Exec(`INSERT INTO sync_recovery_promotions(worktree,recovery_path,source_path,current_action_id)
+						VALUES(?,?,?,?)`, worktree, "base", "base", linkedID)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "duplicate owners" {
+				secondName := syncRecoveryPrefix + "fedcbafedcbafedcbafedcbafedcbafe"
+				_, err = db.Exec(`INSERT INTO sync_recoveries(worktree,path,recovery_name,type,object_id,canonical_mtime,
+					size,device,inode,completed,tombstone_name) VALUES(?,?,?,?,?,?,?,?,?,1,'')`,
+					worktree, "other", secondName, "File", objectID, mtime, 5, 31, 32)
+				if err == nil {
+					_, err = db.Exec(`INSERT INTO sync_recovery_promotions(worktree,recovery_path,source_path,current_action_id)
+						VALUES(?,?,?,?)`, worktree, "other", "other", descendant)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := validateFSActionJournal(t.Context(), db, worktree, journal); err != nil {
+				t.Fatalf("test journal is invalid before ownership check: %v", err)
+			}
+			if err := validatePromotionOwnership(t.Context(), db, worktree, journal); err == nil {
+				t.Fatalf("%s corruption was accepted", scenario)
+			}
+		})
+	}
+}
+
+func TestLibrarySyncRejectsStalePromotionLinkage(t *testing.T) {
+	for _, field := range []string{"recovery", "action"} {
+		t.Run(field, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_completed",
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+			assertProcessSIGKILL(t, command.Run())
+			before := readTestBinding(t, subscriberDir, subscriberTree)
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			query := `UPDATE sync_recovery_promotions SET current_action_id='00112233445566778899aabbccddeeff' WHERE worktree=?`
+			if field == "action" {
+				query = `UPDATE fs_actions SET expected_object=lower(hex(randomblob(32))) WHERE worktree=? AND expected_object<>''`
+			}
+			_, mutateErr := db.Exec(query, subscriberTree)
+			closeErr := db.Close()
+			if mutateErr != nil || closeErr != nil {
+				t.Fatal(errors.Join(mutateErr, closeErr))
+			}
+			err = syncTestWorktree(t, subscriberDir, subscriberTree)
+			if err == nil || (!strings.Contains(err.Error(), "linkage") && !strings.Contains(err.Error(), "journal") &&
+				!strings.Contains(err.Error(), "promotion source")) {
+				t.Fatalf("stale %s error=%v", field, err)
+			}
+			after := readTestBinding(t, subscriberDir, subscriberTree)
+			if after.SyncBase != before.SyncBase || after.SyncBaseRoot != before.SyncBaseRoot || after.HeadETag != before.HeadETag {
+				t.Fatalf("stale %s finalized binding: before=%+v after=%+v", field, before, after)
+			}
+		})
+	}
+}
+
+func TestLibrarySyncRejectsInvalidRootPromotionTargetsWithoutFSChanges(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    func(string) string
+		directory bool
+	}{
+		{"arbitrary sibling", func(string) string { return "other" }, false},
+		{"arbitrary prefix", func(value string) string { return "copy-" + value }, false},
+		{"lookalike", func(value string) string {
+			return strings.Replace(value, "Filecloud conflict", "Filecloud conflict-copy", 1)
+		}, false},
+		{"wrong parent", func(value string) string { return "other/" + value }, false},
+		{"alternate seed", func(value string) string {
+			start := strings.Index(value, " conflict ") + len(" conflict ")
+			return value[:start] + "deadbeef" + value[start+8:]
+		}, false},
+		{"alternate timestamp", func(value string) string { return strings.Replace(value, "Z)", "1Z)", 1) }, false},
+		{"alternate extension", func(value string) string { return value + ".bin" }, false},
+		{"malformed suffix", func(value string) string { return value + " 2 4" }, false},
+		{"casefold alias", strings.ToUpper, false},
+		{"normalized alias", func(value string) string { return "e\u0301" + value }, false},
+		{"path overflow", func(value string) string { return strings.Repeat("p/", 500) + value }, false},
+		{"directory", func(value string) string { next, _ := nextConflictChainPath(value); return next }, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_intent_commit",
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+			assertProcessSIGKILL(t, command.Run())
+			beforeBinding := readTestBinding(t, subscriberDir, subscriberTree)
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			promotions, err := loadConflictPromotions(t.Context(), db, subscriberTree)
+			if err != nil || len(promotions) != 1 {
+				db.Close()
+				t.Fatalf("promotions=%+v err=%v", promotions, err)
+			}
+			target := test.target(promotions[0].target)
+			if target == promotions[0].target {
+				db.Close()
+				t.Fatalf("target mutation was a no-op: %q", target)
+			}
+			if _, err := db.Exec(`UPDATE fs_actions SET target_name=? WHERE worktree=? AND expected_object<>'' AND origin_action_id IS NULL`,
+				target, subscriberTree); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if test.directory {
+				if err := os.Mkdir(filepath.Join(subscriberTree, filepath.FromSlash(target)), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			beforeTree := captureExactTree(t, subscriberTree)
+			err = syncTestWorktree(t, subscriberDir, subscriberTree)
+			if err == nil {
+				t.Fatal("invalid promotion target was accepted")
+			}
+			beforeTree["."] = captureExactTree(t, subscriberTree)["."]
+			assertExactTree(t, subscriberTree, beforeTree)
+			if after := readTestBinding(t, subscriberDir, subscriberTree); after != beforeBinding {
+				t.Fatalf("invalid target changed binding: before=%+v after=%+v", beforeBinding, after)
+			}
+		})
+	}
+}
+
+func TestLibrarySyncRejectsPromotionChainFork(t *testing.T) {
+	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+	command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+		"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+		"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+		"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_completed",
+		"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+	assertProcessSIGKILL(t, command.Run())
+	db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions, err := loadFSActions(t.Context(), db, subscriberTree)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	var root fsAction
+	for _, action := range actions {
+		if action.ExpectedObject != "" && action.OriginActionID == "" {
+			root = action
+			break
+		}
+	}
+	target, err := nextConflictChainPath(root.Target)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	parent, source := splitFSActionPath(root.Target)
+	info, err := os.Stat(filepath.Join(subscriberTree, filepath.FromSlash(root.Target)))
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		db.Close()
+		t.Fatal("read promotion target identity")
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		id, err := newFSActionID()
+		if err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		fork := fsAction{Worktree: subscriberTree, ActionID: id, OriginActionID: root.ActionID, Attempt: 1,
+			Order: root.Order + int64(attempt) + 1, Phase: fsPhasePreBase, Op: fsOpRename, Parent: parent,
+			ParentDevice: uint64(stat.Dev), ParentInode: stat.Ino, Source: source, Target: target, ExpectedKind: "File",
+			ExpectedDevice: uint64(stat.Dev), ExpectedInode: stat.Ino, ExpectedObject: root.ExpectedObject,
+			ExpectedSize: root.ExpectedSize, ExpectedMtime: root.ExpectedMtime, State: fsStateIntent}
+		insertErr := insertFSActionIntent(t.Context(), db, fork)
+		if attempt == 0 && insertErr != nil {
+			db.Close()
+			t.Fatal(insertErr)
+		}
+		if attempt == 1 && (insertErr == nil || !strings.Contains(insertErr.Error(), "UNIQUE constraint")) {
+			db.Close()
+			t.Fatalf("promotion fork insert error=%v", insertErr)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLibrarySyncCheckoutPathFullCASRejectsStaleRows(t *testing.T) {
+	for _, field := range []string{"object_id", "canonical_mtime", "temp_name"} {
+		t.Run(field, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			held, err := os.OpenFile(filepath.Join(subscriberTree, "base"), os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_completed",
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+			assertProcessSIGKILL(t, command.Run())
+			if _, err := held.WriteAt([]byte("late!"), 0); err != nil {
+				t.Fatal(err)
+			}
+			before := readTestBinding(t, subscriberDir, subscriberTree)
+			var injected atomic.Bool
+			err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+				strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+					fsActionFault: func(point string, action fsAction) error {
+						if point != "after_completed" || action.ExpectedObject == "" || !injected.CompareAndSwap(false, true) {
+							return nil
+						}
+						db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+						if err != nil {
+							return err
+						}
+						value := "stale"
+						if field == "object_id" {
+							value = strings.Repeat("0", 64)
+						} else if field == "canonical_mtime" {
+							value = "2000-01-01T00:00:00Z"
+						}
+						_, updateErr := db.Exec("UPDATE checkout_paths SET "+field+"=? WHERE worktree=? AND path=?", value, subscriberTree, action.Source)
+						return errors.Join(updateErr, db.Close())
+					}})
+			if err == nil || !strings.Contains(err.Error(), "stale checkout state") {
+				t.Fatalf("stale checkout %s error=%v", field, err)
+			}
+			after := readTestBinding(t, subscriberDir, subscriberTree)
+			if after.SyncBase != before.SyncBase || after.SyncBaseRoot != before.SyncBaseRoot || after.HeadETag != before.HeadETag {
+				t.Fatalf("stale checkout %s finalized binding: before=%+v after=%+v", field, before, after)
+			}
+			var state string
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = db.QueryRow("SELECT apply_state FROM pending_checkouts WHERE worktree=?", subscriberTree).Scan(&state)
+			closeErr := db.Close()
+			if err != nil || closeErr != nil || state != "applying" {
+				t.Fatalf("stale checkout %s pending state=%q err=%v", field, state, errors.Join(err, closeErr))
+			}
+		})
+	}
+}
+
+func TestLibrarySyncPromotionCollisionCrashMatrix(t *testing.T) {
+	for _, relative := range []string{"base", "nested/base"} {
+		for _, point := range []string{"after_action", "after_parent_sync", "after_completed"} {
+			t.Run(relative+"/"+point, func(t *testing.T) {
+				environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+				if strings.Contains(relative, "/") {
+					for _, root := range []string{publisherTree, subscriberTree} {
+						if err := os.Mkdir(filepath.Join(root, "nested"), 0o700); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(filepath.Join(root, relative), []byte("base"), 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+						t.Fatal(err)
+					}
+					if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filepath.Join(publisherTree, relative), []byte("remote"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(subscriberTree, relative), []byte("local"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+				command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+					"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+					"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+					"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT="+point,
+					"FILECLOUD_PUBLIC_CRASH_ROLE=promotion-collision")
+				assertProcessSIGKILL(t, command.Run())
+				restartErr := syncTestWorktree(t, subscriberDir, subscriberTree)
+				if restartErr == nil || !strings.Contains(restartErr.Error(), "rerun sync") {
+					t.Fatalf("collision successor restart error=%v", restartErr)
+				}
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+					t.Fatalf("publish collision successor: %v", err)
+				}
+				parent, leaf := filepath.Split(filepath.Join(subscriberTree, relative))
+				matches, err := filepath.Glob(filepath.Join(parent,
+					strings.TrimSuffix(leaf, filepath.Ext(leaf))+" (Filecloud conflict *)*"+filepath.Ext(leaf)))
+				if err != nil || len(matches) != 2 {
+					t.Fatalf("collision copies=%v err=%v", matches, err)
+				}
+				contents := make(map[string]bool, len(matches))
+				for _, match := range matches {
+					data, err := os.ReadFile(match)
+					if err != nil {
+						t.Fatal(err)
+					}
+					contents[string(data)] = true
+				}
+				if !contents["local"] || !contents["racing"] {
+					t.Fatalf("collision contents=%v", contents)
+				}
+				assertTestConverged(t, environment, subscriberDir, subscriberTree)
+				assertNoSyncInternalPaths(t, subscriberTree)
+			})
+		}
+	}
+}
+
+func TestLibrarySyncMutationAfterRecoveryRenameIsVisible(t *testing.T) {
+	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.OpenFile(filepath.Join(subscriberTree, "base"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	var changed atomic.Bool
+	err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			afterSyncRecoveryRename: func(string, string) error {
+				if changed.CompareAndSwap(false, true) {
+					_, err := held.WriteAt([]byte("late!"), 0)
+					return err
+				}
+				return nil
+			}})
+	if err == nil || !strings.Contains(err.Error(), "rerun sync") {
+		t.Fatalf("post-recovery mutation error=%v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(subscriberTree, "base (Filecloud conflict *)*"))
+	if err != nil || len(matches) != 2 {
+		t.Fatalf("conflict copies=%v err=%v", matches, err)
+	}
+	contents := make(map[string]bool)
+	for _, path := range matches {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents[string(data)] = true
+	}
+	if !contents["local"] || !contents["late!"] {
+		t.Fatalf("post-recovery mutation lost content: %v", contents)
+	}
+}
+
+func TestLibrarySyncDuplicateConflictIdentityUsesSuffix2(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var injected atomic.Bool
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			fsActionFault: func(point string, action fsAction) error {
+				if point != "before_action" || action.ExpectedObject == "" || !injected.CompareAndSwap(false, true) {
+					return nil
+				}
+				target := filepath.Join(subscriberTree, filepath.FromSlash(action.Target))
+				if err := os.WriteFile(target, []byte("local"), 0o600); err != nil {
+					return err
+				}
+				mtime, err := time.Parse(time.RFC3339, action.ExpectedMtime)
+				if err != nil {
+					return err
+				}
+				return os.Chtimes(target, mtime, mtime)
+			}})
+	if err == nil || !strings.Contains(err.Error(), "rerun sync") {
+		t.Fatalf("duplicate conflict identity error=%v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(subscriberTree, "base (Filecloud conflict *)*"))
+	if err != nil || len(matches) != 2 {
+		t.Fatalf("duplicate conflict copies=%v err=%v", matches, err)
+	}
+	var suffix2 bool
+	for _, match := range matches {
+		data, err := os.ReadFile(match)
+		if err != nil || string(data) != "local" {
+			t.Fatalf("duplicate conflict %q=%q err=%v", match, data, err)
+		}
+		suffix2 = suffix2 || strings.Contains(filepath.Base(match), ") 2")
+	}
+	if !suffix2 {
+		t.Fatalf("duplicate conflict did not use deterministic suffix 2: %v", matches)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+}
+
+func TestLibrarySyncPromotionCollisionPreservesRacingInode(t *testing.T) {
+	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var raced atomic.Bool
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			fsActionFault: func(point string, action fsAction) error {
+				if point == "before_action" && action.ExpectedObject != "" && raced.CompareAndSwap(false, true) {
+					return os.WriteFile(filepath.Join(subscriberTree, filepath.FromSlash(action.Target)), []byte("racing"), 0o600)
+				}
+				return nil
+			}})
+	if err == nil || !strings.Contains(err.Error(), "rerun sync") {
+		t.Fatalf("promotion collision error=%v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(subscriberTree, "base (Filecloud conflict *)*"))
+	if err != nil || len(matches) != 2 {
+		t.Fatalf("conflict copies=%v err=%v", matches, err)
+	}
+	contents := make(map[string]bool)
+	for _, path := range matches {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents[string(data)] = true
+	}
+	if !contents["local"] || !contents["racing"] {
+		t.Fatalf("promotion collision lost content: %v", contents)
+	}
+}
+
+func TestLibrarySyncLateConflictBeforeFinalizeRequiresRerun(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.OpenFile(filepath.Join(subscriberTree, "base"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	var beforeCommit clientBinding
+	var injected atomic.Bool
+	err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			fsTransactionFault: func(point string) error {
+				if point != "before_base_commit" || !injected.CompareAndSwap(false, true) {
+					return nil
+				}
+				beforeCommit = readTestBinding(t, subscriberDir, subscriberTree)
+				_, err := held.WriteAt([]byte("late!"), 0)
+				return err
+			}})
+	if err == nil || !strings.Contains(err.Error(), "rerun sync") {
+		t.Fatalf("late conflict error=%v", err)
+	}
+	after := readTestBinding(t, subscriberDir, subscriberTree)
+	if after.SyncBase != beforeCommit.SyncBase || after.SyncBaseRoot != beforeCommit.SyncBaseRoot || after.HeadETag != beforeCommit.HeadETag {
+		t.Fatalf("failed final validation advanced binding: before=%+v after=%+v", beforeCommit, after)
+	}
+	matches, err := filepath.Glob(filepath.Join(subscriberTree, "base (Filecloud conflict *)*"))
+	if err != nil || len(matches) != 2 {
+		t.Fatalf("conflict copies=%v err=%v", matches, err)
+	}
+	var localFound, lateFound bool
+	for _, path := range matches {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		localFound = localFound || string(data) == "local"
+		lateFound = lateFound || string(data) == "late!"
+	}
+	if !localFound || !lateFound {
+		t.Fatalf("fixed/late conflict content missing: %v", matches)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err == nil || !strings.Contains(err.Error(), "rerun sync") {
+		t.Fatalf("late preservation rerun error=%v", err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	assertNoSyncInternalPaths(t, subscriberTree)
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+}
+
 func TestLibrarySyncSamePathBoundariesLeaveStateUntouched(t *testing.T) {
 	for _, test := range []struct {
 		name, issue string
 		remote      func(string) error
 		local       func(string) error
 	}{
-		{"divergent file", "Issue #17", func(root string) error {
-			return os.WriteFile(filepath.Join(root, "base"), []byte("remote"), 0o600)
-		}, func(root string) error { return os.WriteFile(filepath.Join(root, "base"), []byte("local"), 0o600) }},
 		{"delete modify", "Issue #18", func(root string) error {
 			return os.WriteFile(filepath.Join(root, "base"), []byte("remote"), 0o600)
 		}, func(root string) error { return os.Remove(filepath.Join(root, "base")) }},
@@ -1377,6 +3093,63 @@ func TestLibrarySyncContinuousTrivialMergeCompetition(t *testing.T) {
 		previous = replacement
 	}
 	assertTestConverged(t, state.environment, state.clientDir, state.worktree)
+}
+
+func TestLibrarySyncContinuousDivergentHeadConflictsReuseCapturedSeed(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	publisherPath := filepath.Join(publisherTree, "base")
+	subscriberPath := filepath.Join(subscriberTree, "base")
+	if err := os.WriteFile(publisherPath, []byte("remote-0"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var replacements []pendingPublication
+	advances := 0
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+		now: func() time.Time { return time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC) },
+		beforeHeadCAS: func() error {
+			if advances == 2 {
+				return nil
+			}
+			advances++
+			if err := os.WriteFile(publisherPath, []byte(fmt.Sprintf("remote-%d", advances)), 0o600); err != nil {
+				return err
+			}
+			return syncTestWorktree(t, publisherDir, publisherTree)
+		},
+		afterPendingReplacement: func() error {
+			replacements = append(replacements, readTestPendingPublication(t, subscriberDir, subscriberTree))
+			return nil
+		}}
+	if err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, config); err != nil {
+		t.Fatal(err)
+	}
+	if advances != 2 || len(replacements) != 2 {
+		t.Fatalf("advances=%d replacements=%d", advances, len(replacements))
+	}
+	for index, pending := range replacements {
+		history, err := _decodeCandidateHistory(pending.CandidateHistory)
+		if err != nil || len(history) != index+1 || pending.CapturedCommit != replacements[0].CapturedCommit ||
+			pending.CapturedRoot != replacements[0].CapturedRoot || !bytes.Equal(pending.CapturedData, replacements[0].CapturedData) {
+			t.Fatalf("replacement %d=%+v history=%d err=%v", index, pending, len(history), err)
+		}
+		if index > 0 && !bytes.Equal(history[len(history)-1], replacements[index-1].CandidateData) {
+			t.Fatalf("replacement %d did not replay prior Candidate", index)
+		}
+	}
+	conflict := filepath.Join(subscriberTree, "base (Filecloud conflict bbbbbbbb 20260809T120000Z)")
+	remote, remoteErr := os.ReadFile(subscriberPath)
+	local, localErr := os.ReadFile(conflict)
+	if remoteErr != nil || localErr != nil || string(remote) != "remote-2" || string(local) != "local" {
+		t.Fatalf("remote=%q/%v local=%q/%v", remote, remoteErr, local, localErr)
+	}
+	assertTestConverged(t, environment, subscriberDir, subscriberTree)
 }
 
 func TestLibrarySyncResumesAfterPendingMergeReplacement(t *testing.T) {
@@ -1807,6 +3580,819 @@ func TestLibrarySyncRemoteApplyRejectsLocalSaveBeforeRecovery(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(subscriberTree, name)); err != nil {
 			t.Fatalf("local save path %q moved: %v", name, err)
 		}
+	}
+	assertNoSyncInternalPaths(t, subscriberTree)
+}
+
+func TestLibrarySyncMixedPromotionRollbackRestoresCapturedInode(t *testing.T) {
+	for _, nested := range []bool{false, true} {
+		name := "root"
+		promotedPath := "base"
+		if nested {
+			name = "nested"
+			promotedPath = "folder/base"
+		}
+		t.Run(name, func(t *testing.T) {
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if nested {
+				if err := os.MkdirAll(filepath.Join(publisherTree, "folder"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(publisherTree, promotedPath), []byte("initial"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(publisherTree, "z-second"), []byte("second-original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(publisherTree, promotedPath), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(publisherTree, "z-second"), []byte("second-remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, promotedPath), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			promotedBefore, err := os.Stat(filepath.Join(subscriberTree, promotedPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondBefore, err := os.Stat(filepath.Join(subscriberTree, "z-second"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			hidden := make(map[string]string)
+			var applyBinding clientBinding
+			var disturbed, repaired atomic.Bool
+			config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+				afterSyncRecoveryRename: func(path, recoveryName string) error {
+					hidden[path] = recoveryName
+					if applyBinding.Worktree == "" {
+						applyBinding = readTestBinding(t, subscriberDir, subscriberTree)
+					}
+					return nil
+				},
+				fsActionFault: func(point string, action fsAction) error {
+					if point == "after_completed" && action.Op == fsOpRename && action.ExpectedObject != "" &&
+						action.OriginActionID == "" && disturbed.CompareAndSwap(false, true) {
+						changed := secondBefore.ModTime().Add(time.Hour)
+						return os.Chtimes(filepath.Join(subscriberTree, hidden["z-second"]), changed, changed)
+					}
+					if point == "before_intent_commit" && action.Op == fsOpRestorePromotion && repaired.CompareAndSwap(false, true) {
+						return os.Chtimes(filepath.Join(subscriberTree, hidden["z-second"]), secondBefore.ModTime(), secondBefore.ModTime())
+					}
+					return nil
+				}}
+			err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+				strings.NewReader(""), io.Discard, io.Discard, config)
+			if err == nil || !strings.Contains(err.Error(), "captured local content changed") || !disturbed.Load() || !repaired.Load() {
+				t.Fatalf("mixed promotion rollback error=%v disturbed=%v repaired=%v", err, disturbed.Load(), repaired.Load())
+			}
+			for path, wantContent := range map[string]string{promotedPath: "local", "z-second": "second-original"} {
+				data, err := os.ReadFile(filepath.Join(subscriberTree, path))
+				if err != nil || string(data) != wantContent {
+					t.Fatalf("restored %q=%q err=%v", path, data, err)
+				}
+			}
+			promotedAfter, err := os.Stat(filepath.Join(subscriberTree, promotedPath))
+			if err != nil || !os.SameFile(promotedBefore, promotedAfter) || !promotedBefore.ModTime().Equal(promotedAfter.ModTime()) {
+				t.Fatalf("promoted inode/mtime changed before=%v after=%v err=%v", promotedBefore, promotedAfter, err)
+			}
+			secondAfter, err := os.Stat(filepath.Join(subscriberTree, "z-second"))
+			if err != nil || !os.SameFile(secondBefore, secondAfter) || !secondBefore.ModTime().Equal(secondAfter.ModTime()) {
+				t.Fatalf("second inode/mtime changed before=%v after=%v err=%v", secondBefore, secondAfter, err)
+			}
+			if after := readTestBinding(t, subscriberDir, subscriberTree); after != applyBinding {
+				t.Fatalf("mixed rollback changed binding before=%+v after=%+v", applyBinding, after)
+			}
+			for _, table := range []string{"pending_checkouts", "checkout_paths", "sync_recoveries", "sync_recovery_promotions", "fs_actions"} {
+				if count := countClientRows(t, subscriberDir, table, subscriberTree); count != 0 {
+					t.Fatalf("%s rows=%d", table, count)
+				}
+			}
+			assertNoSyncInternalPaths(t, subscriberTree)
+			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+				t.Fatalf("sync after mixed rollback: %v", err)
+			}
+			assertTestConverged(t, environment, subscriberDir, subscriberTree)
+		})
+	}
+}
+
+func TestRestoreRollbackRootMtimeRejectsStaleActionEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name, state, corruptColumn string
+		changeRoot, laterAction    bool
+	}{
+		{name: "intent parent device", state: fsStateIntent, corruptColumn: "parent_device"},
+		{name: "intent parent inode", state: fsStateIntent, corruptColumn: "parent_inode"},
+		{name: "completed parent device", state: fsStateCompleted, corruptColumn: "parent_device"},
+		{name: "completed parent inode", state: fsStateCompleted, corruptColumn: "parent_inode"},
+		{name: "completed stale mtime", state: fsStateCompleted, changeRoot: true},
+		{name: "completed stale order", state: fsStateCompleted, laterAction: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clientDir, worktree := t.TempDir(), t.TempDir()
+			db, err := initializeClientDB(t.Context(), clientDir, syncDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			root, err := openWorktreeRoot(worktree, func(*os.File) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			if err := bindFSJournalRoot(t.Context(), db, worktree, root); err != nil {
+				t.Fatal(err)
+			}
+			var stat syscall.Stat_t
+			if err := syscall.Fstat(int(root.directory.Fd()), &stat); err != nil {
+				t.Fatal(err)
+			}
+			mtimeNS := time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec).UnixNano()
+			if err := savePendingCheckout(t.Context(), db, pendingCheckout{ServerURL: "http://localhost", LibraryID: "library",
+				Worktree: worktree, UserID: "user", DeviceID: "device", TargetCommit: "commit", ApplyState: "rolling_back",
+				ConflictPromotions: _emptyConflictPromotions, RollbackRootMtimeNS: mtimeNS, RollbackRootMtimeValid: true}); err != nil {
+				t.Fatal(err)
+			}
+			action := fsAction{Worktree: worktree, ActionID: "00112233445566778899aabbccddeeff", Order: 0,
+				Phase: fsPhaseRollback, Op: fsOpMtime, ParentDevice: root.device, ParentInode: root.inode,
+				ExpectedKind: "Directory", ExpectedDevice: root.device, ExpectedInode: root.inode,
+				ExpectedMtime: time.Unix(0, mtimeNS).UTC().Format(time.RFC3339Nano), State: fsStateIntent}
+			if err := insertFSActionIntent(t.Context(), db, action); err != nil {
+				t.Fatal(err)
+			}
+			if test.state == fsStateCompleted {
+				if _, err := db.Exec(`UPDATE fs_actions SET state='completed' WHERE worktree=? AND action_id=?`, worktree, action.ActionID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.corruptColumn != "" {
+				if _, err := db.Exec(`UPDATE fs_actions SET `+test.corruptColumn+`=`+test.corruptColumn+`+1
+					WHERE worktree=? AND action_id=?`, worktree, action.ActionID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.laterAction {
+				later := action
+				later.ActionID, later.Order, later.Source, later.State = "11223344556677889900aabbccddeeff", 1, "later", fsStateCompleted
+				later.ExpectedKind = "File"
+				if err := insertFSActionIntent(t.Context(), db, later); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.Exec(`UPDATE fs_actions SET state='completed' WHERE worktree=? AND action_id=?`, worktree, later.ActionID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.changeRoot {
+				changed := time.Unix(0, mtimeNS).Add(time.Second)
+				if err := os.Chtimes(worktree, changed, changed); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.Stat(worktree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := restoreRollbackRootMtime(t.Context(), db, root, worktree, nil); err == nil {
+				t.Fatal("stale root mtime action evidence was accepted")
+			}
+			after, err := os.Stat(worktree)
+			if err != nil || !after.ModTime().Equal(before.ModTime()) {
+				t.Fatalf("rejection changed root mtime before=%v after=%v err=%v", before.ModTime(), after.ModTime(), err)
+			}
+			var pending, actions int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM pending_checkouts WHERE worktree=? AND apply_state='rolling_back'`, worktree).Scan(&pending); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT COUNT(*) FROM fs_actions WHERE worktree=?`, worktree).Scan(&actions); err != nil {
+				t.Fatal(err)
+			}
+			wantActions := 1
+			if test.laterAction {
+				wantActions = 2
+			}
+			if pending != 1 || actions != wantActions {
+				t.Fatalf("rejection cleaned durable state pending=%d actions=%d", pending, actions)
+			}
+		})
+	}
+}
+
+func TestRestoreRollbackRootMtimeRejectsWrongRootBeforeStateOrFSChanges(t *testing.T) {
+	for _, state := range []string{fsStateIntent, fsStateCompleted} {
+		for _, scenario := range []string{"path replacement", "wrong worktree argument"} {
+			t.Run(state+"/"+scenario, func(t *testing.T) {
+				clientDir, worktree := t.TempDir(), t.TempDir()
+				db, err := initializeClientDB(t.Context(), clientDir, syncDirectory)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				root, err := openWorktreeRoot(worktree, func(*os.File) error { return nil })
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer root.Close()
+				if err := bindFSJournalRoot(t.Context(), db, worktree, root); err != nil {
+					t.Fatal(err)
+				}
+				var stat syscall.Stat_t
+				if err := syscall.Fstat(int(root.directory.Fd()), &stat); err != nil {
+					t.Fatal(err)
+				}
+				mtimeNS := time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec).UnixNano()
+				if err := savePendingCheckout(t.Context(), db, pendingCheckout{ServerURL: "http://localhost", LibraryID: "library",
+					Worktree: worktree, UserID: "user", DeviceID: "device", TargetCommit: "commit", ApplyState: "rolling_back",
+					ConflictPromotions: _emptyConflictPromotions, RollbackRootMtimeNS: mtimeNS, RollbackRootMtimeValid: true}); err != nil {
+					t.Fatal(err)
+				}
+				action := fsAction{Worktree: worktree, ActionID: "00112233445566778899aabbccddeeff", Order: 0,
+					Phase: fsPhaseRollback, Op: fsOpMtime, ParentDevice: root.device, ParentInode: root.inode,
+					ExpectedKind: "Directory", ExpectedDevice: root.device, ExpectedInode: root.inode,
+					ExpectedMtime: time.Unix(0, mtimeNS).UTC().Format(time.RFC3339Nano), State: fsStateIntent}
+				if err := insertFSActionIntent(t.Context(), db, action); err != nil {
+					t.Fatal(err)
+				}
+				if state == fsStateCompleted {
+					if _, err := db.Exec(`UPDATE fs_actions SET state='completed' WHERE worktree=?`, worktree); err != nil {
+						t.Fatal(err)
+					}
+				}
+				callWorktree := worktree + "-wrong"
+				oldPath, replacementPath := worktree, ""
+				if scenario == "path replacement" {
+					oldPath = worktree + "-opened"
+					if err := os.Rename(worktree, oldPath); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(worktree, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					replacementPath = worktree
+					callWorktree = worktree
+				}
+				oldBefore, err := os.Stat(oldPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var replacementBefore os.FileInfo
+				if replacementPath != "" {
+					replacementBefore, err = os.Stat(replacementPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := restoreRollbackRootMtime(t.Context(), db, root, callWorktree, nil); err == nil {
+					t.Fatal("wrong rollback root was accepted")
+				}
+				oldAfter, err := os.Stat(oldPath)
+				if err != nil || !oldAfter.ModTime().Equal(oldBefore.ModTime()) {
+					t.Fatalf("opened tree changed before=%v after=%v err=%v", oldBefore, oldAfter, err)
+				}
+				if replacementPath != "" {
+					replacementAfter, err := os.Stat(replacementPath)
+					if err != nil || !replacementAfter.ModTime().Equal(replacementBefore.ModTime()) {
+						t.Fatalf("replacement tree changed before=%v after=%v err=%v", replacementBefore, replacementAfter, err)
+					}
+				}
+				var pending, actions int
+				if err := db.QueryRow(`SELECT COUNT(*) FROM pending_checkouts WHERE worktree=?`, worktree).Scan(&pending); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.QueryRow(`SELECT COUNT(*) FROM fs_actions WHERE worktree=?`, worktree).Scan(&actions); err != nil {
+					t.Fatal(err)
+				}
+				if pending != 1 || actions != 1 {
+					t.Fatalf("rejection changed durable rows pending=%d actions=%d", pending, actions)
+				}
+			})
+		}
+	}
+}
+
+func TestPublicCheckoutRecoveryRejectsCorruptRootMtimeStateBeforeFSChanges(t *testing.T) {
+	for _, test := range []struct {
+		name, command, state string
+		valid                int64
+	}{
+		{name: "sync applying without mtime", command: "sync", state: "applying"},
+		{name: "sync invalid valid flag", command: "sync", state: "rolling_back", valid: 2},
+		{name: "unbind finalized without mtime", command: "unbind", state: "finalized"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := newImportedBinding(t)
+			db, err := openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := openWorktreeRoot(state.worktree, func(*os.File) error { return nil })
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := bindFSJournalRoot(t.Context(), db, state.worktree, root); err != nil {
+				root.Close()
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(state.worktree, "action-source"), []byte("source"), 0o600); err != nil {
+				root.Close()
+				db.Close()
+				t.Fatal(err)
+			}
+			var source syscall.Stat_t
+			if err := syscall.Stat(filepath.Join(state.worktree, "action-source"), &source); err != nil {
+				root.Close()
+				db.Close()
+				t.Fatal(err)
+			}
+			action := fsAction{Worktree: state.worktree, ActionID: "00112233445566778899aabbccddeeff", Order: 0,
+				Phase: fsPhasePreBase, Op: fsOpRename, ParentDevice: root.device, ParentInode: root.inode,
+				Source: "action-source", Target: "action-target", ExpectedKind: "File", ExpectedDevice: uint64(source.Dev),
+				ExpectedInode: source.Ino, State: fsStateIntent}
+			if err := insertFSActionIntent(t.Context(), db, action); err != nil {
+				root.Close()
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := savePendingCheckout(t.Context(), db, pendingCheckout{ServerURL: state.binding.ServerURL,
+				LibraryID: state.binding.LibraryID, Worktree: state.worktree, UserID: state.binding.UserID,
+				DeviceID: state.binding.DeviceID, TargetCommit: state.binding.SyncBase, TargetRoot: state.binding.SyncBaseRoot,
+				HeadETag: state.binding.HeadETag, ConflictPromotions: _emptyConflictPromotions}); err != nil {
+				root.Close()
+				db.Close()
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`UPDATE pending_checkouts SET apply_state=?,rollback_root_mtime_valid=? WHERE worktree=?`,
+				test.state, test.valid, state.worktree); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`PRAGMA ignore_check_constraints=OFF`); err != nil {
+				t.Fatal(err)
+			}
+			if err := root.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"--client-dir", state.clientDir, "--worktree", state.worktree}
+			var runErr error
+			if test.command == "sync" {
+				runErr = runLibrarySync(t.Context(), args, io.Discard, io.Discard,
+					libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
+			} else {
+				runErr = runLibraryUnbind(t.Context(), args, io.Discard, io.Discard,
+					libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
+			}
+			if runErr == nil || !strings.Contains(runErr.Error(), "state is corrupt") {
+				t.Fatalf("public %s accepted corrupt state: %v", test.command, runErr)
+			}
+			if data, err := os.ReadFile(filepath.Join(state.worktree, "action-source")); err != nil || string(data) != "source" {
+				t.Fatalf("source changed data=%q err=%v", data, err)
+			}
+			if _, err := os.Lstat(filepath.Join(state.worktree, "action-target")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("target created err=%v", err)
+			}
+			db, err = openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var pending, actions, bindings int
+			for table, destination := range map[string]*int{"pending_checkouts": &pending, "fs_actions": &actions, "bindings": &bindings} {
+				if err := db.QueryRow("SELECT COUNT(*) FROM "+table+" WHERE worktree=?", state.worktree).Scan(destination); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if pending != 1 || actions != 1 || bindings != 1 {
+				t.Fatalf("public rejection changed rows pending=%d actions=%d bindings=%d", pending, actions, bindings)
+			}
+		})
+	}
+}
+
+func TestRegisterSyncRecoveryPlanPreservesEpochRootMtime(t *testing.T) {
+	clientDir, worktree := t.TempDir(), t.TempDir()
+	epoch := time.Unix(0, 0)
+	if err := os.Chtimes(worktree, epoch, epoch); err != nil {
+		t.Fatal(err)
+	}
+	db, err := initializeClientDB(t.Context(), clientDir, syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	root, err := openWorktreeRoot(worktree, func(*os.File) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := savePendingCheckout(t.Context(), db, pendingCheckout{ServerURL: "http://localhost", LibraryID: "library",
+		Worktree: worktree, UserID: "user", DeviceID: "device", TargetCommit: "commit",
+		ConflictPromotions: _emptyConflictPromotions}); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerSyncRecoveryPlan(t.Context(), db, root, worktree, nil, libraryClientConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var mtime int64
+	var valid bool
+	if err := db.QueryRow(`SELECT apply_state,rollback_root_mtime_ns,rollback_root_mtime_valid
+		FROM pending_checkouts WHERE worktree=?`, worktree).Scan(&state, &mtime, &valid); err != nil {
+		t.Fatal(err)
+	}
+	if state != "applying" || mtime != 0 || !valid {
+		t.Fatalf("epoch transition state=%q mtime=%d valid=%v", state, mtime, valid)
+	}
+}
+
+func TestLibrarySyncRestorePromotionCrashMatrix(t *testing.T) {
+	points := []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"}
+	type crashStage struct{ op, point string }
+	for _, nested := range []bool{false, true} {
+		stages := make([]crashStage, 0, len(points)*2)
+		for _, point := range points {
+			stages = append(stages, crashStage{fsOpRestorePromotion, point})
+			if !nested {
+				stages = append(stages, crashStage{fsOpMtime, point})
+			}
+		}
+		for _, stage := range stages {
+			op, point := stage.op, stage.point
+			name := "root/" + op + "/" + point
+			promotedPath := "base"
+			if nested {
+				name = "nested/" + op + "/" + point
+				promotedPath = "folder/base"
+			}
+			t.Run(name, func(t *testing.T) {
+				environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+				publisherDir, publisherTree := newClientPaths(t)
+				if err := os.MkdirAll(filepath.Dir(filepath.Join(publisherTree, promotedPath)), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				for path, content := range map[string]string{promotedPath: "initial", "z-second": "second-original"} {
+					if err := os.WriteFile(filepath.Join(publisherTree, path), []byte(content), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				publisherArgs := append(bindArgs(publisherDir, environment.server.URL, testClientLibraryID,
+					publisherTree, testClientDeviceID), "--import-local")
+				if err := runTest(t.Context(), publisherArgs, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+					t.Fatal(err)
+				}
+				var failRequests atomic.Bool
+				proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if failRequests.Load() {
+						http.Error(w, "restart barrier", http.StatusServiceUnavailable)
+						return
+					}
+					environment.handler.ServeHTTP(w, r)
+				}))
+				t.Cleanup(proxy.Close)
+				subscriberDir, subscriberTree := newClientPaths(t)
+				if err := runTest(t.Context(), bindArgs(subscriberDir, proxy.URL, testClientLibraryID, subscriberTree,
+					testOtherDeviceID), strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+					t.Fatal(err)
+				}
+				for path, content := range map[string]string{promotedPath: "remote", "z-second": "second-remote"} {
+					if err := os.WriteFile(filepath.Join(publisherTree, path), []byte(content), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(subscriberTree, promotedPath), []byte("local"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				initialTree := captureExactTree(t, subscriberTree)
+				setupErr := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir,
+					"--worktree", subscriberTree}, strings.NewReader(""), io.Discard, io.Discard,
+					libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+						afterSyncCheckoutTransition: func() error { return errors.New("capture apply baseline") }})
+				if setupErr == nil || !strings.Contains(setupErr.Error(), "capture apply baseline") {
+					t.Fatalf("establish preapply transition error=%v", setupErr)
+				}
+				assertExactTree(t, subscriberTree, initialTree)
+				if state := readPendingCheckoutState(t, subscriberDir, subscriberTree); state != "pending" {
+					t.Fatalf("preapply checkout state=%q want pending", state)
+				}
+
+				preapplyTree := captureExactTree(t, subscriberTree)
+				preapplyBinding := captureTestBinding(t, subscriberDir, subscriberTree)
+				preapplyIndex := captureTestPathIndex(t, subscriberDir, subscriberTree)
+				preapplyHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+					[]byte(environment.token))
+				if err != nil || preapplyHead.CommitID == nil {
+					t.Fatalf("read preapply Head: head=%+v err=%v", preapplyHead, err)
+				}
+				baselineTables := []string{"pending_publications", "pending_checkouts", "checkout_paths", "sync_recoveries",
+					"sync_recovery_promotions", "fs_actions"}
+				preapplyCounts := make(map[string]int, len(baselineTables))
+				for _, table := range baselineTables {
+					preapplyCounts[table] = countClientRows(t, subscriberDir, table, subscriberTree)
+					want := 0
+					if table == "pending_checkouts" {
+						want = 1
+					}
+					if preapplyCounts[table] != want {
+						t.Fatalf("unexpected preapply %s rows=%d want=%d", table, preapplyCounts[table], want)
+					}
+				}
+				beforeJournalBindings := captureTestJournalBindings(t, subscriberDir, subscriberTree)
+
+				crashKind := "File"
+				if op == fsOpMtime {
+					crashKind = "Directory"
+				}
+				crash := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+				crash.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+					"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+					"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhaseRollback, "FILECLOUD_PUBLIC_CRASH_OP="+op,
+					"FILECLOUD_PUBLIC_CRASH_KIND="+crashKind, "FILECLOUD_PUBLIC_CRASH_POINT="+point,
+					"FILECLOUD_PUBLIC_CRASH_ROLE=mixed-restore-promotion", "FILECLOUD_PUBLIC_SECOND_PATH=z-second")
+				assertProcessSIGKILL(t, crash.Run())
+				if state := readPendingCheckoutState(t, subscriberDir, subscriberTree); state != "rolling_back" {
+					t.Fatalf("crashed mixed checkout state=%q", state)
+				}
+				db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var promoted, secondRecovery int
+				promotedErr := db.QueryRow(`SELECT COUNT(*) FROM sync_recovery_promotions
+					WHERE worktree=? AND source_path=?`, subscriberTree, promotedPath).Scan(&promoted)
+				secondErr := db.QueryRow(`SELECT COUNT(*) FROM sync_recoveries
+					WHERE worktree=? AND path='z-second'`, subscriberTree).Scan(&secondRecovery)
+				if err := errors.Join(promotedErr, secondErr, db.Close()); err != nil {
+					t.Fatal(err)
+				}
+				wantRecoveryRows := 1
+				if op == fsOpMtime {
+					wantRecoveryRows = 0
+				}
+				if promoted != wantRecoveryRows || secondRecovery != wantRecoveryRows {
+					t.Fatalf("completed first promotion links=%d different failing recoveries=%d want=%d",
+						promoted, secondRecovery, wantRecoveryRows)
+				}
+
+				failRequests.Store(true)
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err == nil || !strings.Contains(err.Error(), "Service Unavailable") {
+					t.Fatalf("rollback restart barrier error=%v", err)
+				}
+				assertExactTree(t, subscriberTree, preapplyTree)
+				postrollbackBinding := captureTestBinding(t, subscriberDir, subscriberTree)
+				if !reflect.DeepEqual(postrollbackBinding, preapplyBinding) {
+					t.Fatalf("binding differs preapply vs postrollback: preapply=%+v postrollback=%+v access_token_equal=%v",
+						preapplyBinding.binding, postrollbackBinding.binding,
+						bytes.Equal(preapplyBinding.accessToken, postrollbackBinding.accessToken))
+				}
+				if postrollbackIndex := captureTestPathIndex(t, subscriberDir, subscriberTree); !reflect.DeepEqual(postrollbackIndex, preapplyIndex) {
+					t.Fatalf("path_index differs preapply vs postrollback: preapply=%+v postrollback=%+v", preapplyIndex, postrollbackIndex)
+				}
+				for _, table := range baselineTables {
+					if count := countClientRows(t, subscriberDir, table, subscriberTree); count != 0 {
+						t.Fatalf("postrollback %s rows=%d; preapply=%d", table, count, preapplyCounts[table])
+					}
+				}
+				afterJournalBindings := captureTestJournalBindings(t, subscriberDir, subscriberTree)
+				if !reflect.DeepEqual(afterJournalBindings, beforeJournalBindings) {
+					t.Fatalf("fs_journal_bindings differ preapply vs postrollback: preapply=%+v postrollback=%+v",
+						beforeJournalBindings, afterJournalBindings)
+				}
+				assertNoSyncInternalPaths(t, subscriberTree)
+				postrollbackHead, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+					[]byte(environment.token))
+				if err != nil || postrollbackHead.CommitID == nil || *postrollbackHead.CommitID != *preapplyHead.CommitID ||
+					postrollbackHead.ETag != preapplyHead.ETag {
+					t.Fatalf("Head differs preapply vs postrollback: preapply=%+v postrollback=%+v err=%v",
+						preapplyHead, postrollbackHead, err)
+				}
+				failRequests.Store(false)
+
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+					t.Fatalf("sync after mixed rollback: %v", err)
+				}
+				assertTestConverged(t, environment, subscriberDir, subscriberTree)
+				remote, remoteErr := os.ReadFile(filepath.Join(subscriberTree, promotedPath))
+				parent, leaf := filepath.Split(filepath.Join(subscriberTree, promotedPath))
+				matches, globErr := filepath.Glob(filepath.Join(parent,
+					strings.TrimSuffix(leaf, filepath.Ext(leaf))+" (Filecloud conflict *)"+filepath.Ext(leaf)))
+				if remoteErr != nil || globErr != nil || string(remote) != "remote" || len(matches) != 1 {
+					t.Fatalf("converged promoted file=%q/%v conflicts=%v/%v", remote, remoteErr, matches, globErr)
+				}
+				local, err := os.ReadFile(matches[0])
+				second, secondErr := os.ReadFile(filepath.Join(subscriberTree, "z-second"))
+				if err != nil || secondErr != nil || string(local) != "local" || string(second) != "second-remote" {
+					t.Fatalf("converged contents local=%q/%v second=%q/%v", local, err, second, secondErr)
+				}
+			})
+		}
+	}
+}
+
+func TestRestorePromotionOwnershipRejectsInvalidStatesWithoutFSChanges(t *testing.T) {
+	for _, scenario := range []string{"orphan", "wrong target", "wrong identity"} {
+		t.Run(scenario, func(t *testing.T) {
+			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			setup := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
+			setup.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
+				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
+				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
+				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT=after_completed",
+				"FILECLOUD_PUBLIC_CRASH_ROLE=promotion")
+			assertProcessSIGKILL(t, setup.Run())
+			db, err := openClientDB(filepath.Join(subscriberDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := beginSyncRollback(t.Context(), db, subscriberTree); err != nil {
+				t.Fatal(err)
+			}
+			recoveries, err := loadSyncRecoveries(t.Context(), db, subscriberTree)
+			if err != nil || len(recoveries) != 1 {
+				t.Fatalf("recoveries=%+v err=%v", recoveries, err)
+			}
+			links, err := loadSyncRecoveryPromotions(t.Context(), db, subscriberTree)
+			if err != nil || len(links) != 1 {
+				t.Fatalf("links=%+v err=%v", links, err)
+			}
+			promotions, err := loadConflictPromotions(t.Context(), db, subscriberTree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, _, err := linkedPromotionProvenance(recoveries[0], links[0], promotions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actions, err := loadFSActions(t.Context(), db, subscriberTree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var current fsAction
+			var order int64
+			for _, action := range actions {
+				if action.ActionID == links[0].currentActionID {
+					current = action
+				}
+				order = max(order, action.Order+1)
+			}
+			root, err := openWorktreeRoot(subscriberTree, func(*os.File) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			parentPath, leaf := splitFSActionPath(current.Target)
+			parent, openedLeaf, err := promotionTargetParent(t.Context(), db, root, subscriberTree, current.Target)
+			if err != nil || openedLeaf != leaf {
+				t.Fatalf("source parent leaf=%q err=%v", openedLeaf, err)
+			}
+			var parentStat syscall.Stat_t
+			if err := syscall.Fstat(int(parent.Fd()), &parentStat); err != nil {
+				parent.Close()
+				t.Fatal(err)
+			}
+			if err := parent.Close(); err != nil {
+				t.Fatal(err)
+			}
+			id, err := newFSActionID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			restore := fsAction{Worktree: subscriberTree, ActionID: id, Order: order, Phase: fsPhaseRollback,
+				Op: fsOpRestorePromotion, Parent: parentPath, ParentDevice: uint64(parentStat.Dev), ParentInode: parentStat.Ino,
+				Source: leaf, Target: target, ExpectedKind: "File", ExpectedDevice: current.ExpectedDevice,
+				ExpectedInode: current.ExpectedInode, State: fsStateIntent}
+			if scenario == "wrong target" {
+				restore.Target = syncRecoveryPrefix + "00112233445566778899aabbccddeeff"
+			}
+			if scenario == "wrong identity" {
+				restore.ExpectedInode++
+			}
+			if err := insertFSActionIntent(t.Context(), db, restore); err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "orphan" {
+				if _, err := db.Exec(`UPDATE sync_recovery_promotions SET rollback_action_id=? WHERE worktree=?`, id, subscriberTree); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := captureExactTree(t, subscriberTree)
+			if err := validatePendingPromotionTargets(t.Context(), db, subscriberTree); err == nil {
+				t.Fatal("invalid restore promotion ownership was accepted")
+			}
+			if err := recoverFSActions(t.Context(), db, subscriberTree, root, nil); err == nil {
+				t.Fatal("invalid restore promotion was replayed")
+			}
+			before["."] = captureExactTree(t, subscriberTree)["."]
+			assertExactTree(t, subscriberTree, before)
+		})
+	}
+}
+
+func TestLibrarySyncPromotionCollisionRollbackPreservesSuccessor(t *testing.T) {
+	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+	if err := os.WriteFile(filepath.Join(publisherTree, "z-second"), []byte("second-original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(publisherTree, "z-second"), []byte("second-remote"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	baseBefore, err := os.Stat(filepath.Join(subscriberTree, "base"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBefore, err := os.Stat(filepath.Join(subscriberTree, "z-second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hidden := make(map[string]string)
+	var collision, disturbed, repaired atomic.Bool
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+		afterSyncRecoveryRename: func(path, name string) error { hidden[path] = name; return nil },
+		fsActionFault: func(point string, action fsAction) error {
+			if point == "before_action" && action.Op == fsOpRename && action.ExpectedObject != "" &&
+				action.OriginActionID == "" && collision.CompareAndSwap(false, true) {
+				return os.WriteFile(filepath.Join(subscriberTree, filepath.FromSlash(action.Target)), []byte("collision"), 0o600)
+			}
+			if point == "after_completed" && action.Op == fsOpRename && action.ExpectedObject != "" &&
+				action.OriginActionID == "" && disturbed.CompareAndSwap(false, true) {
+				changed := secondBefore.ModTime().Add(time.Hour)
+				return os.Chtimes(filepath.Join(subscriberTree, hidden["z-second"]), changed, changed)
+			}
+			if point == "before_intent_commit" && action.Op == fsOpRestorePromotion && repaired.CompareAndSwap(false, true) {
+				return os.Chtimes(filepath.Join(subscriberTree, hidden["z-second"]), secondBefore.ModTime(), secondBefore.ModTime())
+			}
+			return nil
+		}}
+	err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree},
+		strings.NewReader(""), io.Discard, io.Discard, config)
+	if err == nil || !strings.Contains(err.Error(), "captured local content changed") {
+		t.Fatalf("collision rollback error=%v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(subscriberTree, "base"))
+	baseAfter, statErr := os.Stat(filepath.Join(subscriberTree, "base"))
+	if err != nil || statErr != nil || string(data) != "local" || !os.SameFile(baseBefore, baseAfter) {
+		t.Fatalf("captured base data=%q read=%v stat=%v", data, err, statErr)
+	}
+	entries, err := os.ReadDir(subscriberTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var successors []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "base (Filecloud conflict ") {
+			successors = append(successors, filepath.Join(subscriberTree, entry.Name()))
+		}
+	}
+	if len(successors) != 1 {
+		t.Fatalf("collision successors=%v entries=%v", successors, entries)
+	}
+	if data, err := os.ReadFile(successors[0]); err != nil || string(data) != "collision" {
+		t.Fatalf("collision successor data=%q err=%v", data, err)
 	}
 	assertNoSyncInternalPaths(t, subscriberTree)
 }
@@ -2790,12 +5376,105 @@ func syncTestWorktreeConfirmingDeletes(t *testing.T, clientDir, worktree string)
 	return confirmTestDeletion(t, clientDir, worktree, required.candidate[:deleteCandidatePrefixLen], libraryClientConfig{})
 }
 
+type testBindingSnapshot struct {
+	binding     clientBinding
+	accessToken []byte
+}
+
+func captureTestBinding(t *testing.T, clientDir, worktree string) testBindingSnapshot {
+	t.Helper()
+	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var result testBindingSnapshot
+	err = db.QueryRow(`SELECT server_url,library_id,worktree,user_id,device_id,sync_base_commit,sync_base_root,head_etag,access_token
+		FROM bindings WHERE worktree=?`, worktree).Scan(&result.binding.ServerURL, &result.binding.LibraryID,
+		&result.binding.Worktree, &result.binding.UserID, &result.binding.DeviceID, &result.binding.SyncBase,
+		&result.binding.SyncBaseRoot, &result.binding.HeadETag, &result.accessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+type testPathIndexRow struct {
+	worktree, path, kind, id, canonicalMtime, actualMtime string
+	size                                                  int64
+}
+
+type testJournalBindingRow struct {
+	worktree                             string
+	rootDevice, rootInode, journalFormat uint64
+}
+
+func captureTestJournalBindings(t *testing.T, clientDir, worktree string) []testJournalBindingRow {
+	t.Helper()
+	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT worktree,root_device,root_inode,journal_format
+		FROM fs_journal_bindings WHERE worktree=? ORDER BY worktree,root_device,root_inode,journal_format`, worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []testJournalBindingRow
+	for rows.Next() {
+		var value testJournalBindingRow
+		if err := rows.Scan(&value.worktree, &value.rootDevice, &value.rootInode, &value.journalFormat); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func captureTestPathIndex(t *testing.T, clientDir, worktree string) []testPathIndexRow {
+	t.Helper()
+	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT worktree,path,type,object_id,canonical_mtime,actual_mtime,size
+		FROM path_index WHERE worktree=? ORDER BY path`, worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []testPathIndexRow
+	for rows.Next() {
+		var value testPathIndexRow
+		if err := rows.Scan(&value.worktree, &value.path, &value.kind, &value.id, &value.canonicalMtime,
+			&value.actualMtime, &value.size); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
 func assertTestConverged(t *testing.T, environment libraryCLIEnvironment, clientDir, worktree string) clientBinding {
 	t.Helper()
 	binding := readTestBinding(t, clientDir, worktree)
 	head, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
 	if err != nil || head.CommitID == nil || *head.CommitID != binding.SyncBase {
 		t.Fatalf("binding and Head differ: binding=%+v head=%+v err=%v", binding, head, err)
+	}
+	commit, err := getRemoteCommit(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID,
+		[]byte(environment.token), *head.CommitID)
+	if err != nil || commit.Root != binding.SyncBaseRoot {
+		t.Fatalf("Base and Head root differ: binding=%+v commit=%+v err=%v", binding, commit, err)
 	}
 	root, err := openWorktreeRoot(worktree, func(*os.File) error { return nil })
 	if err != nil {
@@ -2805,6 +5484,37 @@ func assertTestConverged(t *testing.T, environment libraryCLIEnvironment, client
 	closeErr := root.Close()
 	if scanErr != nil || closeErr != nil || snapshot.root != binding.SyncBaseRoot {
 		t.Fatalf("worktree and Base differ: snapshot=%s binding=%+v scan=%v close=%v", snapshot.root, binding, scanErr, closeErr)
+	}
+	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`SELECT path,type,object_id,canonical_mtime,size FROM path_index WHERE worktree=? ORDER BY path`, worktree)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	indexed := make(map[string]checkoutPath, len(snapshot.paths))
+	for rows.Next() {
+		var value checkoutPath
+		if err := rows.Scan(&value.path, &value.kind, &value.id, &value.mtime, &value.size); err != nil {
+			rows.Close()
+			db.Close()
+			t.Fatal(err)
+		}
+		indexed[value.path] = value
+	}
+	if err := errors.Join(rows.Err(), rows.Close(), db.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if len(indexed) != len(snapshot.paths) {
+		t.Fatalf("path index count=%d snapshot paths=%d", len(indexed), len(snapshot.paths))
+	}
+	for _, path := range snapshot.paths {
+		value, ok := indexed[path.path]
+		if !ok || value.kind != path.kind || value.id != path.id || value.mtime != path.mtime || value.size != path.size {
+			t.Fatalf("path index differs at %q: indexed=%+v snapshot=%+v", path.path, value, path)
+		}
 	}
 	return binding
 }

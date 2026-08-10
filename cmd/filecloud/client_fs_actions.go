@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,12 +30,13 @@ const (
 	fsPhaseRollback = "rollback"
 	fsPhasePostBase = "post_base"
 
-	fsOpCreateFile      = "create_file"
-	fsOpCreateDirectory = "create_directory"
-	fsOpRename          = "rename"
-	fsOpUnlink          = "unlink"
-	fsOpRmdir           = "rmdir"
-	fsOpMtime           = "mtime"
+	fsOpCreateFile       = "create_file"
+	fsOpCreateDirectory  = "create_directory"
+	fsOpRename           = "rename"
+	fsOpRestorePromotion = "restore_promotion"
+	fsOpUnlink           = "unlink"
+	fsOpRmdir            = "rmdir"
+	fsOpMtime            = "mtime"
 
 	fsStateIntent    = "intent"
 	fsStateCompleted = "completed"
@@ -204,7 +206,10 @@ func truncateUTF8(value string, limit int) string {
 }
 
 func validateFSAction(value fsAction) error {
-	preserve := value.OriginActionID != ""
+	linked := value.OriginActionID != ""
+	promotion := value.Op == fsOpRename && value.ExpectedObject != ""
+	restorePromotion := value.Op == fsOpRestorePromotion
+	preserve := linked && !promotion
 	if value.Worktree == "" || !validFSActionID(value.ActionID) || value.Order < 0 ||
 		(value.Phase != fsPhasePreBase && value.Phase != fsPhaseRollback && value.Phase != fsPhasePostBase) ||
 		(value.State != fsStateIntent && value.State != fsStateCompleted) || !validateFSRelativeParent(value.Parent) ||
@@ -213,9 +218,9 @@ func validateFSAction(value fsAction) error {
 			(value.ExpectedDevice == 0 || value.ExpectedInode == 0)) {
 		return errors.New("filesystem action journal contains invalid fixed fields")
 	}
-	if preserve != (value.Attempt >= 1) || (!preserve && value.Attempt != 0) ||
-		(preserve && (!validFSActionID(value.OriginActionID) || value.OriginActionID == value.ActionID)) {
-		return errors.New("filesystem action journal contains invalid preserve provenance")
+	if linked != (value.Attempt >= 1) || (!linked && value.Attempt != 0) ||
+		(linked && (!validFSActionID(value.OriginActionID) || value.OriginActionID == value.ActionID)) {
+		return errors.New("filesystem action journal contains invalid action provenance")
 	}
 	if (value.ExpectedDevice == 0) != (value.ExpectedInode == 0) {
 		return errors.New("filesystem action journal contains partial expected identity")
@@ -227,6 +232,8 @@ func validateFSAction(value fsAction) error {
 			(value.State == fsStateCompleted && value.Outcome != "preserve_unknown" && value.Outcome != "collision") {
 			return errors.New("filesystem action journal contains invalid preserve outcome")
 		}
+	} else if linked && (!promotion || value.Phase != fsPhasePreBase || value.Outcome != "" || value.InternalSource != "" || value.InternalTarget != "") {
+		return errors.New("filesystem action journal contains invalid promotion linkage")
 	} else if value.Outcome != "" && !(value.State == fsStateCompleted &&
 		(value.Op == fsOpCreateFile || value.Op == fsOpCreateDirectory) && value.Outcome == "rolled_back") {
 		return errors.New("filesystem action journal contains invalid outcome")
@@ -239,9 +246,23 @@ func validateFSAction(value fsAction) error {
 		(value.InternalTarget != "" && !validFSInternalName(value.InternalTarget)) {
 		return errors.New("filesystem action journal contains invalid internal ownership")
 	}
-	if !validateFSLeaf(value.Source, value.InternalSource, value.Op == fsOpMtime) ||
-		!validateFSLeaf(value.Target, value.InternalTarget, value.Op != fsOpRename) {
-		return errors.New("filesystem action journal contains invalid source or target leaf")
+	if !validateFSLeaf(value.Source, value.InternalSource, value.Op == fsOpMtime) {
+		return errors.New("filesystem action journal contains invalid source leaf")
+	}
+	if promotion {
+		targetParent, targetLeaf := splitFSActionPath(value.Target)
+		if !validateFSRelativeParent(targetParent) || !validRecoveryVisibleName(targetLeaf) || value.InternalTarget != "" {
+			return errors.New("filesystem promotion action contains invalid target path")
+		}
+	} else if restorePromotion {
+		components := strings.Split(value.Target, "/")
+		if !validateFSRelativeParent(value.Target) || len(components) == 0 ||
+			!strings.HasPrefix(components[0], syncRecoveryPrefix) ||
+			!validFSActionID(strings.TrimPrefix(components[0], syncRecoveryPrefix)) || value.InternalTarget != "" {
+			return errors.New("filesystem restore promotion action contains invalid hidden target path")
+		}
+	} else if !validateFSLeaf(value.Target, value.InternalTarget, value.Op != fsOpRename) {
+		return errors.New("filesystem action journal contains invalid target leaf")
 	}
 	if value.ExpectedKind != "File" && value.ExpectedKind != "Directory" {
 		return errors.New("filesystem action journal contains invalid expected kind")
@@ -253,7 +274,7 @@ func validateFSAction(value fsAction) error {
 		return errors.New("filesystem action journal contains invalid expected size")
 	}
 	if value.ExpectedMtime != "" {
-		if parsed, err := time.Parse("2006-01-02T15:04:05Z", value.ExpectedMtime); err != nil || parsed.Format("2006-01-02T15:04:05Z") != value.ExpectedMtime {
+		if parsed, err := time.Parse(time.RFC3339Nano, value.ExpectedMtime); err != nil || parsed.UTC().Format(time.RFC3339Nano) != value.ExpectedMtime {
 			return errors.New("filesystem action journal contains invalid expected mtime")
 		}
 	}
@@ -270,6 +291,17 @@ func validateFSAction(value fsAction) error {
 		if value.Source == "" || value.Target == "" || value.Source == value.Target {
 			return errors.New("filesystem rename action is invalid")
 		}
+		if promotion && (value.ExpectedKind != "File" || value.ExpectedMtime == "" ||
+			(value.InternalSource != "" && value.InternalSource != value.Source)) {
+			return errors.New("filesystem promotion action is invalid")
+		}
+	case fsOpRestorePromotion:
+		if linked || value.Phase != fsPhaseRollback || value.Source == "" || value.Target == "" ||
+			value.ExpectedKind != "File" || value.ExpectedDevice == 0 || value.ExpectedInode == 0 ||
+			value.ExpectedObject != "" || value.ExpectedSize != 0 ||
+			value.InternalSource != "" || value.InternalTarget != "" || value.Outcome != "" {
+			return errors.New("filesystem restore promotion action is invalid")
+		}
 	case fsOpUnlink:
 		if value.ExpectedKind != "File" || value.Source == "" || value.Target != "" ||
 			value.ExpectedObject == "" || value.ExpectedMtime == "" {
@@ -280,7 +312,7 @@ func validateFSAction(value fsAction) error {
 			return errors.New("filesystem rmdir action is invalid")
 		}
 	case fsOpMtime:
-		if value.Source == "" || value.Target != "" || value.ExpectedMtime == "" {
+		if (value.Source == "" && value.Parent != "") || value.Target != "" || value.ExpectedMtime == "" {
 			return errors.New("filesystem mtime action is invalid")
 		}
 	default:
@@ -400,6 +432,9 @@ func insertFSActionIntent(ctx context.Context, db *sql.DB, value fsAction) error
 }
 
 func executeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, value fsAction, fault fsActionFault) error {
+	if err := validatePendingCheckoutState(ctx, db, value.Worktree); err != nil {
+		return err
+	}
 	if err := bindFSJournalRoot(ctx, db, value.Worktree, root); err != nil {
 		return err
 	}
@@ -427,10 +462,16 @@ func executeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, valu
 }
 
 func actionPathState(parent *os.File, name string, value fsAction) (bool, bool, error) {
-	if name == "" {
-		return false, false, nil
-	}
 	var stat unix.Stat_t
+	if name == "" {
+		if value.Op != fsOpMtime {
+			return false, false, nil
+		}
+		err := unix.Fstat(int(parent.Fd()), &stat)
+		matches := err == nil && value.ExpectedKind == "Directory" && stat.Mode&syscall.S_IFMT == syscall.S_IFDIR &&
+			uint64(stat.Dev) == value.ExpectedDevice && stat.Ino == value.ExpectedInode
+		return err == nil, matches, err
+	}
 	err := unix.Fstatat(int(parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW)
 	if errors.Is(err, syscall.ENOENT) {
 		return false, false, nil
@@ -483,6 +524,11 @@ func rollbackZeroIdentityCreate(ctx context.Context, db *sql.DB, root *openedWor
 	if err != nil {
 		return err
 	}
+	var rootStat unix.Stat_t
+	if err := unix.Fstat(int(root.directory.Fd()), &rootStat); err != nil {
+		return err
+	}
+	rootMtimeNS := time.Unix(rootStat.Mtim.Sec, rootStat.Mtim.Nsec).UnixNano()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -509,8 +555,10 @@ func rollbackZeroIdentityCreate(ctx context.Context, db *sql.DB, root *openedWor
 	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 		return fail(errors.Join(errors.New("mark ambiguous filesystem creation rolled back"), err))
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE pending_checkouts SET apply_state = 'rolling_back'
-		WHERE worktree = ? AND apply_state IN ('pending', 'applying')`, value.Worktree); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE pending_checkouts SET apply_state = 'rolling_back',
+		rollback_root_mtime_ns = CASE WHEN rollback_root_mtime_valid=0 THEN ? ELSE rollback_root_mtime_ns END,
+		rollback_root_mtime_valid = 1 WHERE worktree = ? AND apply_state IN ('pending', 'applying')`,
+		rootMtimeNS, value.Worktree); err != nil {
 		return fail(err)
 	}
 	if fault != nil {
@@ -589,6 +637,9 @@ func advancePreserveUnknownCollision(ctx context.Context, db *sql.DB, root *open
 }
 
 func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, value fsAction, fault fsActionFault) error {
+	if err := validatePendingCheckoutState(ctx, db, value.Worktree); err != nil {
+		return err
+	}
 	if err := validateFSAction(value); err != nil {
 		return err
 	}
@@ -598,6 +649,18 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 	}
 	if err := validateFSActionJournal(ctx, db, value.Worktree, journal); err != nil {
 		return err
+	}
+	if value.Op == fsOpRename && value.ExpectedObject != "" {
+		if err := validatePromotionOwnership(ctx, db, value.Worktree, journal); err != nil {
+			return err
+		}
+		return completePromotionAction(ctx, db, root, value, fault)
+	}
+	if value.Op == fsOpRestorePromotion {
+		if err := validatePromotionOwnership(ctx, db, value.Worktree, journal); err != nil {
+			return err
+		}
+		return completeRestorePromotionAction(ctx, db, root, value, fault)
 	}
 	parent, err := openFSActionParent(root, value.Parent, value.ParentDevice, value.ParentInode)
 	if err != nil {
@@ -727,7 +790,12 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 		if value.ExpectedKind == "Directory" {
 			flags |= unix.O_DIRECTORY
 		}
-		fd, err := unix.Openat(int(parent.Fd()), value.Source, flags, 0)
+		var fd int
+		if value.Source == "" {
+			fd, err = unix.Dup(int(parent.Fd()))
+		} else {
+			fd, err = unix.Openat(int(parent.Fd()), value.Source, flags, 0)
+		}
 		if err != nil {
 			return err
 		}
@@ -781,7 +849,7 @@ func loadFSActionsWith(ctx context.Context, db fsActionQueryer, worktree string)
 	rows, err := db.QueryContext(ctx, `SELECT worktree, action_id, COALESCE(origin_action_id, ''), attempt, action_order, phase, op, parent_path,
 		parent_device, parent_inode, source_name, target_name, expected_kind, expected_device, expected_inode,
 		expected_object, expected_size, expected_mtime, internal_source, internal_target, action_outcome, state FROM fs_actions
-		WHERE worktree = ? ORDER BY action_order, action_id`, worktree)
+		WHERE worktree = ? ORDER BY action_order, action_id LIMIT ?`, worktree, maxSyncJournalRows+1)
 	if err != nil {
 		return nil, err
 	}
@@ -801,7 +869,13 @@ func loadFSActionsWith(ctx context.Context, db fsActionQueryer, worktree string)
 		}
 		values = append(values, value)
 	}
-	return values, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(values) > maxSyncJournalRows {
+		return nil, errors.New("filesystem action journal exceeds synchronization budget")
+	}
+	return values, nil
 }
 
 func loadFSActions(ctx context.Context, db *sql.DB, worktree string) ([]fsAction, error) {
@@ -842,9 +916,26 @@ func validateFSActionJournal(ctx context.Context, db fsActionQueryer, worktree s
 	}
 	for originID, chain := range chains {
 		origin, ok := byID[originID]
-		if !ok || origin.Worktree != worktree || origin.Phase != fsPhasePreBase ||
-			(origin.Op != fsOpCreateFile && origin.Op != fsOpCreateDirectory) || origin.State != fsStateCompleted ||
-			origin.Outcome != "rolled_back" || origin.ExpectedDevice != 0 || origin.ExpectedInode != 0 {
+		if !ok || origin.Worktree != worktree || origin.OriginActionID != "" || origin.Attempt != 0 {
+			return errors.New("filesystem action chain has an invalid root")
+		}
+		if origin.Op == fsOpRename && origin.ExpectedObject != "" {
+			previous := origin.Target
+			for attempt := 1; attempt <= len(chain); attempt++ {
+				value, ok := chain[attempt]
+				parent, source := splitFSActionPath(previous)
+				want, err := nextConflictChainPath(previous)
+				if !ok || err != nil || value.Worktree != origin.Worktree || value.Phase != fsPhasePreBase ||
+					value.Op != fsOpRename || value.Parent != parent || value.Source != source || value.Target != want ||
+					value.ExpectedKind != "File" || value.ExpectedObject == "" || value.Outcome != "" {
+					return errors.Join(errors.New("filesystem promotion chain is not continuous or deterministic"), err)
+				}
+				previous = value.Target
+			}
+			continue
+		}
+		if origin.Phase != fsPhasePreBase || (origin.Op != fsOpCreateFile && origin.Op != fsOpCreateDirectory) ||
+			origin.State != fsStateCompleted || origin.Outcome != "rolled_back" || origin.ExpectedDevice != 0 || origin.ExpectedInode != 0 {
 			return errors.New("filesystem preserve chain has invalid creation origin")
 		}
 		rows, err := db.QueryContext(ctx, `SELECT cp.path FROM checkout_paths cp JOIN pending_checkouts pc ON pc.worktree=cp.worktree
@@ -901,6 +992,9 @@ func validateFSActionJournal(ctx context.Context, db fsActionQueryer, worktree s
 }
 
 func recoverFSActions(ctx context.Context, db *sql.DB, worktree string, root *openedWorktree, fault fsActionFault) error {
+	if err := validatePendingCheckoutState(ctx, db, worktree); err != nil {
+		return err
+	}
 	if err := bindFSJournalRoot(ctx, db, worktree, root); err != nil {
 		return err
 	}
@@ -911,10 +1005,37 @@ func recoverFSActions(ctx context.Context, db *sql.DB, worktree string, root *op
 	if err := validateFSActionJournal(ctx, db, worktree, values); err != nil {
 		return err
 	}
+	if err := validatePromotionOwnership(ctx, db, worktree, values); err != nil {
+		return err
+	}
+	intents := make([]fsAction, 0)
 	for _, value := range values {
-		if value.State != fsStateIntent {
-			continue
+		if value.State == fsStateIntent {
+			intents = append(intents, value)
 		}
+	}
+	byID := make(map[string]fsAction, len(values))
+	for _, value := range values {
+		byID[value.ActionID] = value
+	}
+	rootID := func(value fsAction) string {
+		if value.OriginActionID != "" {
+			return value.OriginActionID
+		}
+		return value.ActionID
+	}
+	sort.SliceStable(intents, func(i, j int) bool {
+		leftRoot, rightRoot := rootID(intents[i]), rootID(intents[j])
+		if leftRoot == rightRoot {
+			root := byID[leftRoot]
+			if root.Op == fsOpRename && root.ExpectedObject != "" {
+				return intents[i].Attempt > intents[j].Attempt
+			}
+			return intents[i].Order < intents[j].Order
+		}
+		return byID[leftRoot].Order < byID[rightRoot].Order
+	})
+	for _, value := range intents {
 		if err := completeFSAction(ctx, db, root, value, fault); err != nil {
 			return err
 		}
@@ -1137,6 +1258,568 @@ func journalRename(ctx context.Context, db *sql.DB, root *openedWorktree, worktr
 		Op: fsOpRename, Parent: parentPath, ParentDevice: uint64(parentStat.Dev), ParentInode: parentStat.Ino,
 		Source: source, Target: target, ExpectedKind: kind, ExpectedDevice: device, ExpectedInode: inode,
 		InternalSource: internalSource, InternalTarget: internalTarget, State: fsStateIntent}, fault)
+}
+
+func journalPromotion(ctx context.Context, db *sql.DB, root *openedWorktree, worktree, provenanceSource,
+	sourceParent, source, target, internalSource, expectedObject, expectedMtime string, expectedSize int64,
+	device, inode uint64, recovery *syncRecovery, fault fsActionFault) error {
+	if recovery == nil {
+		return errors.New("filesystem promotion requires an exact sync recovery owner")
+	}
+	parent, err := openFSActionParent(root, sourceParent, 0, 0)
+	if err != nil {
+		return err
+	}
+	var parentStat unix.Stat_t
+	if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
+		parent.Close()
+		return err
+	}
+	if err := parent.Close(); err != nil {
+		return err
+	}
+	if recovery.worktree != worktree || !recovery.completed ||
+		(provenanceSource != recovery.path && !strings.HasPrefix(provenanceSource, recovery.path+"/")) {
+		return errors.New("sync recovery does not own the promotion source")
+	}
+	if err := bindFSJournalRoot(ctx, db, worktree, root); err != nil {
+		return err
+	}
+	id, err := newFSActionID()
+	if err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error { return errors.Join(err, tx.Rollback()) }
+	var order int64
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(action_order), -1) + 1 FROM fs_actions WHERE worktree=?", worktree).Scan(&order); err != nil {
+		return fail(err)
+	}
+	value := fsAction{Worktree: worktree, ActionID: id, Order: order, Phase: fsPhasePreBase, Op: fsOpRename,
+		Parent: sourceParent, ParentDevice: uint64(parentStat.Dev), ParentInode: parentStat.Ino,
+		Source: source, Target: target, ExpectedKind: "File", ExpectedDevice: device, ExpectedInode: inode,
+		ExpectedObject: expectedObject, ExpectedSize: expectedSize, ExpectedMtime: expectedMtime,
+		InternalSource: internalSource, State: fsStateIntent}
+	if err := insertFSActionIntentWith(ctx, tx, value); err != nil {
+		return fail(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sync_recovery_promotions(worktree,recovery_path,source_path,current_action_id,rollback_action_id)
+		VALUES(?,?,?,?, '')`, worktree, recovery.path, provenanceSource, id); err != nil {
+		return fail(fmt.Errorf("bind promotion action to sync recovery source: %w", err))
+	}
+	journal, err := loadFSActionsWith(ctx, tx, worktree)
+	if err != nil {
+		return fail(err)
+	}
+	if err := validateFSActionJournal(ctx, tx, worktree, journal); err != nil {
+		return fail(err)
+	}
+	if err := validatePromotionOwnership(ctx, tx, worktree, journal); err != nil {
+		return fail(err)
+	}
+	if fault != nil {
+		if err := fault("before_intent_commit", value); err != nil {
+			return fail(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if fault != nil {
+		if err := fault("after_intent_commit", value); err != nil {
+			return err
+		}
+	}
+	return completeFSAction(ctx, db, root, value, fault)
+}
+
+func journalLatePromotion(ctx context.Context, db *sql.DB, root *openedWorktree, link *syncRecoveryPromotion,
+	current fsAction, parentDevice, parentInode uint64, target, expectedObject, expectedMtime string,
+	expectedSize int64, device, inode uint64, fault fsActionFault) (fsAction, error) {
+	if link == nil || link.worktree != current.Worktree || link.currentActionID != current.ActionID ||
+		current.State != fsStateCompleted || current.Op != fsOpRename || current.ExpectedObject == "" {
+		return fsAction{}, errors.New("invalid late promotion linkage")
+	}
+	rootID := current.ActionID
+	if current.OriginActionID != "" {
+		rootID = current.OriginActionID
+	}
+	parent, source := splitFSActionPath(current.Target)
+	want, err := nextConflictChainPath(current.Target)
+	if err != nil || target != want {
+		return fsAction{}, errors.Join(errors.New("late promotion target is not the strict next successor"), err)
+	}
+	if err := bindFSJournalRoot(ctx, db, current.Worktree, root); err != nil {
+		return fsAction{}, err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fsAction{}, err
+	}
+	fail := func(err error) (fsAction, error) { return fsAction{}, errors.Join(err, tx.Rollback()) }
+	journal, err := loadFSActionsWith(ctx, tx, current.Worktree)
+	if err != nil {
+		return fail(err)
+	}
+	if err := validateFSActionJournal(ctx, tx, current.Worktree, journal); err != nil {
+		return fail(err)
+	}
+	if err := validatePromotionOwnership(ctx, tx, current.Worktree, journal); err != nil {
+		return fail(err)
+	}
+	var successor fsAction
+	for _, value := range journal {
+		if value.OriginActionID == rootID && value.Attempt == current.Attempt+1 {
+			successor = value
+			break
+		}
+	}
+	if successor.ActionID == "" {
+		id, err := newFSActionID()
+		if err != nil {
+			return fail(err)
+		}
+		var order int64
+		if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(action_order), -1) + 1 FROM fs_actions WHERE worktree=?",
+			current.Worktree).Scan(&order); err != nil {
+			return fail(err)
+		}
+		successor = fsAction{Worktree: current.Worktree, ActionID: id, OriginActionID: rootID,
+			Attempt: current.Attempt + 1, Order: order, Phase: fsPhasePreBase, Op: fsOpRename,
+			Parent: parent, ParentDevice: parentDevice, ParentInode: parentInode, Source: source, Target: target,
+			ExpectedKind: "File", ExpectedDevice: device, ExpectedInode: inode, ExpectedObject: expectedObject,
+			ExpectedSize: expectedSize, ExpectedMtime: expectedMtime, State: fsStateIntent}
+		if err := insertFSActionIntentWith(ctx, tx, successor); err != nil {
+			return fail(err)
+		}
+	} else if successor.Parent != parent || successor.ParentDevice != parentDevice || successor.ParentInode != parentInode ||
+		successor.Source != source || successor.Target != target || successor.ExpectedDevice != device ||
+		successor.ExpectedInode != inode || successor.ExpectedObject != expectedObject ||
+		successor.ExpectedSize != expectedSize || successor.ExpectedMtime != expectedMtime {
+		return fail(errors.New("late promotion successor does not match its exact chain slot"))
+	}
+	args := append([]any{successor.ActionID}, syncRecoveryPromotionCASArgs(*link)...)
+	result, err := tx.ExecContext(ctx, "UPDATE sync_recovery_promotions SET current_action_id=? WHERE "+_syncRecoveryPromotionCAS, args...)
+	if err != nil {
+		return fail(err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return fail(errors.Join(errors.New("advance late promotion source linkage"), err))
+	}
+	if fault != nil {
+		if err := fault("before_intent_commit", successor); err != nil {
+			return fail(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fsAction{}, err
+	}
+	link.currentActionID = successor.ActionID
+	if fault != nil {
+		if err := fault("after_intent_commit", successor); err != nil {
+			return fsAction{}, err
+		}
+	}
+	if successor.State == fsStateIntent {
+		if err := completeFSAction(ctx, db, root, successor, fault); err != nil {
+			return fsAction{}, err
+		}
+		successor.State = fsStateCompleted
+	}
+	return successor, nil
+}
+
+func journalRestorePromotion(ctx context.Context, db *sql.DB, root *openedWorktree, recovery syncRecovery,
+	link *syncRecoveryPromotion, current fsAction, target string, fault fsActionFault) error {
+	if link == nil || link.worktree != recovery.worktree || link.recoveryPath != recovery.path ||
+		link.currentActionID != current.ActionID || link.rollbackActionID != "" || current.State != fsStateCompleted ||
+		current.Op != fsOpRename || current.ExpectedObject == "" {
+		return errors.New("invalid promotion restore linkage")
+	}
+	sourceParentPath, sourceLeaf := splitFSActionPath(current.Target)
+	sourceParent, sourceLeafOpened, err := promotionTargetParent(ctx, db, root, recovery.worktree, current.Target)
+	if err != nil {
+		return err
+	}
+	if sourceLeafOpened != sourceLeaf {
+		sourceParent.Close()
+		return errors.New("promotion restore source path changed during resolution")
+	}
+	var parentStat unix.Stat_t
+	if err := unix.Fstat(int(sourceParent.Fd()), &parentStat); err != nil {
+		sourceParent.Close()
+		return err
+	}
+	id, err := newFSActionID()
+	if err != nil {
+		sourceParent.Close()
+		return err
+	}
+	parentMtime, err := restorePromotionParentMtime(ctx, db, recovery, link.sourcePath)
+	if err != nil {
+		sourceParent.Close()
+		return err
+	}
+	value := fsAction{Worktree: recovery.worktree, ActionID: id, Phase: fsPhaseRollback,
+		Op: fsOpRestorePromotion, Parent: sourceParentPath, ParentDevice: uint64(parentStat.Dev), ParentInode: parentStat.Ino,
+		Source: sourceLeaf, Target: target, ExpectedKind: "File", ExpectedDevice: current.ExpectedDevice,
+		ExpectedInode: current.ExpectedInode, ExpectedMtime: parentMtime, State: fsStateIntent}
+	sourceExists, sourceMatches, stateErr := actionPathState(sourceParent, sourceLeaf, value)
+	closeErr := sourceParent.Close()
+	if stateErr != nil || closeErr != nil || !sourceExists || !sourceMatches {
+		return errors.Join(errors.New("promotion restore source no longer has its captured identity"), stateErr, closeErr)
+	}
+	if err := bindFSJournalRoot(ctx, db, recovery.worktree, root); err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error { return errors.Join(err, tx.Rollback()) }
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(action_order), -1) + 1 FROM fs_actions WHERE worktree=?",
+		recovery.worktree).Scan(&value.Order); err != nil {
+		return fail(err)
+	}
+	if err := insertFSActionIntentWith(ctx, tx, value); err != nil {
+		return fail(err)
+	}
+	args := append([]any{id}, syncRecoveryPromotionCASArgs(*link)...)
+	result, err := tx.ExecContext(ctx, "UPDATE sync_recovery_promotions SET rollback_action_id=? WHERE "+_syncRecoveryPromotionCAS, args...)
+	if err != nil {
+		return fail(err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return fail(errors.Join(errors.New("bind promotion restore action to exact source linkage"), err))
+	}
+	link.rollbackActionID = id
+	journal, err := loadFSActionsWith(ctx, tx, recovery.worktree)
+	if err != nil {
+		return fail(err)
+	}
+	if err := validateFSActionJournal(ctx, tx, recovery.worktree, journal); err != nil {
+		return fail(err)
+	}
+	if err := validatePromotionOwnership(ctx, tx, recovery.worktree, journal); err != nil {
+		return fail(err)
+	}
+	if fault != nil {
+		if err := fault("before_intent_commit", value); err != nil {
+			return fail(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if fault != nil {
+		if err := fault("after_intent_commit", value); err != nil {
+			return err
+		}
+	}
+	return completeFSAction(ctx, db, root, value, fault)
+}
+
+func promotionTargetParent(ctx context.Context, db *sql.DB, root *openedWorktree, worktree, target string) (*os.File, string, error) {
+	parentPath, leaf := splitFSActionPath(target)
+	if parentPath == "" {
+		parent, err := openFSActionParent(root, "", root.device, root.inode)
+		return parent, leaf, err
+	}
+	var device, inode uint64
+	var completed bool
+	err := db.QueryRowContext(ctx, `SELECT target_device, target_inode, completed FROM checkout_paths
+		WHERE worktree=? AND path=? AND type='Directory'`, worktree, parentPath).Scan(&device, &inode, &completed)
+	if err != nil || !completed || device == 0 || inode == 0 {
+		return nil, "", errors.Join(errors.New("filesystem promotion target parent is not durably installed"), err)
+	}
+	parent, err := openFSActionParent(root, parentPath, device, inode)
+	return parent, leaf, err
+}
+
+func openRestorePromotionTargetParent(root *openedWorktree, recovery syncRecovery, target string) (*os.File, string, error) {
+	if recovery.worktree == "" || !recovery.completed ||
+		!strings.HasPrefix(recovery.name, syncRecoveryPrefix) || target != recovery.name && !strings.HasPrefix(target, recovery.name+"/") {
+		return nil, "", errors.New("filesystem restore promotion has no exact hidden recovery target")
+	}
+	components := strings.Split(target, "/")
+	if len(components) == 1 {
+		if recovery.kind != "File" || target != recovery.name {
+			return nil, "", errors.New("filesystem restore promotion target does not match its recovery type")
+		}
+		parent, err := openFSActionParent(root, "", root.device, root.inode)
+		return parent, components[0], err
+	}
+	if recovery.kind != "Directory" || components[0] != recovery.name {
+		return nil, "", errors.New("filesystem restore promotion descendant has no directory recovery owner")
+	}
+	fd, err := unix.Openat(int(root.directory.Fd()), recovery.name,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, "", err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || !statMatchesRecovery(stat, recovery) {
+		unix.Close(fd)
+		return nil, "", errors.Join(errors.New("filesystem restore promotion recovery root changed identity"), err)
+	}
+	current := fd
+	for _, component := range components[1 : len(components)-1] {
+		next, openErr := unix.Openat(current, component,
+			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		unix.Close(current)
+		if openErr != nil {
+			return nil, "", openErr
+		}
+		current = next
+	}
+	return os.NewFile(uintptr(current), target), components[len(components)-1], nil
+}
+
+func completeRestorePromotionAction(ctx context.Context, db *sql.DB, root *openedWorktree, value fsAction, fault fsActionFault) error {
+	sourceParent, err := openFSActionParent(root, value.Parent, value.ParentDevice, value.ParentInode)
+	if err != nil {
+		return err
+	}
+	defer sourceParent.Close()
+	var recovery syncRecovery
+	err = db.QueryRowContext(ctx, `SELECT r.worktree,r.path,r.recovery_name,r.tombstone_name,r.type,r.object_id,r.canonical_mtime,
+		r.size,r.device,r.inode,r.completed FROM sync_recovery_promotions p JOIN sync_recoveries r
+		ON r.worktree=p.worktree AND r.path=p.recovery_path
+		WHERE p.worktree=? AND p.rollback_action_id=? AND r.recovery_name=?`,
+		value.Worktree, value.ActionID, strings.Split(value.Target, "/")[0]).Scan(&recovery.worktree, &recovery.path, &recovery.name,
+		&recovery.tombstone, &recovery.kind, &recovery.id, &recovery.mtime, &recovery.size, &recovery.device,
+		&recovery.inode, &recovery.completed)
+	if err != nil {
+		return errors.Join(errors.New("filesystem restore promotion recovery owner is absent"), err)
+	}
+	targetParent, targetLeaf, err := openRestorePromotionTargetParent(root, recovery, value.Target)
+	if err != nil {
+		return err
+	}
+	defer targetParent.Close()
+	sourceExists, sourceMatches, err := actionPathState(sourceParent, value.Source, value)
+	if err != nil {
+		return err
+	}
+	targetExists, targetMatches, err := actionPathState(targetParent, targetLeaf, value)
+	if err != nil {
+		return err
+	}
+	changed := false
+	switch {
+	case sourceExists && sourceMatches && !targetExists:
+		if fault != nil {
+			if err := fault("before_action", value); err != nil {
+				return err
+			}
+		}
+		if err := unix.Renameat2(int(sourceParent.Fd()), value.Source, int(targetParent.Fd()), targetLeaf, unix.RENAME_NOREPLACE); err != nil {
+			if errors.Is(err, syscall.EEXIST) {
+				return completeRestorePromotionAction(ctx, db, root, value, fault)
+			}
+			return fmt.Errorf("execute journaled promotion restore: %w", err)
+		}
+		changed = true
+	case !sourceExists && targetExists && targetMatches:
+		// The atomic cross-parent rename happened before restart.
+	default:
+		return errors.New("filesystem restore promotion has ambiguous or mismatched source/target state")
+	}
+	if fault != nil && changed {
+		if err := fault("after_action", value); err != nil {
+			return err
+		}
+	}
+	if value.ExpectedMtime != "" {
+		if err := setOpenFileMtime(targetParent, value.ExpectedMtime); err != nil {
+			return fmt.Errorf("restore promotion target parent mtime: %w", err)
+		}
+	}
+	if err := sourceParent.Sync(); err != nil {
+		return fmt.Errorf("sync filesystem restore promotion source parent: %w", err)
+	}
+	if err := targetParent.Sync(); err != nil {
+		return fmt.Errorf("sync filesystem restore promotion target parent: %w", err)
+	}
+	if fault != nil {
+		if err := fault("after_parent_sync", value); err != nil {
+			return err
+		}
+	}
+	result, err := db.ExecContext(ctx, `UPDATE fs_actions SET state='completed' WHERE worktree=? AND action_id=? AND state='intent'`,
+		value.Worktree, value.ActionID)
+	if err != nil {
+		return err
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		return errors.Join(errors.New("filesystem restore promotion completion did not update one Intent"), err)
+	}
+	if fault != nil {
+		return fault("after_completed", value)
+	}
+	return nil
+}
+
+func verifyPromotionSource(parent *os.File, value fsAction) error {
+	file, info, err := openScannableAt(parent, value.Source, value.Parent+"/"+value.Source)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+	id, err := scanRegularFile(file, value.Source, info, &snapshot)
+	if err != nil || id != value.ExpectedObject || info.Size() != value.ExpectedSize || mtime != value.ExpectedMtime {
+		return errors.Join(errors.New("filesystem promotion source content changed"), err)
+	}
+	return nil
+}
+
+func completePromotionAction(ctx context.Context, db *sql.DB, root *openedWorktree, value fsAction, fault fsActionFault) error {
+	sourceParent, err := openFSActionParent(root, value.Parent, value.ParentDevice, value.ParentInode)
+	if err != nil {
+		return err
+	}
+	defer sourceParent.Close()
+	targetParent, targetLeaf, err := promotionTargetParent(ctx, db, root, value.Worktree, value.Target)
+	if err != nil {
+		return err
+	}
+	defer targetParent.Close()
+	sourceExists, sourceMatches, err := actionPathState(sourceParent, value.Source, value)
+	if err != nil {
+		return err
+	}
+	targetExists, targetMatches, err := actionPathState(targetParent, targetLeaf, value)
+	if err != nil {
+		return err
+	}
+	changed := false
+	switch {
+	case sourceExists && sourceMatches && targetExists && !targetMatches:
+		if err := preservePromotionCollision(ctx, db, root, value, targetParent, targetLeaf, fault); err != nil {
+			return err
+		}
+		return completePromotionAction(ctx, db, root, value, fault)
+	case sourceExists && sourceMatches && !targetExists:
+		if err := verifyPromotionSource(sourceParent, value); err != nil {
+			return err
+		}
+		if fault != nil {
+			if err := fault("before_action", value); err != nil {
+				return err
+			}
+		}
+		if err := unix.Renameat2(int(sourceParent.Fd()), value.Source, int(targetParent.Fd()), targetLeaf, unix.RENAME_NOREPLACE); err != nil {
+			if errors.Is(err, syscall.EEXIST) {
+				return completePromotionAction(ctx, db, root, value, fault)
+			}
+			return fmt.Errorf("execute journaled promotion: %w", err)
+		}
+		changed = true
+	case !sourceExists && targetExists && targetMatches:
+		// The atomic cross-parent rename happened before restart.
+	default:
+		return errors.New("filesystem promotion has ambiguous or mismatched source/target state")
+	}
+	if fault != nil && changed {
+		if err := fault("after_action", value); err != nil {
+			return err
+		}
+	}
+	if err := sourceParent.Sync(); err != nil {
+		return fmt.Errorf("sync filesystem promotion source parent: %w", err)
+	}
+	if err := targetParent.Sync(); err != nil {
+		return fmt.Errorf("sync filesystem promotion target parent: %w", err)
+	}
+	if fault != nil {
+		if err := fault("after_parent_sync", value); err != nil {
+			return err
+		}
+	}
+	result, err := db.ExecContext(ctx, `UPDATE fs_actions SET state='completed' WHERE worktree=? AND action_id=? AND state='intent'`,
+		value.Worktree, value.ActionID)
+	if err != nil {
+		return err
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		return errors.Join(errors.New("filesystem promotion completion did not update one Intent"), err)
+	}
+	if fault != nil {
+		return fault("after_completed", value)
+	}
+	return nil
+}
+
+func preservePromotionCollision(ctx context.Context, db *sql.DB, root *openedWorktree, origin fsAction,
+	targetParent *os.File, targetLeaf string, fault fsActionFault) error {
+	file, info, err := openScannableAt(targetParent, targetLeaf, origin.Target)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+	id, scanErr := scanRegularFile(file, origin.Target, info, &snapshot)
+	closeErr := file.Close()
+	if scanErr != nil || closeErr != nil || !ok {
+		return errors.Join(scanErr, closeErr, errors.New("inspect promotion collision identity"))
+	}
+	parentPath, _ := splitFSActionPath(origin.Target)
+	successor, err := nextConflictChainPath(origin.Target)
+	if err != nil {
+		return err
+	}
+	rootID, attempt := origin.ActionID, 1
+	if origin.OriginActionID != "" {
+		rootID, attempt = origin.OriginActionID, origin.Attempt+1
+	}
+	mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+	values, err := loadFSActions(ctx, db, origin.Worktree)
+	if err != nil {
+		return err
+	}
+	if err := validateFSActionJournal(ctx, db, origin.Worktree, values); err != nil {
+		return err
+	}
+	if err := validatePromotionOwnership(ctx, db, origin.Worktree, values); err != nil {
+		return err
+	}
+	for _, existing := range values {
+		if existing.OriginActionID != rootID || existing.Attempt != attempt {
+			continue
+		}
+		if existing.Parent != parentPath || existing.Source != targetLeaf || existing.Target != successor ||
+			existing.ExpectedDevice != uint64(stat.Dev) || existing.ExpectedInode != stat.Ino ||
+			existing.ExpectedObject != id || existing.ExpectedSize != info.Size() || existing.ExpectedMtime != mtime {
+			return errors.New("promotion collision successor does not match its exact chain slot")
+		}
+		if existing.State == fsStateCompleted {
+			return nil
+		}
+		return completeFSAction(ctx, db, root, existing, fault)
+	}
+	var parentStat unix.Stat_t
+	if err := unix.Fstat(int(targetParent.Fd()), &parentStat); err != nil {
+		return err
+	}
+	actionID, err := newFSActionID()
+	if err != nil {
+		return err
+	}
+	var order int64
+	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(action_order), -1) + 1 FROM fs_actions WHERE worktree=?", origin.Worktree).Scan(&order); err != nil {
+		return err
+	}
+	return executeFSAction(ctx, db, root, fsAction{Worktree: origin.Worktree, ActionID: actionID,
+		OriginActionID: rootID, Attempt: attempt, Order: order, Phase: fsPhasePreBase, Op: fsOpRename,
+		Parent: parentPath, ParentDevice: uint64(parentStat.Dev), ParentInode: parentStat.Ino,
+		Source: targetLeaf, Target: successor, ExpectedKind: "File", ExpectedDevice: uint64(stat.Dev),
+		ExpectedInode: stat.Ino, ExpectedObject: id, ExpectedSize: info.Size(), ExpectedMtime: mtime,
+		State: fsStateIntent}, fault)
 }
 
 func assertNoIncompletePreBase(ctx context.Context, tx *sql.Tx, worktree string) error {

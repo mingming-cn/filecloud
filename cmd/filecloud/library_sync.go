@@ -13,18 +13,21 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/mingming-cn/filecloud/internal/object"
 	"golang.org/x/sys/unix"
+	"golang.org/x/text/cases"
 )
 
 const (
 	syncRecoveryPrefix        = ".filecloud-internal-sync-"
 	syncTombstonePrefix       = ".filecloud-internal-sync-trash-"
 	maxSyncParentWalk         = 1024
+	maxSyncJournalRows        = 1 << 20
 	deleteCandidatePrefixLen  = 12
 	_maxCandidateCommitBytes  = 64 << 10
 	_maxCandidateHistoryBytes = 8 + maxSyncParentWalk*(_maxCandidateCommitBytes+4)
@@ -144,6 +147,13 @@ func _decodeCandidateHistory(data []byte) ([][]byte, error) {
 	return result, nil
 }
 
+type syncRerunError struct{ cause error }
+
+func (value *syncRerunError) Error() string {
+	return "filesystem changed before Sync Base commit; rerun sync: " + value.cause.Error()
+}
+func (value *syncRerunError) Unwrap() error { return value.cause }
+
 type deleteConfirmationRequiredError struct {
 	candidate        string
 	deleted, tracked int64
@@ -159,10 +169,28 @@ func (value *deleteConfirmationRequiredError) Error() string {
 }
 
 type syncRecovery struct {
-	path, name, tombstone, kind, id, mtime string
-	size                                   int64
-	device, inode                          uint64
-	completed                              bool
+	worktree, path, name, tombstone, kind, id, mtime string
+	size                                             int64
+	device, inode                                    uint64
+	completed                                        bool
+}
+
+const _syncRecoveryCAS = `worktree=? AND path=? AND recovery_name=? AND tombstone_name=? AND type=?
+	AND object_id=? AND canonical_mtime=? AND size=? AND device=? AND inode=? AND completed=?`
+
+func syncRecoveryCASArgs(value syncRecovery) []any {
+	return []any{value.worktree, value.path, value.name, value.tombstone, value.kind, value.id, value.mtime,
+		value.size, value.device, value.inode, value.completed}
+}
+
+type syncRecoveryPromotion struct {
+	worktree, recoveryPath, sourcePath, currentActionID, rollbackActionID string
+}
+
+const _syncRecoveryPromotionCAS = `worktree=? AND recovery_path=? AND source_path=? AND current_action_id=? AND rollback_action_id=?`
+
+func syncRecoveryPromotionCASArgs(value syncRecoveryPromotion) []any {
+	return []any{value.worktree, value.recoveryPath, value.sourcePath, value.currentActionID, value.rollbackActionID}
 }
 
 func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding, stdout io.Writer, config libraryClientConfig) error {
@@ -210,7 +238,8 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 		return _startRecursiveMerge(ctx, db, options, binding, snapshot, head, stdout, config, budget)
 	case remoteChanged:
 		pendingCheckout := pendingCheckout{ServerURL: binding.ServerURL, LibraryID: binding.LibraryID, Worktree: binding.Worktree,
-			UserID: binding.UserID, DeviceID: binding.DeviceID, TargetCommit: *head.CommitID, HeadETag: head.ETag, ApplyState: "pending"}
+			UserID: binding.UserID, DeviceID: binding.DeviceID, TargetCommit: *head.CommitID, HeadETag: head.ETag,
+			ApplyState: "pending", ConflictPromotions: _emptyConflictPromotions}
 		if err := savePendingCheckout(ctx, db, pendingCheckout); err != nil {
 			return err
 		}
@@ -433,7 +462,7 @@ func resumePublication(ctx context.Context, db *sql.DB, options bindOptions, bin
 		if pending.CandidateRoot == pending.CapturedRoot {
 			return finalizePublished(ctx, db, binding, snapshot, head, pending, stdout)
 		}
-		return transitionPublishedSuccessor(ctx, db, options, binding, snapshot, head, pending, stdout, config)
+		return transitionPublishedSuccessor(ctx, db, options, binding, snapshot, head, pending, stdout, config, budget)
 	}
 	ancestor, err := _remoteCommitDescendsFrom(ctx, options, *head.CommitID, pending.CandidateCommit, binding.UserID, budget)
 	if err != nil {
@@ -441,7 +470,7 @@ func resumePublication(ctx context.Context, db *sql.DB, options bindOptions, bin
 	}
 	if ancestor {
 		if snapshot.root == pending.CapturedRoot {
-			return transitionPublishedSuccessor(ctx, db, options, binding, snapshot, head, pending, stdout, config)
+			return transitionPublishedSuccessor(ctx, db, options, binding, snapshot, head, pending, stdout, config, budget)
 		}
 		return recoverPublishedCandidate(ctx, db, options, binding, head, pending)
 	}
@@ -534,8 +563,13 @@ func replacePendingForTrivialMerge(ctx context.Context, db *sql.DB, options bind
 	if err != nil || remote.AuthorUserID != binding.UserID {
 		return errors.Join(errors.New("verify latest Head for merge"), err)
 	}
+	localSeed, err := object.VerifyCommit(old.CandidateData, old.CandidateCommit)
+	if err != nil || localSeed.AuthorUserID != binding.UserID || localSeed.DeviceID != binding.DeviceID ||
+		localSeed.Root != old.CandidateRoot {
+		return errors.New("pending Candidate conflict-name seed is invalid")
+	}
 	prepared, err := _prepareRecursiveMerge(ctx, options, rebuilt.snapshot, base.Root, old.CandidateRoot, remote.Root,
-		*head.CommitID, old.CandidateCommit, binding, config, budget)
+		*head.CommitID, old.CandidateCommit, localSeed, binding, config, budget)
 	if err != nil {
 		return err
 	}
@@ -799,12 +833,28 @@ func _remoteCommitDescendsFrom(ctx context.Context, options bindOptions, head, a
 }
 
 func transitionPublishedSuccessor(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding, snapshot worktreeSnapshot,
-	head remoteHead, pending pendingPublication, stdout io.Writer, config libraryClientConfig) error {
+	head remoteHead, pending pendingPublication, stdout io.Writer, config libraryClientConfig, budget *_replayBudget) error {
 	if head.CommitID == nil {
 		return errors.New("remote successor Head is empty")
 	}
+	var promotions []_conflictPromotion
+	if pending.CandidateCommit != pending.CapturedCommit {
+		rebuilt, err := _rebuildPendingMerge(ctx, options, binding, snapshot, pending, budget)
+		if err != nil {
+			return fmt.Errorf("rebuild conflict provenance before checkout transition: %w", err)
+		}
+		promotions = rebuilt.promotions
+		if err := _validatePromotionTargets(promotions, rebuilt.paths); err != nil {
+			return err
+		}
+	}
+	encodedPromotions, err := _encodeConflictPromotions(promotions)
+	if err != nil {
+		return err
+	}
 	checkout := pendingCheckout{ServerURL: binding.ServerURL, LibraryID: binding.LibraryID, Worktree: binding.Worktree,
-		UserID: binding.UserID, DeviceID: binding.DeviceID, TargetCommit: *head.CommitID, HeadETag: head.ETag, ApplyState: "pending"}
+		UserID: binding.UserID, DeviceID: binding.DeviceID, TargetCommit: *head.CommitID, HeadETag: head.ETag,
+		ApplyState: "pending", ConflictPromotions: encodedPromotions}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -813,8 +863,9 @@ func transitionPublishedSuccessor(ctx context.Context, db *sql.DB, options bindO
 		return errors.Join(err, tx.Rollback())
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO pending_checkouts(server_url, library_id, worktree, user_id, device_id,
-		target_commit, target_root, head_etag, apply_state) VALUES (?, ?, ?, ?, ?, ?, '', ?, 'pending')`, checkout.ServerURL,
-		checkout.LibraryID, checkout.Worktree, checkout.UserID, checkout.DeviceID, checkout.TargetCommit, checkout.HeadETag); err != nil {
+		target_commit, target_root, head_etag, apply_state, conflict_promotions)
+		VALUES (?, ?, ?, ?, ?, ?, '', ?, 'pending', ?)`, checkout.ServerURL, checkout.LibraryID, checkout.Worktree,
+		checkout.UserID, checkout.DeviceID, checkout.TargetCommit, checkout.HeadETag, checkout.ConflictPromotions); err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
 	if err := _deletePendingPublication(ctx, tx, binding.Worktree, pending,
@@ -825,6 +876,11 @@ func transitionPublishedSuccessor(ctx context.Context, db *sql.DB, options bindO
 		return fmt.Errorf("transition superseded publication: %w", err)
 	}
 	binding.SyncBase, binding.SyncBaseRoot, binding.HeadETag = pending.CapturedCommit, pending.CapturedRoot, head.ETag
+	if config.afterSyncCheckoutTransition != nil {
+		if err := config.afterSyncCheckoutTransition(); err != nil {
+			return fmt.Errorf("after sync checkout transition: %w", err)
+		}
+	}
 	return continueSyncCheckout(ctx, db, options, binding, checkout, stdout, config)
 }
 
@@ -968,7 +1024,7 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 			}
 			return errors.Join(errors.New("local and remote libraries both changed; merge is not supported yet"), err)
 		}
-		if err := registerSyncRecoveryPlan(ctx, db, binding.Worktree, stable.paths, config); err != nil {
+		if err := registerSyncRecoveryPlan(ctx, db, options.worktreeRoot, binding.Worktree, stable.paths, config); err != nil {
 			return err
 		}
 		pending.ApplyState = "applying"
@@ -981,8 +1037,29 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 			return fmt.Errorf("prepare checkout materialization: %w", err)
 		}
 	}
-	if err := materializeCheckout(ctx, db, options, paths, config); err != nil {
+	if err := materializeCheckoutDirectories(ctx, db, options, paths, config); err != nil {
 		return err
+	}
+	promotions, err := _decodeConflictPromotions(pending.ConflictPromotions)
+	if err != nil {
+		return fmt.Errorf("decode pending conflict provenance: %w", err)
+	}
+	if err := promoteCapturedConflictFiles(ctx, db, options.worktreeRoot, binding.Worktree, promotions, paths, config); err != nil {
+		return err
+	}
+	latePaths, err := reconcilePromotedConflictFiles(ctx, db, options, paths, config)
+	if err != nil {
+		return err
+	}
+	if err := materializeCheckoutFiles(ctx, db, options, paths, config); err != nil {
+		return err
+	}
+	moreMaterializedLate, err := reconcilePromotedConflictFiles(ctx, db, options, paths, config)
+	if err != nil {
+		return err
+	}
+	for path := range moreMaterializedLate {
+		latePaths[path] = true
 	}
 	if err := verifyAllSyncRecoveries(ctx, db, options.worktreeRoot, binding.Worktree); err != nil {
 		rollbackErr := beginSyncRollback(ctx, db, binding.Worktree)
@@ -1000,6 +1077,7 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 	}
 	scanConfig := options.scanConfig
 	scanConfig.ignoredRootNames = ignored
+	scanConfig.ignoredPaths = latePaths
 	verified, err := scanWorktreeWithConfig(options.worktreeRoot, scanConfig)
 	if err != nil || verified.root != pending.TargetRoot {
 		return errors.Join(errors.New("applied remote snapshot did not match its fixed target"), err)
@@ -1008,6 +1086,13 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 		if err := config.beforeFinalize(); err != nil {
 			return fmt.Errorf("finalize checkout: %w", err)
 		}
+	}
+	moreLate, err := reconcilePromotedConflictFiles(ctx, db, options, paths, config)
+	if err != nil {
+		return err
+	}
+	for path := range moreLate {
+		latePaths[path] = true
 	}
 	if err := verifyAllSyncRecoveries(ctx, db, options.worktreeRoot, binding.Worktree); err != nil {
 		return fmt.Errorf("captured local content changed before finalization: %w", err)
@@ -1018,14 +1103,73 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 	}
 	scanConfig = options.scanConfig
 	scanConfig.ignoredRootNames = ignored
+	scanConfig.ignoredPaths = latePaths
 	verified, err = scanWorktreeWithConfig(options.worktreeRoot, scanConfig)
 	if err != nil || verified.root != pending.TargetRoot {
 		return errors.Join(errors.New("remote target changed before finalization"), err)
 	}
-	if err := finalizeSyncApply(ctx, db, binding, pending, paths, config); err != nil {
+	finalRecoveries, err := loadSyncRecoveries(ctx, db, binding.Worktree)
+	if err != nil {
+		return err
+	}
+	finalLinks, err := loadSyncRecoveryPromotions(ctx, db, binding.Worktree)
+	if err != nil {
+		return err
+	}
+	directPromotions := make(map[string]bool, len(finalLinks))
+	for _, link := range finalLinks {
+		directPromotions[link.recoveryPath] = directPromotions[link.recoveryPath] || link.sourcePath == link.recoveryPath
+	}
+	finalIgnored := make(map[string]bool, len(finalRecoveries)*2)
+	for _, recovery := range finalRecoveries {
+		finalIgnored[recovery.name] = true
+		if recovery.tombstone != "" {
+			finalIgnored[recovery.tombstone] = true
+		}
+	}
+	finalValidation := func() error {
+		for _, recovery := range finalRecoveries {
+			if !recovery.completed {
+				return fmt.Errorf("sync recovery %q is incomplete", recovery.path)
+			}
+			name := recovery.name
+			if recovery.tombstone != "" {
+				name = recovery.tombstone
+			}
+			if recovery.kind == "File" && directPromotions[recovery.path] {
+				if _, err := statAt(options.worktreeRoot.directory, name); errors.Is(err, syscall.ENOENT) {
+					continue
+				}
+			}
+			if err := verifyNamedRecovery(options.worktreeRoot.directory, name, recovery); err != nil {
+				return fmt.Errorf("verify captured path %q: %w", recovery.path, err)
+			}
+		}
+		finalScan := options.scanConfig
+		finalScan.ignoredRootNames = finalIgnored
+		finalScan.ignoredPaths = latePaths
+		snapshot, err := scanWorktreeWithConfig(options.worktreeRoot, finalScan)
+		if err != nil || snapshot.root != pending.TargetRoot {
+			return errors.Join(errors.New("worktree no longer matches checkout Candidate"), err)
+		}
+		return nil
+	}
+	if err := finalizeSyncApply(ctx, db, binding, pending, paths, config, finalValidation); err != nil {
+		var rerun *syncRerunError
+		if errors.As(err, &rerun) {
+			if _, reconcileErr := reconcilePromotedConflictFiles(ctx, db, options, paths, config); reconcileErr != nil {
+				return errors.Join(err, reconcileErr)
+			}
+		}
 		return err
 	}
 	pending.ApplyState = "finalized"
+	if len(latePaths) != 0 {
+		if err := finishSyncCleanup(ctx, db, options, pending, io.Discard, config); err != nil {
+			return err
+		}
+		return errors.New("late local conflict was preserved at a visible path; rerun sync")
+	}
 	return finishSyncCleanup(ctx, db, options, pending, stdout, config)
 }
 
@@ -1059,7 +1203,7 @@ func clearApplyingCheckout(ctx context.Context, db *sql.DB, worktree string) err
 	if err != nil {
 		return err
 	}
-	for _, query := range []string{"DELETE FROM checkout_paths WHERE worktree = ?", "DELETE FROM sync_recoveries WHERE worktree = ?", "DELETE FROM pending_checkouts WHERE worktree = ?"} {
+	for _, query := range []string{"DELETE FROM checkout_paths WHERE worktree = ?", "DELETE FROM sync_recovery_promotions WHERE worktree = ?", "DELETE FROM sync_recoveries WHERE worktree = ?", "DELETE FROM pending_checkouts WHERE worktree = ?"} {
 		if _, err := tx.ExecContext(ctx, query, worktree); err != nil {
 			return errors.Join(err, tx.Rollback())
 		}
@@ -1067,7 +1211,19 @@ func clearApplyingCheckout(ctx context.Context, db *sql.DB, worktree string) err
 	return tx.Commit()
 }
 
-func registerSyncRecoveryPlan(ctx context.Context, db *sql.DB, worktree string, paths []checkoutPath, config libraryClientConfig) error {
+func registerSyncRecoveryPlan(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string, paths []checkoutPath,
+	config libraryClientConfig) error {
+	if root == nil || root.path != worktree {
+		return errors.New("sync recovery plan has no exact worktree root")
+	}
+	if err := root.validateIdentity(); err != nil {
+		return err
+	}
+	var rootStat unix.Stat_t
+	if err := unix.Fstat(int(root.directory.Fd()), &rootStat); err != nil {
+		return err
+	}
+	rootMtimeNS := time.Unix(rootStat.Mtim.Sec, rootStat.Mtim.Nsec).UnixNano()
 	top := make([]checkoutPath, 0)
 	for _, path := range paths {
 		if !strings.Contains(path.path, "/") {
@@ -1089,12 +1245,15 @@ func registerSyncRecoveryPlan(ctx context.Context, db *sql.DB, worktree string, 
 			return errors.Join(err, tx.Rollback())
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO sync_recoveries(worktree, path, recovery_name, type, object_id,
-			canonical_mtime, size, device, inode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, worktree, path.path, name,
+			canonical_mtime, size, device, inode, completed, tombstone_name)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '')`, worktree, path.path, name,
 			path.kind, path.id, path.mtime, path.size, path.device, path.inode); err != nil {
 			return errors.Join(err, tx.Rollback())
 		}
 	}
-	result, err := tx.ExecContext(ctx, "UPDATE pending_checkouts SET apply_state = 'applying' WHERE worktree = ? AND apply_state = 'pending'", worktree)
+	result, err := tx.ExecContext(ctx, `UPDATE pending_checkouts
+		SET apply_state='applying',rollback_root_mtime_ns=?,rollback_root_mtime_valid=1
+		WHERE worktree=? AND apply_state='pending' AND rollback_root_mtime_valid=0`, rootMtimeNS, worktree)
 	if err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
@@ -1129,9 +1288,10 @@ func registeredSyncRecoveryNames(ctx context.Context, db *sql.DB, worktree strin
 	return names, nil
 }
 
-func loadSyncRecoveries(ctx context.Context, db *sql.DB, worktree string) ([]syncRecovery, error) {
-	rows, err := db.QueryContext(ctx, `SELECT path, recovery_name, tombstone_name, type, object_id, canonical_mtime,
-		size, device, inode, completed FROM sync_recoveries WHERE worktree = ? ORDER BY path`, worktree)
+func loadSyncRecoveriesWith(ctx context.Context, db fsActionQueryer, worktree string) ([]syncRecovery, error) {
+	rows, err := db.QueryContext(ctx, `SELECT worktree, path, recovery_name, tombstone_name, type, object_id, canonical_mtime,
+		size, device, inode, completed FROM sync_recoveries WHERE worktree = ? ORDER BY path LIMIT ?`, worktree,
+		maxSyncJournalRows+1)
 	if err != nil {
 		return nil, err
 	}
@@ -1139,13 +1299,508 @@ func loadSyncRecoveries(ctx context.Context, db *sql.DB, worktree string) ([]syn
 	var values []syncRecovery
 	for rows.Next() {
 		var value syncRecovery
-		if err := rows.Scan(&value.path, &value.name, &value.tombstone, &value.kind, &value.id, &value.mtime,
+		if err := rows.Scan(&value.worktree, &value.path, &value.name, &value.tombstone, &value.kind, &value.id, &value.mtime,
 			&value.size, &value.device, &value.inode, &value.completed); err != nil {
 			return nil, err
 		}
 		values = append(values, value)
 	}
-	return values, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(values) > maxSyncJournalRows {
+		return nil, errors.New("sync recovery plan exceeds synchronization budget")
+	}
+	return values, nil
+}
+
+func loadSyncRecoveries(ctx context.Context, db *sql.DB, worktree string) ([]syncRecovery, error) {
+	return loadSyncRecoveriesWith(ctx, db, worktree)
+}
+
+func loadSyncRecoveryPromotionsWith(ctx context.Context, db fsActionQueryer, worktree string) ([]syncRecoveryPromotion, error) {
+	rows, err := db.QueryContext(ctx, `SELECT worktree,recovery_path,source_path,current_action_id,rollback_action_id
+		FROM sync_recovery_promotions WHERE worktree=? ORDER BY source_path LIMIT ?`, worktree, maxSyncJournalRows+1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := make([]syncRecoveryPromotion, 0)
+	for rows.Next() {
+		var value syncRecoveryPromotion
+		if err := rows.Scan(&value.worktree, &value.recoveryPath, &value.sourcePath, &value.currentActionID, &value.rollbackActionID); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(values) > maxSyncJournalRows {
+		return nil, errors.New("sync recovery promotion linkage exceeds synchronization budget")
+	}
+	return values, nil
+}
+
+func loadSyncRecoveryPromotions(ctx context.Context, db *sql.DB, worktree string) ([]syncRecoveryPromotion, error) {
+	return loadSyncRecoveryPromotionsWith(ctx, db, worktree)
+}
+
+func loadConflictPromotionsWith(ctx context.Context, db fsActionQueryer, worktree string) ([]_conflictPromotion, error) {
+	rows, err := db.QueryContext(ctx, `SELECT length(conflict_promotions),
+		CASE WHEN length(conflict_promotions) BETWEEN 8 AND 33554432 THEN conflict_promotions END
+		FROM pending_checkouts WHERE worktree=?`, worktree)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, errors.Join(sql.ErrNoRows, rows.Err())
+	}
+	var length int
+	var encoded []byte
+	if err := rows.Scan(&length, &encoded); err != nil {
+		return nil, err
+	}
+	if rows.Next() {
+		return nil, errors.New("worktree has multiple pending checkouts")
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if length != len(encoded) {
+		return nil, errors.New("pending checkout conflict provenance exceeds synchronization budget")
+	}
+	return _decodeConflictPromotions(encoded)
+}
+
+func loadConflictPromotions(ctx context.Context, db *sql.DB, worktree string) ([]_conflictPromotion, error) {
+	return loadConflictPromotionsWith(ctx, db, worktree)
+}
+
+func validateCompletedPromotion(ctx context.Context, db *sql.DB, root *openedWorktree, recovery syncRecovery,
+	link *syncRecoveryPromotion, sourcePath string, expected _conflictPromotion, config libraryClientConfig) (fsAction, error) {
+	if recovery.worktree == "" || link == nil || link.worktree != recovery.worktree ||
+		link.recoveryPath != recovery.path || link.sourcePath != expected.source || !validFSActionID(link.currentActionID) {
+		return fsAction{}, fmt.Errorf("conflict provenance source %q has no exact promotion action linkage", expected.source)
+	}
+	journal, err := loadFSActions(ctx, db, recovery.worktree)
+	if err != nil {
+		return fsAction{}, err
+	}
+	if err := validateFSActionJournal(ctx, db, recovery.worktree, journal); err != nil {
+		return fsAction{}, err
+	}
+	byID := make(map[string]fsAction, len(journal))
+	for _, action := range journal {
+		byID[action.ActionID] = action
+	}
+	promotion, ok := byID[link.currentActionID]
+	rootAction := promotion
+	if promotion.OriginActionID != "" {
+		rootAction, ok = byID[promotion.OriginActionID]
+	}
+	sourceParent, sourceLeaf := splitFSActionPath(sourcePath)
+	if !ok || rootAction.OriginActionID != "" || rootAction.Attempt != 0 || rootAction.Op != fsOpRename ||
+		rootAction.Phase != fsPhasePreBase || rootAction.Parent != sourceParent || rootAction.Source != sourceLeaf ||
+		rootAction.ExpectedKind != "File" || rootAction.ExpectedDevice == 0 || rootAction.ExpectedInode == 0 ||
+		(recovery.kind == "File" && (rootAction.ExpectedDevice != recovery.device || rootAction.ExpectedInode != recovery.inode)) ||
+		(promotion.ActionID != rootAction.ActionID && (promotion.OriginActionID != rootAction.ActionID || promotion.Attempt <= 0)) {
+		return fsAction{}, fmt.Errorf("conflict provenance source %q has a stale or mismatched promotion action linkage", expected.source)
+	}
+	if err := validateRootPromotionTarget(expected.target, rootAction.Target); err != nil {
+		return fsAction{}, err
+	}
+	if rootAction.Target == expected.target && (rootAction.ExpectedObject != expected.id ||
+		rootAction.ExpectedMtime != expected.mtime || rootAction.ExpectedSize != expected.size) {
+		return fsAction{}, fmt.Errorf("conflict provenance source %q has mismatched fixed-target content linkage", expected.source)
+	}
+	canonicalTarget := rootAction.Target
+	for attempt := 0; attempt < promotion.Attempt; attempt++ {
+		canonicalTarget, err = nextConflictChainPath(canonicalTarget)
+		if err != nil {
+			return fsAction{}, err
+		}
+	}
+	if canonicalTarget != promotion.Target {
+		return fsAction{}, errors.New("linked promotion target is outside its deterministic collision sequence")
+	}
+	if promotion.State == fsStateIntent {
+		if err := completeFSAction(ctx, db, root, promotion, config.fsActionFault); err != nil {
+			return fsAction{}, fmt.Errorf("resume conflict promotion %q: %w", expected.source, err)
+		}
+		promotion.State = fsStateCompleted
+	}
+	targetParent, targetLeaf, err := promotionTargetParent(ctx, db, root, recovery.worktree, promotion.Target)
+	if err != nil {
+		return fsAction{}, err
+	}
+	file, info, openErr := openScannableAt(targetParent, targetLeaf, promotion.Target)
+	if openErr != nil {
+		return fsAction{}, errors.Join(openErr, targetParent.Close())
+	}
+	stat, statOK := info.Sys().(*syscall.Stat_t)
+	var parentStat unix.Stat_t
+	parentStatErr := unix.Fstat(int(targetParent.Fd()), &parentStat)
+	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+	id, scanErr := scanRegularFile(file, promotion.Target, info, &snapshot)
+	mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+	closeErr := errors.Join(file.Close(), targetParent.Close())
+	if scanErr != nil || closeErr != nil || parentStatErr != nil || !statOK ||
+		uint64(stat.Dev) != promotion.ExpectedDevice || stat.Ino != promotion.ExpectedInode {
+		return fsAction{}, errors.Join(errors.New("completed conflict promotion target changed identity"),
+			scanErr, closeErr, parentStatErr)
+	}
+	if id == promotion.ExpectedObject && info.Size() == promotion.ExpectedSize && mtime == promotion.ExpectedMtime {
+		return promotion, nil
+	}
+	if promotion.Attempt == 0 {
+		return promotion, nil
+	}
+	successor, err := nextConflictChainPath(promotion.Target)
+	if err != nil {
+		return fsAction{}, err
+	}
+	checkout, err := loadCheckoutPathCAS(ctx, db, recovery.worktree, expected.target)
+	if err != nil {
+		return fsAction{}, err
+	}
+	next, err := journalLatePromotion(ctx, db, root, link, promotion, uint64(parentStat.Dev), parentStat.Ino,
+		successor, id, mtime, info.Size(), uint64(stat.Dev), stat.Ino, config.fsActionFault)
+	if err != nil {
+		return fsAction{}, fmt.Errorf("preserve changed completed promotion %q: %w", promotion.Target, err)
+	}
+	if err := resetPromotedCheckoutIfNeeded(ctx, db, root, recovery.worktree, expected.target, &checkout); err != nil {
+		return fsAction{}, err
+	}
+	return next, nil
+}
+
+func validatePromotionOwnership(ctx context.Context, db fsActionQueryer, worktree string, journal []fsAction) error {
+	byID := make(map[string]fsAction, len(journal))
+	roots := make(map[string]fsAction)
+	restores := make(map[string]fsAction)
+	for _, action := range journal {
+		byID[action.ActionID] = action
+		if action.Op == fsOpRestorePromotion {
+			restores[action.ActionID] = action
+		}
+	}
+	for _, action := range journal {
+		if action.Op != fsOpRename || action.ExpectedObject == "" {
+			continue
+		}
+		rootID := action.ActionID
+		if action.OriginActionID != "" {
+			rootID = action.OriginActionID
+		}
+		root, ok := byID[rootID]
+		if !ok || root.OriginActionID != "" || root.Attempt != 0 || root.Phase != fsPhasePreBase ||
+			root.Op != fsOpRename || root.ExpectedObject == "" {
+			return errors.New("filesystem promotion chain has an invalid root")
+		}
+		roots[rootID] = root
+	}
+	recoveries, err := loadSyncRecoveriesWith(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	links, err := loadSyncRecoveryPromotionsWith(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	if len(roots) == 0 && len(links) == 0 && len(restores) == 0 {
+		return nil
+	}
+	promotions, err := loadConflictPromotionsWith(ctx, db, worktree)
+	if err != nil {
+		return errors.Join(errors.New("filesystem promotion journal has no exact pending checkout provenance"), err)
+	}
+	recoveryByPath := make(map[string]syncRecovery, len(recoveries))
+	for _, recovery := range recoveries {
+		recoveryByPath[recovery.path] = recovery
+	}
+	promotionBySource := make(map[string]_conflictPromotion, len(promotions))
+	for _, promotion := range promotions {
+		promotionBySource[promotion.source] = promotion
+	}
+	owners := make(map[string]string, len(roots))
+	restoreOwners := make(map[string]string, len(restores))
+	for _, link := range links {
+		recovery, ok := recoveryByPath[link.recoveryPath]
+		if !ok || link.worktree != worktree || !recovery.completed ||
+			(link.sourcePath != recovery.path && !strings.HasPrefix(link.sourcePath, recovery.path+"/")) {
+			return errors.New("sync recovery promotion linkage has no exact completed recovery owner")
+		}
+		if !strings.HasPrefix(recovery.name, syncRecoveryPrefix) ||
+			!validFSActionID(strings.TrimPrefix(recovery.name, syncRecoveryPrefix)) {
+			return fmt.Errorf("sync recovery %q has an invalid hidden promotion source", recovery.path)
+		}
+		expected, ok := promotionBySource[link.sourcePath]
+		if !ok || !validFSActionID(link.currentActionID) ||
+			(link.rollbackActionID != "" && !validFSActionID(link.rollbackActionID)) {
+			return errors.New("sync recovery promotion linkage has no exact conflict provenance source")
+		}
+		current, ok := byID[link.currentActionID]
+		if !ok {
+			return errors.New("linked promotion action linkage is absent")
+		}
+		rootID := current.ActionID
+		if current.OriginActionID != "" {
+			rootID = current.OriginActionID
+		}
+		root, ok := roots[rootID]
+		if !ok {
+			return errors.New("sync recovery promotion linkage does not resolve into a promotion chain")
+		}
+		if owner, exists := owners[rootID]; exists {
+			return fmt.Errorf("filesystem promotion chain has duplicate source owners %q and %q", owner, link.sourcePath)
+		}
+		child := strings.TrimPrefix(link.sourcePath, recovery.path)
+		if child != "" {
+			if recovery.kind != "Directory" || child[0] != '/' {
+				return errors.New("promotion source is outside its recovery type boundary")
+			}
+			child = child[1:]
+		}
+		sourcePath := recovery.name
+		if child != "" {
+			sourcePath += "/" + child
+		}
+		parent, leaf := splitFSActionPath(sourcePath)
+		if root.Parent != parent || root.Source != leaf || validateRootPromotionTarget(expected.target, root.Target) != nil ||
+			(root.Target == expected.target && (root.ExpectedObject != expected.id || root.ExpectedMtime != expected.mtime ||
+				root.ExpectedSize != expected.size)) ||
+			(child == "" && (recovery.kind != "File" || root.ExpectedDevice != recovery.device || root.ExpectedInode != recovery.inode)) {
+			return fmt.Errorf("promotion source %q has mismatched recovery or conflict provenance ownership", link.sourcePath)
+		}
+		owners[rootID] = link.sourcePath
+		if link.rollbackActionID == "" {
+			continue
+		}
+		restore, ok := restores[link.rollbackActionID]
+		sourceParent, sourceLeaf := splitFSActionPath(current.Target)
+		parentMtime, mtimeErr := restorePromotionParentMtime(ctx, db, recovery, link.sourcePath)
+		if !ok || mtimeErr != nil || current.State != fsStateCompleted || restore.Worktree != worktree ||
+			restore.Phase != fsPhaseRollback || restore.Op != fsOpRestorePromotion || restore.Parent != sourceParent ||
+			restore.Source != sourceLeaf || restore.Target != sourcePath || restore.ExpectedKind != "File" ||
+			restore.ExpectedDevice != current.ExpectedDevice || restore.ExpectedInode != current.ExpectedInode ||
+			restore.ExpectedMtime != parentMtime {
+			return fmt.Errorf("promotion source %q has mismatched restore action ownership", link.sourcePath)
+		}
+		if owner, exists := restoreOwners[restore.ActionID]; exists {
+			return fmt.Errorf("filesystem restore promotion action has duplicate source owners %q and %q", owner, link.sourcePath)
+		}
+		restoreOwners[restore.ActionID] = link.sourcePath
+	}
+	if len(owners) != len(roots) {
+		return errors.New("filesystem promotion journal contains an orphan root or chain")
+	}
+	if len(restoreOwners) != len(restores) {
+		return errors.New("filesystem restore promotion journal contains an orphan action")
+	}
+	if len(restores) != 0 {
+		rows, err := db.QueryContext(ctx, `SELECT apply_state FROM pending_checkouts WHERE worktree=? AND apply_state='rolling_back'`, worktree)
+		if err != nil {
+			return err
+		}
+		rollingBack := rows.Next()
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return err
+		}
+		if !rollingBack {
+			return errors.New("filesystem restore promotion action is outside rollback")
+		}
+	}
+	return nil
+}
+
+func validatePendingPromotionTargets(ctx context.Context, db *sql.DB, worktree string) error {
+	if err := validatePendingCheckoutState(ctx, db, worktree); err != nil {
+		return err
+	}
+	journal, err := loadFSActions(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	if err := validateFSActionJournal(ctx, db, worktree, journal); err != nil {
+		return err
+	}
+	return validatePromotionOwnership(ctx, db, worktree, journal)
+}
+
+func restorePromotionParentMtime(ctx context.Context, db fsActionQueryer, recovery syncRecovery, sourcePath string) (string, error) {
+	parent, _ := splitFSActionPath(sourcePath)
+	if parent == "" {
+		return "", nil
+	}
+	if parent != recovery.path && !strings.HasPrefix(parent, recovery.path+"/") {
+		return "", errors.New("promotion restore parent is outside its recovery")
+	}
+	rows, err := db.QueryContext(ctx, `SELECT canonical_mtime FROM path_index
+		WHERE worktree=? AND path=? AND type='Directory'`, recovery.worktree, parent)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return "", errors.Join(errors.New("promotion restore parent has no exact baseline metadata"), rows.Err())
+	}
+	var mtime string
+	if err := rows.Scan(&mtime); err != nil {
+		return "", err
+	}
+	if rows.Next() {
+		return "", errors.New("promotion restore parent has duplicate baseline metadata")
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return mtime, nil
+}
+
+func linkedPromotionProvenance(recovery syncRecovery, link syncRecoveryPromotion,
+	promotions []_conflictPromotion) (string, _conflictPromotion, error) {
+	if link.worktree != recovery.worktree || link.recoveryPath != recovery.path ||
+		(link.sourcePath != recovery.path && !strings.HasPrefix(link.sourcePath, recovery.path+"/")) {
+		return "", _conflictPromotion{}, errors.New("linked promotion has no exact recovery owner")
+	}
+	for _, expected := range promotions {
+		if expected.source != link.sourcePath {
+			continue
+		}
+		sourcePath := recovery.name
+		if expected.source != recovery.path {
+			sourcePath += "/" + strings.TrimPrefix(expected.source, recovery.path+"/")
+		}
+		return sourcePath, expected, nil
+	}
+	return "", _conflictPromotion{}, errors.New("linked promotion has no exact conflict provenance")
+}
+
+func resetPromotedCheckoutIfNeeded(ctx context.Context, db *sql.DB, root *openedWorktree,
+	worktree, path string, expected *checkoutPathCAS) error {
+	var loaded checkoutPathCAS
+	var err error
+	if expected == nil {
+		loaded, err = loadCheckoutPathCAS(ctx, db, worktree, path)
+		if err != nil {
+			return err
+		}
+	} else {
+		loaded = *expected
+	}
+	if !loaded.completed {
+		return nil
+	}
+	parentPath, leaf := splitFSActionPath(path)
+	parent, err := openFSActionParent(root, parentPath, 0, 0)
+	if err != nil {
+		return err
+	}
+	file, info, openErr := openScannableAt(parent, leaf, path)
+	if openErr == nil {
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+		id, scanErr := scanRegularFile(file, path, info, &snapshot)
+		mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+		closeErr := errors.Join(file.Close(), parent.Close())
+		registeredIdentity := (uint64(stat.Dev) == loaded.targetDevice && stat.Ino == loaded.targetInode) ||
+			(uint64(stat.Dev) == loaded.tempDevice && stat.Ino == loaded.tempInode)
+		if scanErr == nil && closeErr == nil && ok && loaded.kind == "File" && id == loaded.id &&
+			info.Size() == loaded.size && mtime == loaded.mtime && registeredIdentity {
+			return nil
+		}
+		if scanErr != nil || closeErr != nil {
+			return errors.Join(scanErr, closeErr)
+		}
+	} else {
+		closeErr := parent.Close()
+		if !errors.Is(openErr, syscall.ENOENT) || closeErr != nil {
+			return errors.Join(openErr, closeErr)
+		}
+	}
+	result, err := db.ExecContext(ctx, `UPDATE checkout_paths SET actual_mtime='',temp_name='',temp_device=0,temp_inode=0,
+		target_device=0,target_inode=0,completed=0 WHERE `+_checkoutPathCAS, checkoutPathCASArgs(loaded)...)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.Join(errors.New("reset late conflict Candidate path failed due to stale checkout state"), err)
+	}
+	return nil
+}
+
+func consumeSyncRecovery(ctx context.Context, db *sql.DB, recovery syncRecovery) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error { return errors.Join(err, tx.Rollback()) }
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT COALESCE(a.origin_action_id,a.action_id)
+		FROM sync_recovery_promotions p JOIN fs_actions a
+		ON a.worktree=p.worktree AND a.action_id=p.current_action_id
+		WHERE p.worktree=? AND p.recovery_path=? LIMIT ?`, recovery.worktree, recovery.path, maxSyncJournalRows+1)
+	if err != nil {
+		return fail(err)
+	}
+	var roots []string
+	for rows.Next() {
+		var rootID string
+		if err := rows.Scan(&rootID); err != nil {
+			rows.Close()
+			return fail(err)
+		}
+		roots = append(roots, rootID)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fail(err)
+	}
+	if len(roots) > maxSyncJournalRows {
+		return fail(errors.New("sync recovery promotion cleanup exceeds synchronization budget"))
+	}
+	for _, rootID := range roots {
+		var incomplete int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM fs_actions WHERE worktree=?
+			AND (action_id=? OR origin_action_id=?) AND state<>'completed'`, recovery.worktree, rootID, rootID).Scan(&incomplete); err != nil {
+			return fail(err)
+		}
+		if incomplete != 0 {
+			return fail(errors.New("cannot consume sync recovery with incomplete promotion actions"))
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM fs_actions WHERE worktree=? AND origin_action_id=?`, recovery.worktree, rootID); err != nil {
+			return fail(err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM fs_actions WHERE worktree=? AND action_id=?`, recovery.worktree, rootID); err != nil {
+			return fail(err)
+		}
+	}
+	var incompleteRestores int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_recovery_promotions p JOIN fs_actions a
+		ON a.worktree=p.worktree AND a.action_id=p.rollback_action_id
+		WHERE p.worktree=? AND p.recovery_path=? AND a.state<>'completed'`, recovery.worktree, recovery.path).Scan(&incompleteRestores); err != nil {
+		return fail(err)
+	}
+	if incompleteRestores != 0 {
+		return fail(errors.New("cannot consume sync recovery with incomplete promotion restores"))
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM fs_actions WHERE worktree=? AND action_id IN
+		(SELECT rollback_action_id FROM sync_recovery_promotions WHERE worktree=? AND recovery_path=?)`,
+		recovery.worktree, recovery.worktree, recovery.path); err != nil {
+		return fail(err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sync_recovery_promotions
+		WHERE worktree=? AND recovery_path=?`, recovery.worktree, recovery.path); err != nil {
+		return fail(err)
+	}
+	result, err := tx.ExecContext(ctx, "DELETE FROM sync_recoveries WHERE "+_syncRecoveryCAS, syncRecoveryCASArgs(recovery)...)
+	if err != nil {
+		return fail(err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return fail(errors.Join(errors.New("consume sync recovery failed"), err))
+	}
+	return tx.Commit()
 }
 
 func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string, config libraryClientConfig) error {
@@ -1153,7 +1808,38 @@ func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 	if err != nil {
 		return err
 	}
+	promotions, err := loadConflictPromotions(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	links, err := loadSyncRecoveryPromotions(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
 	for _, value := range values {
+		directFilePromotion := false
+		if value.completed {
+			for index := range links {
+				link := &links[index]
+				if link.recoveryPath != value.path {
+					continue
+				}
+				sourcePath, expected, err := linkedPromotionProvenance(value, *link, promotions)
+				if err != nil {
+					return err
+				}
+				current, err := validateCompletedPromotion(ctx, db, root, value, link, sourcePath, expected, config)
+				if err != nil {
+					return err
+				}
+				directFilePromotion = directFilePromotion || link.sourcePath == value.path
+				if current.Attempt > 0 {
+					if err := resetPromotedCheckoutIfNeeded(ctx, db, root, worktree, expected.target, nil); err != nil {
+						return err
+					}
+				}
+			}
+		}
 		visible, visibleErr := statAt(root.directory, value.path)
 		hidden, hiddenErr := statAt(root.directory, value.name)
 		visibleExists, hiddenExists := visibleErr == nil, hiddenErr == nil
@@ -1164,6 +1850,12 @@ func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 			return hiddenErr
 		}
 		if value.completed {
+			if !hiddenExists && value.kind == "File" {
+				if !directFilePromotion {
+					return fmt.Errorf("completed sync recovery %q changed identity", value.path)
+				}
+				continue
+			}
 			if !hiddenExists || !statMatchesRecovery(hidden, value) {
 				return fmt.Errorf("completed sync recovery %q changed identity", value.path)
 			}
@@ -1183,8 +1875,22 @@ func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 				}
 			}
 			current, err := statAt(root.directory, value.path)
-			if err != nil || !statMatchesRecovery(current, value) {
-				return fmt.Errorf("worktree path %q changed at recovery rename", value.path)
+			if err != nil {
+				return fmt.Errorf("worktree path %q changed at recovery rename: %w", value.path, err)
+			}
+			if !statMatchesRecovery(current, value) {
+				if value.kind != "File" || current.Mode&syscall.S_IFMT != syscall.S_IFREG {
+					return fmt.Errorf("worktree path %q changed structurally at recovery rename; Issue #18 owns preservation", value.path)
+				}
+				args := append([]any{uint64(current.Dev), current.Ino}, syncRecoveryCASArgs(value)...)
+				result, err := db.ExecContext(ctx, "UPDATE sync_recoveries SET device=?,inode=? WHERE "+_syncRecoveryCAS, args...)
+				if err != nil {
+					return err
+				}
+				if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+					return errors.Join(errors.New("record replacement recovery inode failed"), err)
+				}
+				value.device, value.inode = uint64(current.Dev), current.Ino
 			}
 			if err := journalRename(ctx, db, root, worktree, fsPhasePreBase, "", value.path, value.name,
 				value.kind, "", value.name, value.device, value.inode, config.fsActionFault); err != nil {
@@ -1207,7 +1913,8 @@ func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 				return fmt.Errorf("before sync recovery completion: %w", err)
 			}
 		}
-		result, err := db.ExecContext(ctx, `UPDATE sync_recoveries SET completed = 1 WHERE worktree = ? AND path = ? AND completed = 0`, worktree, value.path)
+		result, err := db.ExecContext(ctx, "UPDATE sync_recoveries SET completed=1 WHERE "+_syncRecoveryCAS,
+			syncRecoveryCASArgs(value)...)
 		if err != nil {
 			return err
 		}
@@ -1218,10 +1925,419 @@ func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 	return nil
 }
 
+func reconcilePromotedConflictFiles(ctx context.Context, db *sql.DB, options bindOptions, targets []checkoutPath,
+	config libraryClientConfig) (map[string]bool, error) {
+	promotions, err := loadConflictPromotions(ctx, db, options.worktree)
+	if err != nil {
+		return nil, err
+	}
+	recoveries, err := loadSyncRecoveries(ctx, db, options.worktree)
+	if err != nil {
+		return nil, err
+	}
+	links, err := loadSyncRecoveryPromotions(ctx, db, options.worktree)
+	if err != nil {
+		return nil, err
+	}
+	journal, err := loadFSActions(ctx, db, options.worktree)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateFSActionJournal(ctx, db, options.worktree, journal); err != nil {
+		return nil, err
+	}
+	byID := make(map[string]fsAction, len(journal))
+	late := make(map[string]bool)
+	for _, action := range journal {
+		byID[action.ActionID] = action
+		if action.OriginActionID != "" && action.Op == fsOpRename && action.ExpectedObject != "" &&
+			action.State == fsStateCompleted {
+			late[action.Target] = true
+		}
+	}
+	recoveryByPath := make(map[string]syncRecovery, len(recoveries))
+	for _, recovery := range recoveries {
+		recoveryByPath[recovery.path] = recovery
+	}
+	for index := range links {
+		link := &links[index]
+		recovery, ok := recoveryByPath[link.recoveryPath]
+		if !ok || !recovery.completed {
+			return nil, errors.New("late promotion linkage has no completed recovery")
+		}
+		_, expected, err := linkedPromotionProvenance(recovery, *link, promotions)
+		if err != nil {
+			return nil, err
+		}
+		current, ok := byID[link.currentActionID]
+		if !ok || current.State != fsStateCompleted {
+			return nil, errors.New("late promotion recovery has stale current linkage")
+		}
+		if current.Target != expected.target {
+			late[current.Target] = true
+		}
+		parentPath, leaf := splitFSActionPath(current.Target)
+		parent, err := openFSActionParent(options.worktreeRoot, parentPath, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		file, info, err := openScannableAt(parent, leaf, current.Target)
+		if err != nil {
+			parent.Close()
+			return nil, err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+		id, scanErr := scanRegularFile(file, current.Target, info, &snapshot)
+		mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+		closeErr := file.Close()
+		if scanErr != nil || closeErr != nil || !ok {
+			parent.Close()
+			return nil, errors.Join(scanErr, closeErr, errors.New("inspect promoted conflict identity"))
+		}
+		if uint64(stat.Dev) == current.ExpectedDevice && stat.Ino == current.ExpectedInode &&
+			id == current.ExpectedObject && info.Size() == current.ExpectedSize && mtime == current.ExpectedMtime {
+			if err := parent.Close(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		successor, err := nextConflictChainPath(current.Target)
+		if err != nil {
+			parent.Close()
+			return nil, err
+		}
+		var parentStat unix.Stat_t
+		if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
+			parent.Close()
+			return nil, err
+		}
+		if err := parent.Close(); err != nil {
+			return nil, err
+		}
+		checkout, err := loadCheckoutPathCAS(ctx, db, options.worktree, expected.target)
+		if err != nil {
+			return nil, err
+		}
+		next, err := journalLatePromotion(ctx, db, options.worktreeRoot, link, current,
+			uint64(parentStat.Dev), parentStat.Ino, successor, id, mtime, info.Size(), uint64(stat.Dev), stat.Ino,
+			config.fsActionFault)
+		if err != nil {
+			return nil, fmt.Errorf("preserve late conflict %q as %q: %w", current.Target, successor, err)
+		}
+		late[next.Target] = true
+		if err := resetPromotedCheckoutIfNeeded(ctx, db, options.worktreeRoot, options.worktree, expected.target, &checkout); err != nil {
+			return nil, err
+		}
+	}
+	if len(late) != 0 {
+		if err := materializeCheckoutFiles(ctx, db, options, targets, config); err != nil {
+			return nil, err
+		}
+	}
+	return late, nil
+}
+
+func nextConflictChainPath(current string) (string, error) {
+	parentPath, leaf := splitFSActionPath(current)
+	stem, extension := leaf, ""
+	if index := strings.LastIndexByte(leaf, '.'); index > 0 {
+		stem, extension = leaf[:index], leaf[index:]
+	}
+	close := strings.LastIndex(stem, ")")
+	if close < 0 || !strings.Contains(stem[:close], " (Filecloud conflict ") {
+		return "", errors.New("promoted conflict path does not use the canonical template")
+	}
+	base := stem[:close+1]
+	number := 2
+	if suffix := strings.TrimSpace(stem[close+1:]); suffix != "" {
+		value, err := strconv.Atoi(suffix)
+		if err != nil || value < 2 || value >= 9999 {
+			return "", errors.New("promoted conflict path has an invalid collision suffix")
+		}
+		number = value + 1
+	}
+	leaf = base + " " + strconv.Itoa(number) + extension
+	path := leaf
+	if parentPath != "" {
+		path = parentPath + "/" + leaf
+	}
+	if !validRecoveryVisibleName(leaf) || len(path) > _mergeMaxPath {
+		return "", errors.New("late conflict path exceeds Issue #17 limits; Issue #19 owns fallback")
+	}
+	return path, nil
+}
+
+func validateRootPromotionTarget(expected, target string) error {
+	if !_validConflictPromotionPath(expected) || !_validConflictPromotionPath(target) {
+		return errors.New("promotion root target is invalid")
+	}
+	path := expected
+	for attempt := 0; attempt < 9999; attempt++ {
+		if path == target {
+			return nil
+		}
+		var err error
+		path, err = nextConflictChainPath(path)
+		if err != nil {
+			return errors.Join(errors.New("promotion root target is outside its deterministic conflict-name family"), err)
+		}
+	}
+	return errors.New("promotion root target is outside its deterministic conflict-name family")
+}
+
+func nextConflictVisiblePath(parent *os.File, parentPath, current string) (string, error) {
+	currentParent, _ := splitFSActionPath(current)
+	if currentParent == "" && parentPath != "" {
+		current = parentPath + "/" + current
+	} else if currentParent != parentPath {
+		return "", errors.New("conflict collision parent changed")
+	}
+	if _, err := parent.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	names, err := parent.Readdirnames(-1)
+	if err != nil {
+		return "", err
+	}
+	occupied := make(map[string]bool, len(names))
+	for _, name := range names {
+		occupied[cases.Fold().String(name)] = true
+	}
+	path := current
+	for attempt := 0; attempt < 9999; attempt++ {
+		path, err = nextConflictChainPath(path)
+		if err != nil {
+			return "", err
+		}
+		_, leaf := splitFSActionPath(path)
+		if !occupied[cases.Fold().String(leaf)] {
+			return path, nil
+		}
+	}
+	return "", errors.New("conflict collision sequence exhausted")
+}
+
+type checkoutPathCAS struct {
+	worktree, path, kind, id, mtime, actualMtime, tempName, rollbackName, createActionID string
+	size                                                                                 int64
+	tempDevice, tempInode, targetDevice, targetInode                                     uint64
+	completed                                                                            bool
+}
+
+const _checkoutPathCAS = `worktree=? AND path=? AND type=? AND object_id=? AND canonical_mtime=? AND actual_mtime=?
+	AND size=? AND temp_name=? AND temp_device=? AND temp_inode=? AND target_device=? AND target_inode=?
+	AND completed=? AND rollback_name=? AND create_action_id=?`
+
+func loadCheckoutPathCAS(ctx context.Context, db *sql.DB, worktree, path string) (checkoutPathCAS, error) {
+	var value checkoutPathCAS
+	err := db.QueryRowContext(ctx, `SELECT worktree,path,type,object_id,canonical_mtime,actual_mtime,size,temp_name,
+		temp_device,temp_inode,target_device,target_inode,completed,rollback_name,create_action_id
+		FROM checkout_paths WHERE worktree=? AND path=?`, worktree, path).Scan(&value.worktree, &value.path, &value.kind,
+		&value.id, &value.mtime, &value.actualMtime, &value.size, &value.tempName, &value.tempDevice, &value.tempInode,
+		&value.targetDevice, &value.targetInode, &value.completed, &value.rollbackName, &value.createActionID)
+	return value, err
+}
+
+func checkoutPathCASArgs(value checkoutPathCAS) []any {
+	return []any{value.worktree, value.path, value.kind, value.id, value.mtime, value.actualMtime, value.size,
+		value.tempName, value.tempDevice, value.tempInode, value.targetDevice, value.targetInode, value.completed,
+		value.rollbackName, value.createActionID}
+}
+
+func registerPromotedCheckoutPath(ctx context.Context, db *sql.DB, root *openedWorktree, worktree, path string) error {
+	loaded, err := loadCheckoutPathCAS(ctx, db, worktree, path)
+	if err != nil {
+		return err
+	}
+	if loaded.kind != "File" || loaded.rollbackName != "" {
+		return errors.New("promoted checkout path is not in its expected state")
+	}
+	targetStat, err := statAt(root.directory, path)
+	if err != nil {
+		return err
+	}
+	if loaded.completed {
+		if loaded.actualMtime != loaded.mtime {
+			return errors.New("completed promoted checkout path changed mtime")
+		}
+		if loaded.targetDevice == uint64(targetStat.Dev) && loaded.targetInode == targetStat.Ino {
+			return nil
+		}
+		if loaded.targetDevice != 0 || loaded.targetInode != 0 {
+			return errors.New("completed promoted checkout path changed identity")
+		}
+		args := append([]any{uint64(targetStat.Dev), targetStat.Ino, uint64(targetStat.Dev), targetStat.Ino}, checkoutPathCASArgs(loaded)...)
+		result, err := db.ExecContext(ctx, `UPDATE checkout_paths SET temp_device=?,temp_inode=?,target_device=?,target_inode=? WHERE `+_checkoutPathCAS, args...)
+		if err != nil {
+			return err
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return errors.Join(errors.New("register completed promoted checkout identity failed"), err)
+		}
+		return nil
+	}
+	args := append([]any{uint64(targetStat.Dev), targetStat.Ino, uint64(targetStat.Dev), targetStat.Ino}, checkoutPathCASArgs(loaded)...)
+	result, err := db.ExecContext(ctx, `UPDATE checkout_paths SET temp_device=?,temp_inode=?,target_device=?,target_inode=?,
+		actual_mtime=canonical_mtime,completed=1 WHERE `+_checkoutPathCAS, args...)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.Join(errors.New("register promoted conflict checkout path failed"), err)
+	}
+	return nil
+}
+
+func promoteCapturedConflictFiles(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string,
+	promotions []_conflictPromotion, targets []checkoutPath, config libraryClientConfig) error {
+	recoveries, err := loadSyncRecoveries(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	links, err := loadSyncRecoveryPromotions(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	linkBySource := make(map[string]*syncRecoveryPromotion, len(links))
+	for index := range links {
+		linkBySource[links[index].sourcePath] = &links[index]
+	}
+	targetByPath := make(map[string]checkoutPath, len(targets))
+	for _, target := range targets {
+		targetByPath[target.path] = target
+	}
+	for _, promotion := range promotions {
+		var recovery *syncRecovery
+		for index := range recoveries {
+			prefix := recoveries[index].path + "/"
+			if promotion.source == recoveries[index].path || strings.HasPrefix(promotion.source, prefix) {
+				if recovery != nil {
+					return fmt.Errorf("conflict provenance source %q crosses recovery boundaries", promotion.source)
+				}
+				recovery = &recoveries[index]
+			}
+		}
+		if recovery == nil {
+			return fmt.Errorf("conflict provenance source %q has no captured recovery", promotion.source)
+		}
+		sourcePath := recovery.name
+		if promotion.source != recovery.path {
+			sourcePath += "/" + strings.TrimPrefix(promotion.source, recovery.path+"/")
+		}
+		sourceParent, sourceLeaf := splitFSActionPath(sourcePath)
+		parent, err := openFSActionParent(root, sourceParent, 0, 0)
+		if err != nil {
+			return err
+		}
+		file, info, err := openScannableAt(parent, sourceLeaf, promotion.source)
+		if errors.Is(err, syscall.ENOENT) {
+			if closeErr := parent.Close(); closeErr != nil {
+				return closeErr
+			}
+			action, err := validateCompletedPromotion(ctx, db, root, *recovery, linkBySource[promotion.source], sourcePath, promotion, config)
+			if err != nil {
+				return err
+			}
+			if action.Target == promotion.target {
+				if err := registerPromotedCheckoutPath(ctx, db, root, worktree, promotion.target); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if err != nil {
+			parent.Close()
+			return err
+		}
+		sourceStat, ok := info.Sys().(*syscall.Stat_t)
+		sourceSnapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+		sourceID, scanErr := scanRegularFile(file, promotion.source, info, &sourceSnapshot)
+		closeErr := file.Close()
+		if scanErr != nil || closeErr != nil || !ok {
+			parent.Close()
+			return errors.Join(scanErr, closeErr, errors.New("inspect captured conflict source"))
+		}
+		sourceMtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+		destination := promotion.target
+		target, fixed := targetByPath[promotion.target]
+		fixed = fixed && target.kind == "File" && target.id == promotion.id && target.mtime == promotion.mtime &&
+			target.size == promotion.size && sourceID == promotion.id && sourceMtime == promotion.mtime && info.Size() == promotion.size
+		if !fixed {
+			targetParentPath, targetLeaf := splitFSActionPath(promotion.target)
+			targetParent, _, err := promotionTargetParent(ctx, db, root, worktree, promotion.target)
+			if err != nil {
+				parent.Close()
+				return err
+			}
+			destination, err = nextConflictVisiblePath(targetParent, targetParentPath, targetLeaf)
+			targetCloseErr := targetParent.Close()
+			if err != nil || targetCloseErr != nil {
+				parent.Close()
+				return errors.Join(err, targetCloseErr)
+			}
+		}
+		if err := validateRootPromotionTarget(promotion.target, destination); err != nil {
+			parent.Close()
+			return err
+		}
+		if err := parent.Close(); err != nil {
+			return err
+		}
+		internalSource := ""
+		if sourceParent == "" {
+			internalSource = sourceLeaf
+		}
+		if err := journalPromotion(ctx, db, root, worktree, promotion.source, sourceParent, sourceLeaf, destination,
+			internalSource, sourceID, sourceMtime, info.Size(), uint64(sourceStat.Dev), sourceStat.Ino,
+			recovery, config.fsActionFault); err != nil {
+			return fmt.Errorf("promote captured conflict %q to %q: %w", promotion.source, destination, err)
+		}
+		if fixed {
+			if err := registerPromotedCheckoutPath(ctx, db, root, worktree, promotion.target); err != nil {
+				return err
+			}
+		}
+	}
+	for _, recovery := range recoveries {
+		if recovery.kind == "File" {
+			continue
+		}
+		file, info, err := openScannableAt(root.directory, recovery.name, recovery.path)
+		if err != nil {
+			return err
+		}
+		snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
+		id, scanErr := scanDirectory(file, recovery.path, &snapshot)
+		closeErr := file.Close()
+		if scanErr != nil || closeErr != nil {
+			return errors.Join(scanErr, closeErr)
+		}
+		mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+		args := append([]any{id, mtime}, syncRecoveryCASArgs(recovery)...)
+		result, err := db.ExecContext(ctx, "UPDATE sync_recoveries SET object_id=?,canonical_mtime=? WHERE "+_syncRecoveryCAS, args...)
+		if err != nil {
+			return err
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return errors.Join(errors.New("update directory recovery identity failed"), err)
+		}
+	}
+	return nil
+}
+
 func verifyAllSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string) error {
 	values, err := loadSyncRecoveries(ctx, db, worktree)
 	if err != nil {
 		return err
+	}
+	links, err := loadSyncRecoveryPromotions(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	directPromotions := make(map[string]bool, len(links))
+	for _, link := range links {
+		directPromotions[link.recoveryPath] = directPromotions[link.recoveryPath] || link.sourcePath == link.recoveryPath
 	}
 	for _, value := range values {
 		if !value.completed {
@@ -1230,6 +2346,11 @@ func verifyAllSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktr
 		name := value.name
 		if value.tombstone != "" {
 			name = value.tombstone
+		}
+		if value.kind == "File" && directPromotions[value.path] {
+			if _, err := statAt(root.directory, name); errors.Is(err, syscall.ENOENT) {
+				continue
+			}
 		}
 		if err := verifyNamedRecovery(root.directory, name, value); err != nil {
 			return fmt.Errorf("verify captured path %q: %w", value.path, err)
@@ -1278,7 +2399,8 @@ func statMatchesRecovery(stat unix.Stat_t, value syncRecovery) bool {
 	return uint64(stat.Dev) == value.device && stat.Ino == value.inode && stat.Mode&syscall.S_IFMT == mode
 }
 
-func finalizeSyncApply(ctx context.Context, db *sql.DB, binding clientBinding, pending pendingCheckout, paths []checkoutPath, config libraryClientConfig) error {
+func finalizeSyncApply(ctx context.Context, db *sql.DB, binding clientBinding, pending pendingCheckout, paths []checkoutPath,
+	config libraryClientConfig, revalidate func() error) error {
 	worktree := binding.Worktree
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1301,6 +2423,12 @@ func finalizeSyncApply(ctx context.Context, db *sql.DB, binding clientBinding, p
 		if err := config.fsTransactionFault("before_base_commit"); err != nil {
 			return errors.Join(err, tx.Rollback())
 		}
+	}
+	if revalidate == nil {
+		return errors.Join(errors.New("final Sync Base commit requires filesystem revalidation"), tx.Rollback())
+	}
+	if err := revalidate(); err != nil {
+		return errors.Join(&syncRerunError{cause: err}, tx.Rollback())
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("finalize synchronized checkout: %w", err)
@@ -1479,6 +2607,9 @@ func removeRecoveryDirectory(ctx context.Context, db *sql.DB, root *openedWorktr
 }
 
 func cleanupSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string, config libraryClientConfig) error {
+	if err := validatePendingPromotionTargets(ctx, db, worktree); err != nil {
+		return err
+	}
 	values, err := loadSyncRecoveries(ctx, db, worktree)
 	if err != nil {
 		return err
@@ -1489,10 +2620,17 @@ func cleanupSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 			if err != nil {
 				return err
 			}
-			if _, err := db.ExecContext(ctx, `UPDATE sync_recoveries SET tombstone_name = ? WHERE worktree = ? AND path = ? AND tombstone_name = ''`,
-				value.tombstone, worktree, value.path); err != nil {
+			registered := value.tombstone
+			value.tombstone = ""
+			args := append([]any{registered}, syncRecoveryCASArgs(value)...)
+			result, err := db.ExecContext(ctx, "UPDATE sync_recoveries SET tombstone_name=? WHERE "+_syncRecoveryCAS, args...)
+			if err != nil {
 				return err
 			}
+			if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+				return errors.Join(errors.New("register sync recovery tombstone failed"), err)
+			}
+			value.tombstone = registered
 		}
 		if config.beforeSyncRecoveryCleanup != nil {
 			if err := config.beforeSyncRecoveryCleanup(value.path, value.name); err != nil {
@@ -1522,7 +2660,7 @@ func cleanupSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 				return fmt.Errorf("sync recovery tombstone %q changed identity", value.path)
 			}
 		case !recoveryExists && !tombstoneExists:
-			if _, err := db.ExecContext(ctx, "DELETE FROM sync_recoveries WHERE worktree = ? AND path = ?", worktree, value.path); err != nil {
+			if err := consumeSyncRecovery(ctx, db, value); err != nil {
 				return err
 			}
 			continue
@@ -1547,7 +2685,7 @@ func cleanupSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 				return fmt.Errorf("remove sync recovery %q: %w", value.path, err)
 			}
 		}
-		if _, err := db.ExecContext(ctx, "DELETE FROM sync_recoveries WHERE worktree = ? AND path = ?", worktree, value.path); err != nil {
+		if err := consumeSyncRecovery(ctx, db, value); err != nil {
 			return err
 		}
 	}
@@ -1563,6 +2701,12 @@ type rollbackCheckoutPath struct {
 }
 
 func rollbackSyncApply(ctx context.Context, db *sql.DB, root *openedWorktree, clientDir, worktree string, config libraryClientConfig) error {
+	if err := validatePendingCheckoutState(ctx, db, worktree); err != nil {
+		return err
+	}
+	if err := rollbackSyncRecoveryPromotions(ctx, db, root, worktree, config); err != nil {
+		return err
+	}
 	cacheRoot, err := openVerifiedCacheRoot(clientDir)
 	if err != nil {
 		return err
@@ -1578,7 +2722,114 @@ func rollbackSyncApply(ctx context.Context, db *sql.DB, root *openedWorktree, cl
 	if err := rollbackInstalledCheckoutPaths(ctx, db, root, cacheRoot, worktree, config); err != nil {
 		return err
 	}
-	return rollbackSyncRecoveries(ctx, db, root, worktree, config)
+	if err := rollbackSyncRecoveries(ctx, db, root, worktree, config); err != nil {
+		return err
+	}
+	if err := restoreRollbackRootMtime(ctx, db, root, worktree, config.fsActionFault); err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for _, query := range []string{
+		"DELETE FROM fs_actions WHERE worktree=? AND state='completed' AND origin_action_id IS NOT NULL",
+		"DELETE FROM fs_actions WHERE worktree=? AND state='completed'",
+	} {
+		if _, err := tx.ExecContext(ctx, query, worktree); err != nil {
+			return errors.Join(err, tx.Rollback())
+		}
+	}
+	var remaining int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM fs_actions WHERE worktree=?", worktree).Scan(&remaining); err != nil || remaining != 0 {
+		return errors.Join(errors.New("sync rollback left incomplete filesystem actions"), err, tx.Rollback())
+	}
+	return tx.Commit()
+}
+
+func rollbackSyncRecoveryPromotions(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string,
+	config libraryClientConfig) error {
+	journal, err := loadFSActions(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	if err := validateFSActionJournal(ctx, db, worktree, journal); err != nil {
+		return err
+	}
+	if err := validatePromotionOwnership(ctx, db, worktree, journal); err != nil {
+		return err
+	}
+	recoveries, err := loadSyncRecoveries(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	links, err := loadSyncRecoveryPromotions(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	promotions, err := loadConflictPromotions(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]fsAction, len(journal))
+	for _, action := range journal {
+		byID[action.ActionID] = action
+	}
+	recoveryByPath := make(map[string]syncRecovery, len(recoveries))
+	for _, recovery := range recoveries {
+		recoveryByPath[recovery.path] = recovery
+	}
+	descendantRecoveries := make(map[string]bool)
+	for index := range links {
+		link := &links[index]
+		recovery, ok := recoveryByPath[link.recoveryPath]
+		current, currentOK := byID[link.currentActionID]
+		if !ok || !currentOK {
+			return errors.New("promotion restore has stale recovery or current action linkage")
+		}
+		target, _, err := linkedPromotionProvenance(recovery, *link, promotions)
+		if err != nil {
+			return err
+		}
+		if link.sourcePath != recovery.path {
+			descendantRecoveries[recovery.path] = true
+		}
+		if link.rollbackActionID == "" {
+			if err := journalRestorePromotion(ctx, db, root, recovery, link, current, target, config.fsActionFault); err != nil {
+				return fmt.Errorf("restore promoted recovery source %q: %w", link.sourcePath, err)
+			}
+			continue
+		}
+		restore, ok := byID[link.rollbackActionID]
+		if !ok {
+			return errors.New("promotion restore linkage is absent")
+		}
+		if restore.State == fsStateIntent {
+			if err := completeFSAction(ctx, db, root, restore, config.fsActionFault); err != nil {
+				return fmt.Errorf("resume promoted recovery restore %q: %w", link.sourcePath, err)
+			}
+		}
+	}
+	for recoveryPath := range descendantRecoveries {
+		recovery := recoveryByPath[recoveryPath]
+		var id, mtime string
+		if err := db.QueryRowContext(ctx, `SELECT object_id,canonical_mtime FROM path_index
+			WHERE worktree=? AND path=? AND type='Directory'`, worktree, recoveryPath).Scan(&id, &mtime); err != nil {
+			return errors.Join(errors.New("promoted directory recovery has no exact pre-apply metadata"), err)
+		}
+		if recovery.id == id && recovery.mtime == mtime {
+			continue
+		}
+		args := append([]any{id, mtime}, syncRecoveryCASArgs(recovery)...)
+		result, err := db.ExecContext(ctx, "UPDATE sync_recoveries SET object_id=?,canonical_mtime=? WHERE "+_syncRecoveryCAS, args...)
+		if err != nil {
+			return err
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return errors.Join(errors.New("restore promoted directory recovery metadata"), err)
+		}
+	}
+	return nil
 }
 
 func loadRollbackCheckoutPaths(ctx context.Context, db *sql.DB, worktree string) ([]rollbackCheckoutPath, error) {
@@ -1844,6 +3095,64 @@ func syncRollbackParent(parent *os.File, config libraryClientConfig) error {
 	return config.syncDirectory(parent.Name())
 }
 
+func restoreRollbackRootMtime(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string, fault fsActionFault) error {
+	if root == nil || root.path != worktree {
+		return errors.New("sync rollback root mtime has no exact worktree root")
+	}
+	if err := root.validateIdentity(); err != nil {
+		return err
+	}
+	if err := validatePendingCheckoutState(ctx, db, worktree); err != nil {
+		return err
+	}
+	var mtimeNS int64
+	var mtimeValid bool
+	err := db.QueryRowContext(ctx, `SELECT rollback_root_mtime_ns,rollback_root_mtime_valid FROM pending_checkouts
+		WHERE worktree=? AND apply_state='rolling_back'`, worktree).Scan(&mtimeNS, &mtimeValid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil || !mtimeValid {
+		return errors.Join(errors.New("sync rollback has no exact root mtime"), err)
+	}
+	mtime := time.Unix(0, mtimeNS).UTC().Format(time.RFC3339Nano)
+	journal, err := loadFSActions(ctx, db, worktree)
+	if err != nil {
+		return err
+	}
+	var existing *fsAction
+	for index := range journal {
+		action := &journal[index]
+		if action.Phase != fsPhaseRollback || action.Op != fsOpMtime || action.Parent != "" || action.Source != "" {
+			continue
+		}
+		if existing != nil || index != len(journal)-1 || action.Worktree != worktree || action.OriginActionID != "" || action.Attempt != 0 ||
+			action.ParentDevice != root.device || action.ParentInode != root.inode || action.Target != "" ||
+			action.ExpectedKind != "Directory" || action.ExpectedDevice != root.device || action.ExpectedInode != root.inode ||
+			action.ExpectedObject != "" || action.ExpectedSize != 0 || action.ExpectedMtime != mtime ||
+			action.InternalSource != "" || action.InternalTarget != "" || action.Outcome != "" {
+			return errors.New("sync rollback root mtime action changed identity or metadata")
+		}
+		existing = action
+	}
+	if existing != nil {
+		if existing.State == fsStateCompleted {
+			var stat unix.Stat_t
+			if err := unix.Fstat(int(root.directory.Fd()), &stat); err != nil {
+				return err
+			}
+			if uint64(stat.Dev) != root.device || stat.Ino != root.inode ||
+				time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec).UnixNano() != mtimeNS {
+				return errors.New("completed sync rollback root mtime action no longer matches the worktree")
+			}
+			return nil
+		}
+		return completeFSAction(ctx, db, root, *existing, fault)
+	}
+	return journalMtime(ctx, db, root, worktree, fsPhaseRollback, "", "", "Directory", mtime,
+		root.device, root.inode, fault)
+}
+
 func rollbackSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree, worktree string, config libraryClientConfig) error {
 	values, err := loadSyncRecoveries(ctx, db, worktree)
 	if err != nil {
@@ -1889,7 +3198,7 @@ func rollbackSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktre
 				return fmt.Errorf("after sync recovery restore: %w", err)
 			}
 		}
-		if _, err := db.ExecContext(ctx, "DELETE FROM sync_recoveries WHERE worktree = ? AND path = ?", worktree, value.path); err != nil {
+		if err := consumeSyncRecovery(ctx, db, value); err != nil {
 			return err
 		}
 	}

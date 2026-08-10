@@ -1213,8 +1213,303 @@ func TestLibraryCheckoutCacheRejectsIntermediateSymlink(t *testing.T) {
 	}
 }
 
-func TestPendingCheckoutAccessTokenColumnMigration(t *testing.T) {
-	clientDir, worktree := newClientPaths(t)
+func TestPendingCheckoutV21InflightMigrationRejectedBeforeDDL(t *testing.T) {
+	for _, state := range []string{"applying", "rolling_back"} {
+		for _, consumed := range []bool{false, true} {
+			name := state + "/empty"
+			if consumed {
+				name = state + "/consumed checkout path"
+			}
+			t.Run(name, func(t *testing.T) {
+				db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				if _, err := db.Exec(`DROP TABLE sync_recovery_promotions;
+					ALTER TABLE pending_checkouts RENAME TO v22_pending_checkouts;`+_clientV21CheckoutSQL+`;
+					DROP TABLE v22_pending_checkouts;
+					DELETE FROM client_schema_migrations WHERE version=22;
+					INSERT INTO pending_checkouts VALUES('http://localhost','library','/work','user','device','commit','root','etag',?)`, state); err != nil {
+					t.Fatal(err)
+				}
+				if consumed {
+					if _, err := db.Exec(`INSERT INTO checkout_paths(worktree,path,type,object_id,canonical_mtime,actual_mtime,
+						size,completed) VALUES('/work','base','File','object','2024-01-02T03:04:05Z','2024-01-02T03:04:05Z',1,1)`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var beforeSchema string
+				if err := db.QueryRow(`SELECT group_concat(type||'|'||name||'|'||COALESCE(sql,''), char(10)) FROM
+					(SELECT type,name,sql FROM sqlite_schema ORDER BY type,name)`).Scan(&beforeSchema); err != nil {
+					t.Fatal(err)
+				}
+				var beforeVersion, beforePending, beforePaths int
+				if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&beforeVersion); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.QueryRow(`SELECT COUNT(*) FROM pending_checkouts`).Scan(&beforePending); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.QueryRow(`SELECT COUNT(*) FROM checkout_paths`).Scan(&beforePaths); err != nil {
+					t.Fatal(err)
+				}
+				err = initializeClientSchema(t.Context(), db)
+				if err == nil || !strings.Contains(err.Error(), "no exact rollback root mtime") {
+					t.Fatalf("v21 in-flight migration error=%v", err)
+				}
+				var afterSchema string
+				if err := db.QueryRow(`SELECT group_concat(type||'|'||name||'|'||COALESCE(sql,''), char(10)) FROM
+					(SELECT type,name,sql FROM sqlite_schema ORDER BY type,name)`).Scan(&afterSchema); err != nil {
+					t.Fatal(err)
+				}
+				var afterVersion, afterPending, afterPaths int
+				if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&afterVersion); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.QueryRow(`SELECT COUNT(*) FROM pending_checkouts`).Scan(&afterPending); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.QueryRow(`SELECT COUNT(*) FROM checkout_paths`).Scan(&afterPaths); err != nil {
+					t.Fatal(err)
+				}
+				if afterSchema != beforeSchema || afterVersion != beforeVersion || afterPending != beforePending || afterPaths != beforePaths {
+					t.Fatalf("rejected migration changed database schema=%v version=%d/%d pending=%d/%d paths=%d/%d",
+						afterSchema != beforeSchema, beforeVersion, afterVersion, beforePending, afterPending, beforePaths, afterPaths)
+				}
+			})
+		}
+	}
+}
+
+func TestPendingCheckoutV22RequiresExactMtimeForInflightState(t *testing.T) {
+	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_, err = db.Exec(`INSERT INTO pending_checkouts(server_url,library_id,worktree,user_id,device_id,target_commit,target_root,
+		head_etag,apply_state,conflict_promotions,rollback_root_mtime_ns,rollback_root_mtime_valid)
+		VALUES('http://localhost','library','/work','user','device','commit','root','etag','applying',X'4643503100000000',0,0)`)
+	if err == nil || !strings.Contains(err.Error(), "CHECK constraint") {
+		t.Fatalf("invalid in-flight root mtime error=%v", err)
+	}
+	if err := _validateClientV22CheckoutSchema(t.Context(), db); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPendingCheckoutV21ToV22Migration(t *testing.T) {
+	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`ALTER TABLE pending_checkouts RENAME TO v22_pending_checkouts;` + _clientV21CheckoutSQL + `;
+		INSERT INTO pending_checkouts(server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state)
+		SELECT server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state FROM v22_pending_checkouts;
+		INSERT INTO pending_checkouts VALUES('http://localhost','11111111-2222-4333-8444-555555555555','/work',
+		'11111111-2222-4333-8444-555555555555','aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee','commit','','etag','pending');
+		DROP TABLE v22_pending_checkouts;
+		ALTER TABLE sync_recoveries RENAME TO v22_sync_recoveries;` + _clientV21SyncRecoverySQL + `;
+		INSERT INTO sync_recoveries(worktree,path,recovery_name,type,object_id,canonical_mtime,size,device,inode,completed,tombstone_name)
+		SELECT worktree,path,recovery_name,type,object_id,canonical_mtime,size,device,inode,completed,tombstone_name FROM v22_sync_recoveries;
+		DROP TABLE v22_sync_recoveries; DELETE FROM client_schema_migrations WHERE version=22`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeClientSchema(t.Context(), db); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	var encoded []byte
+	if err := db.QueryRow("SELECT MAX(version) FROM client_schema_migrations").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT conflict_promotions FROM pending_checkouts LIMIT 1").Scan(&encoded); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal(err)
+	}
+	var recoveryColumns, rollbackColumns, promotionRows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sync_recoveries') WHERE name='promotion_action_id'").Scan(&recoveryColumns); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sync_recovery_promotions') WHERE name='rollback_action_id'").Scan(&rollbackColumns); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM sync_recovery_promotions").Scan(&promotionRows); err != nil {
+		t.Fatal(err)
+	}
+	if version != 22 || !bytes.Equal(encoded, _emptyConflictPromotions) || recoveryColumns != 0 || rollbackColumns != 1 || promotionRows != 0 {
+		t.Fatalf("migration version=%d provenance=%x scalar columns=%d rollback columns=%d promotion rows=%d",
+			version, encoded, recoveryColumns, rollbackColumns, promotionRows)
+	}
+	if err := _validateClientSyncRecoverySchema(t.Context(), db, 22, _clientV22SyncRecoverySQL, _clientV22SyncRecoveryColumns); err != nil {
+		t.Fatal(err)
+	}
+	if err := _validateClientSyncRecoveryPromotionSchema(t.Context(), db); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientV22MigratesFSActionRestorePromotionConstraint(t *testing.T) {
+	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	const worktree = "/work"
+	if _, err := db.Exec(`INSERT INTO fs_journal_bindings(worktree,root_device,root_inode,journal_format) VALUES(?,1,2,1)`, worktree); err != nil {
+		t.Fatal(err)
+	}
+	action := fsAction{Worktree: worktree, ActionID: "00112233445566778899aabbccddeeff", Order: 1,
+		Phase: fsPhasePreBase, Op: fsOpMtime, ParentDevice: 1, ParentInode: 2, Source: "base",
+		ExpectedKind: "File", ExpectedDevice: 3, ExpectedInode: 4, ExpectedMtime: "2026-08-09T00:00:00Z"}
+	if err := insertFSActionIntent(t.Context(), db, action); err != nil {
+		t.Fatal(err)
+	}
+	var createSQL string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='fs_actions'`).Scan(&createSQL); err != nil {
+		t.Fatal(err)
+	}
+	oldSQL := strings.Replace(createSQL, ", 'restore_promotion'", "", 1)
+	if oldSQL == createSQL {
+		t.Fatal("current filesystem action schema has no restore promotion operation")
+	}
+	if _, err := db.Exec(`DROP INDEX fs_actions_pending; DROP INDEX fs_actions_preserve_attempt;
+		ALTER TABLE fs_actions RENAME TO current_fs_actions;` + oldSQL + `;
+		INSERT INTO fs_actions SELECT * FROM current_fs_actions; DROP TABLE current_fs_actions;
+		CREATE INDEX fs_actions_pending ON fs_actions(worktree,phase,state,action_order);
+		CREATE UNIQUE INDEX fs_actions_preserve_attempt ON fs_actions(worktree,origin_action_id,attempt)
+		WHERE origin_action_id IS NOT NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeClientSchema(t.Context(), db); err != nil {
+		t.Fatal(err)
+	}
+	var migratedSQL string
+	var actions int
+	if err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='fs_actions'`).Scan(&migratedSQL); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM fs_actions WHERE worktree=?`, worktree).Scan(&actions); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(migratedSQL, "'restore_promotion'") || actions != 1 {
+		t.Fatalf("restore operation migrated=%v preserved actions=%d", strings.Contains(migratedSQL, "'restore_promotion'"), actions)
+	}
+}
+
+func TestSyncRecoveryV21DriftRejectedBeforePromotionDDL(t *testing.T) {
+	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DROP TABLE sync_recovery_promotions;
+		ALTER TABLE pending_checkouts RENAME TO v22_pending_checkouts;` + _clientV21CheckoutSQL + `;
+		INSERT INTO pending_checkouts(server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state)
+		SELECT server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state FROM v22_pending_checkouts;
+		DROP TABLE v22_pending_checkouts;
+		ALTER TABLE sync_recoveries ADD COLUMN stale TEXT NOT NULL DEFAULT '';
+		DELETE FROM client_schema_migrations WHERE version=22`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeClientSchema(t.Context(), db); err == nil || !strings.Contains(err.Error(), "v21 sync recovery canonical SQL changed") {
+		t.Fatalf("v21 drift error=%v", err)
+	}
+	var promotionTables int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='sync_recovery_promotions'`).Scan(&promotionTables); err != nil {
+		t.Fatal(err)
+	}
+	if promotionTables != 0 {
+		t.Fatal("v21 drift validation created promotion linkage table")
+	}
+}
+
+func TestSyncRecoveryCurrentSchemaRejectsDrift(t *testing.T) {
+	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("ALTER TABLE sync_recoveries ADD COLUMN stale TEXT NOT NULL DEFAULT ''"); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeClientSchema(t.Context(), db); err == nil || !strings.Contains(err.Error(), "sync recovery canonical SQL changed") {
+		t.Fatalf("current sync recovery drift error=%v", err)
+	}
+	var columns int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sync_recoveries') WHERE name='stale'").Scan(&columns); err != nil || columns != 1 {
+		t.Fatalf("schema rejection changed stale columns=%d err=%v", columns, err)
+	}
+}
+
+func TestSyncRecoveryPromotionSchemaAndConstraints(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ddl  string
+	}{
+		{"extra column", "ALTER TABLE sync_recovery_promotions ADD COLUMN stale TEXT NOT NULL DEFAULT ''"},
+		{"extra index", "CREATE INDEX stale_promotion_index ON sync_recovery_promotions(recovery_path)"},
+		{"trigger", "CREATE TRIGGER stale_promotion_trigger AFTER INSERT ON sync_recovery_promotions BEGIN SELECT 1; END"},
+		{"view", "CREATE VIEW stale_promotion_view AS SELECT * FROM sync_recovery_promotions"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec(test.ddl); err != nil {
+				t.Fatal(err)
+			}
+			if err := initializeClientSchema(t.Context(), db); err == nil {
+				t.Fatal("promotion schema drift was accepted")
+			}
+		})
+	}
+
+	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	valid := []any{"/work", "top", "top/one", "00112233445566778899aabbccddeeff"}
+	if _, err := db.Exec(`INSERT INTO sync_recovery_promotions(worktree,recovery_path,source_path,current_action_id)
+		VALUES(?,?,?,?)`, valid...); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE sync_recovery_promotions SET rollback_action_id='ffeeddccbbaa00998877665544332211'
+		WHERE worktree='/work' AND source_path='top/one'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE sync_recovery_promotions SET rollback_action_id='bad' WHERE worktree='/work'`); err == nil {
+		t.Fatal("malformed rollback action identity was accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO sync_recovery_promotions(worktree,recovery_path,source_path,current_action_id,rollback_action_id)
+		VALUES('/work','top','top/two','11223344556677889900aabbccddeeff','ffeeddccbbaa00998877665544332211')`); err == nil {
+		t.Fatal("duplicate rollback action identity was accepted")
+	}
+	for _, test := range []struct {
+		name string
+		row  []any
+	}{
+		{"oversize source", []any{"/work", "top", strings.Repeat("x", 4097), "11223344556677889900aabbccddeeff"}},
+		{"malformed action", []any{"/work", "top", "top/two", "short"}},
+		{"nonhex action", []any{"/work", "top", "top/two", "zz11223344556677889900aabbccddee"}},
+		{"duplicate source", []any{"/work", "top", "top/one", "11223344556677889900aabbccddeeff"}},
+		{"duplicate action", []any{"/work", "top", "top/two", "00112233445566778899aabbccddeeff"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := db.Exec(`INSERT INTO sync_recovery_promotions(worktree,recovery_path,source_path,current_action_id)
+				VALUES(?,?,?,?)`, test.row...); err == nil {
+				t.Fatal("malformed promotion linkage was accepted")
+			}
+		})
+	}
+}
+
+func TestPendingCheckoutCurrentSchemaRejectsAccessTokenDrift(t *testing.T) {
+	clientDir, _ := newClientPaths(t)
 	if err := os.Mkdir(clientDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1222,32 +1517,16 @@ func TestPendingCheckoutAccessTokenColumnMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer db.Close()
 	if _, err := db.Exec("ALTER TABLE pending_checkouts ADD COLUMN access_token BLOB NOT NULL DEFAULT X''"); err != nil {
 		t.Fatal(err)
 	}
-	pending := pendingCheckout{ServerURL: "http://localhost", LibraryID: testClientLibraryID, Worktree: worktree,
-		UserID: testClientUserID, DeviceID: testClientDeviceID, TargetCommit: strings.Repeat("a", 64), HeadETag: `"head-version-1"`}
-	if _, err := db.Exec(`INSERT INTO pending_checkouts(server_url, library_id, worktree, user_id, device_id,
-		target_commit, target_root, head_etag, access_token) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)`, pending.ServerURL,
-		pending.LibraryID, pending.Worktree, pending.UserID, pending.DeviceID, pending.TargetCommit, pending.HeadETag, []byte("obsolete")); err != nil {
-		t.Fatal(err)
+	if err := initializeClientSchema(t.Context(), db); err == nil || !strings.Contains(err.Error(), "pending checkout canonical SQL changed") {
+		t.Fatalf("current pending checkout drift error=%v", err)
 	}
-	if err := initializeClientSchema(t.Context(), db); err != nil {
-		t.Fatal(err)
-	}
-	var columns, secureDelete int
-	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('pending_checkouts') WHERE name = 'access_token'").Scan(&columns); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.QueryRow("PRAGMA secure_delete").Scan(&secureDelete); err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := loadPendingCheckout(t.Context(), db, pending.ServerURL, pending.LibraryID, pending.Worktree)
-	if err != nil || loaded == nil || loaded.TargetCommit != pending.TargetCommit || columns != 0 || secureDelete != 1 {
-		t.Fatalf("migration loaded=%+v columns=%d secure_delete=%d err=%v", loaded, columns, secureDelete, err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
+	var columns int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('pending_checkouts') WHERE name = 'access_token'").Scan(&columns); err != nil || columns != 1 {
+		t.Fatalf("schema rejection changed access_token columns=%d err=%v", columns, err)
 	}
 }
 
@@ -1427,6 +1706,112 @@ func importedRemoteCheckout(t *testing.T) (libraryCLIEnvironment, string, string
 	}
 	binding := readTestBinding(t, clientDir, worktree)
 	return environment, binding.SyncBase, binding.SyncBaseRoot, files
+}
+
+func TestPendingCheckoutRootMtimeStateValidation(t *testing.T) {
+	for _, test := range []struct {
+		name, state  string
+		mtime, valid int64
+		accepted     bool
+	}{
+		{name: "pending sentinel", state: "pending", accepted: true},
+		{name: "applying epoch", state: "applying", valid: 1, accepted: true},
+		{name: "applying missing mtime", state: "applying"},
+		{name: "rolling back missing mtime", state: "rolling_back"},
+		{name: "finalized missing mtime", state: "finalized"},
+		{name: "pending valid mtime", state: "pending", valid: 1},
+		{name: "noncanonical sentinel", state: "pending", mtime: 1},
+		{name: "invalid valid flag", state: "applying", valid: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clientDir, worktree := t.TempDir(), t.TempDir()
+			db, err := initializeClientDB(t.Context(), clientDir, syncDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			root, err := openWorktreeRoot(worktree, func(*os.File) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			if err := bindFSJournalRoot(t.Context(), db, worktree, root); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(worktree, "source"), []byte("source"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var source syscall.Stat_t
+			if err := syscall.Stat(filepath.Join(worktree, "source"), &source); err != nil {
+				t.Fatal(err)
+			}
+			action := fsAction{Worktree: worktree, ActionID: "00112233445566778899aabbccddeeff", Order: 0,
+				Phase: fsPhasePreBase, Op: fsOpRename, ParentDevice: root.device, ParentInode: root.inode,
+				Source: "source", Target: "target", ExpectedKind: "File", ExpectedDevice: uint64(source.Dev),
+				ExpectedInode: source.Ino, State: fsStateIntent}
+			if err := insertFSActionIntent(t.Context(), db, action); err != nil {
+				t.Fatal(err)
+			}
+			if err := savePendingCheckout(t.Context(), db, pendingCheckout{ServerURL: "http://localhost", LibraryID: "library",
+				Worktree: worktree, UserID: "user", DeviceID: "device", TargetCommit: "commit",
+				ConflictPromotions: _emptyConflictPromotions}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`UPDATE pending_checkouts SET apply_state=?,rollback_root_mtime_ns=?,rollback_root_mtime_valid=?
+				WHERE worktree=?`, test.state, test.mtime, test.valid, worktree); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`PRAGMA ignore_check_constraints=OFF`); err != nil {
+				t.Fatal(err)
+			}
+			loaded, loadErr := loadPendingCheckout(t.Context(), db, "http://localhost", "library", worktree)
+			tx, err := db.BeginTx(t.Context(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			loadedWith, withErr := loadPendingCheckoutWith(t.Context(), tx, "http://localhost", "library", worktree)
+			if err := tx.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if test.accepted {
+				if loadErr != nil || withErr != nil || loaded == nil || loadedWith == nil ||
+					loaded.RollbackRootMtimeValid != (test.valid == 1) || loaded.RollbackRootMtimeNS != test.mtime {
+					t.Fatalf("valid pending load=%+v/%+v err=%v/%v", loaded, loadedWith, loadErr, withErr)
+				}
+				return
+			}
+			if loadErr == nil || withErr == nil || !strings.Contains(loadErr.Error(), "state is corrupt") ||
+				!strings.Contains(withErr.Error(), "state is corrupt") {
+				t.Fatalf("corrupt pending load=%+v/%+v err=%v/%v", loaded, loadedWith, loadErr, withErr)
+			}
+			if err := recoverFSActions(t.Context(), db, worktree, root, nil); err == nil ||
+				!strings.Contains(err.Error(), "state is corrupt") {
+				t.Fatalf("corrupt pending recovery error=%v", err)
+			}
+			if data, err := os.ReadFile(filepath.Join(worktree, "source")); err != nil || string(data) != "source" {
+				t.Fatalf("source changed data=%q err=%v", data, err)
+			}
+			if _, err := os.Lstat(filepath.Join(worktree, "target")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("target created err=%v", err)
+			}
+			var state string
+			var mtime, valid int64
+			var actionState string
+			if err := db.QueryRow(`SELECT apply_state,rollback_root_mtime_ns,rollback_root_mtime_valid
+				FROM pending_checkouts WHERE worktree=?`, worktree).Scan(&state, &mtime, &valid); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT state FROM fs_actions WHERE worktree=?`, worktree).Scan(&actionState); err != nil {
+				t.Fatal(err)
+			}
+			if state != test.state || mtime != test.mtime || valid != test.valid || actionState != fsStateIntent {
+				t.Fatalf("rejection changed DB state=%q/%d/%d action=%q", state, mtime, valid, actionState)
+			}
+		})
+	}
 }
 
 func assertPendingCheckout(t *testing.T, clientDir, target string) {

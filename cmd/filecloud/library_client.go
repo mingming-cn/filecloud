@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -37,6 +38,7 @@ type libraryClientConfig struct {
 	beforeHeadCAS                   func() error
 	beforeBindingRefresh            func() error
 	afterPendingReplacement         func() error
+	afterSyncCheckoutTransition     func() error
 	beforeCheckoutMaterialize       func() error
 	beforeCheckoutBaseCommit        func() error
 	afterCheckoutBaseCommit         func() error
@@ -113,6 +115,9 @@ type bindIntent struct {
 type pendingCheckout struct {
 	ServerURL, LibraryID, Worktree, UserID, DeviceID string
 	TargetCommit, TargetRoot, HeadETag, ApplyState   string
+	ConflictPromotions                               []byte
+	RollbackRootMtimeNS                              int64
+	RollbackRootMtimeValid                           bool
 }
 
 type remoteHead struct {
@@ -266,6 +271,9 @@ func bindLibrary(ctx context.Context, options bindOptions, stdout io.Writer, con
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, db.Close()) }()
+	if err := validatePendingPromotionTargets(ctx, db, options.worktree); err != nil {
+		return fmt.Errorf("validate checkout promotion targets: %w", err)
+	}
 	if err := recoverFSActions(ctx, db, options.worktree, options.worktreeRoot, config.fsActionFault); err != nil {
 		return fmt.Errorf("recover checkout filesystem actions: %w", err)
 	}
@@ -772,6 +780,9 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, root.Close()) }()
+	if err := validatePendingPromotionTargets(ctx, db, binding.Worktree); err != nil {
+		return fmt.Errorf("validate checkout promotion targets: %w", err)
+	}
 	if err := recoverFSActions(ctx, db, binding.Worktree, root, config.fsActionFault); err != nil {
 		return fmt.Errorf("recover checkout filesystem actions: %w", err)
 	}
@@ -853,6 +864,9 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 	defer func() { retErr = errors.Join(retErr, db.Close()) }()
 	if err := initializeClientSchema(ctx, db); err != nil {
 		return err
+	}
+	if err := validatePendingPromotionTargets(ctx, db, canonicalWorktree); err != nil {
+		return fmt.Errorf("validate checkout promotion targets: %w", err)
 	}
 	temps, err := checkoutTempNames(ctx, db, canonicalWorktree)
 	if err != nil {
@@ -939,6 +953,9 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM checkout_paths WHERE worktree = ?", canonicalWorktree); err != nil {
 		return errors.Join(fmt.Errorf("remove checkout paths: %w", err), tx.Rollback())
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM sync_recovery_promotions WHERE worktree = ?", canonicalWorktree); err != nil {
+		return errors.Join(fmt.Errorf("remove sync recovery promotions: %w", err), tx.Rollback())
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM sync_recoveries WHERE worktree = ?", canonicalWorktree); err != nil {
 		return errors.Join(fmt.Errorf("remove sync recoveries: %w", err), tx.Rollback())
@@ -1149,7 +1166,7 @@ func initializeClientDB(ctx context.Context, clientDir string, syncDir func(stri
 	return db, nil
 }
 
-const clientSchemaVersion = 21
+const clientSchemaVersion = 22
 
 var legacyClientV12Columns = map[string][]string{
 	"bindings":             {"server_url|TEXT|1||0", "library_id|TEXT|1||0", "worktree|TEXT|1||1", "user_id|TEXT|1||0", "device_id|TEXT|1||0", "sync_base_commit|TEXT|1||0", "sync_base_root|TEXT|1||0", "head_etag|TEXT|1||0", "access_token|BLOB|1||0"},
@@ -1311,6 +1328,199 @@ func validateClientV20Schema(ctx context.Context, db clientSchemaQuerier) error 
 
 func _validateClientV21Schema(ctx context.Context, db clientSchemaQuerier) error {
 	return validatePendingPublicationSchema(ctx, db, 21, _clientV21PendingSQL, _clientV21PendingColumns)
+}
+
+const _clientV21CheckoutSQL = `CREATE TABLE pending_checkouts (server_url TEXT NOT NULL, library_id TEXT NOT NULL,
+	worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+	target_commit TEXT NOT NULL, target_root TEXT NOT NULL, head_etag TEXT NOT NULL,
+	apply_state TEXT NOT NULL DEFAULT 'pending', UNIQUE(server_url, library_id))`
+
+const _clientV22CheckoutSQL = `CREATE TABLE pending_checkouts (
+	server_url TEXT NOT NULL, library_id TEXT NOT NULL, worktree TEXT PRIMARY KEY NOT NULL,
+	user_id TEXT NOT NULL, device_id TEXT NOT NULL, target_commit TEXT NOT NULL, target_root TEXT NOT NULL,
+	head_etag TEXT NOT NULL, apply_state TEXT NOT NULL DEFAULT 'pending',
+	conflict_promotions BLOB NOT NULL DEFAULT X'4643503100000000', rollback_root_mtime_ns INTEGER NOT NULL DEFAULT 0,
+	rollback_root_mtime_valid INTEGER NOT NULL DEFAULT 0,
+	CHECK(length(conflict_promotions) BETWEEN 8 AND 33554432), CHECK(rollback_root_mtime_valid IN (0, 1)),
+	CHECK(apply_state NOT IN ('applying', 'rolling_back') OR rollback_root_mtime_valid = 1), UNIQUE(server_url, library_id))`
+
+const _clientV21SyncRecoverySQL = `CREATE TABLE sync_recoveries (
+	worktree TEXT NOT NULL, path TEXT NOT NULL, recovery_name TEXT NOT NULL,
+	type TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '', canonical_mtime TEXT NOT NULL DEFAULT '',
+	size INTEGER NOT NULL DEFAULT 0, device INTEGER NOT NULL DEFAULT 0, inode INTEGER NOT NULL DEFAULT 0,
+	completed INTEGER NOT NULL DEFAULT 0, tombstone_name TEXT NOT NULL DEFAULT '', PRIMARY KEY(worktree, path))`
+
+const _clientV22SyncRecoverySQL = _clientV21SyncRecoverySQL
+
+const _clientV22SyncRecoveryPromotionSQL = `CREATE TABLE sync_recovery_promotions (
+	worktree TEXT NOT NULL, recovery_path TEXT NOT NULL, source_path TEXT NOT NULL, current_action_id TEXT NOT NULL,
+	rollback_action_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(worktree, source_path), UNIQUE(worktree, current_action_id),
+	CHECK(length(worktree) BETWEEN 1 AND 4096),
+	CHECK(length(recovery_path) BETWEEN 1 AND 4096), CHECK(length(source_path) BETWEEN 1 AND 4096),
+	CHECK(length(current_action_id) = 32 AND current_action_id NOT GLOB '*[^0-9a-f]*'),
+	CHECK(rollback_action_id = '' OR (length(rollback_action_id) = 32 AND rollback_action_id NOT GLOB '*[^0-9a-f]*')))`
+
+const _clientV22SyncRecoveryPromotionRollbackIndexSQL = `CREATE UNIQUE INDEX sync_recovery_promotions_rollback_action
+	ON sync_recovery_promotions(worktree, rollback_action_id) WHERE rollback_action_id <> ''`
+
+var _clientV21SyncRecoveryColumns = []string{
+	"0|worktree|TEXT|1||1", "1|path|TEXT|1||2", "2|recovery_name|TEXT|1||0", "3|type|TEXT|1||0",
+	"4|object_id|TEXT|1|''|0", "5|canonical_mtime|TEXT|1|''|0", "6|size|INTEGER|1|0|0",
+	"7|device|INTEGER|1|0|0", "8|inode|INTEGER|1|0|0", "9|completed|INTEGER|1|0|0",
+	"10|tombstone_name|TEXT|1|''|0",
+}
+
+var _clientV22SyncRecoveryColumns = _clientV21SyncRecoveryColumns
+
+var _clientV22SyncRecoveryPromotionColumns = []string{
+	"0|worktree|TEXT|1||1", "1|recovery_path|TEXT|1||0", "2|source_path|TEXT|1||2",
+	"3|current_action_id|TEXT|1||0", "4|rollback_action_id|TEXT|1|''|0",
+}
+
+func _validateClientSyncRecoverySchema(ctx context.Context, db clientSchemaQuerier, version int, expectedSQL string, expectedColumns []string) error {
+	var createSQL string
+	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema WHERE type='table' AND name='sync_recoveries'`).Scan(&createSQL); err != nil {
+		return fmt.Errorf("read v%d sync recovery schema: %w", version, err)
+	}
+	if canonicalSQLiteSQL(createSQL) != canonicalSQLiteSQL(expectedSQL) {
+		return fmt.Errorf("v%d sync recovery canonical SQL changed", version)
+	}
+	rows, err := db.QueryContext(ctx, `SELECT cid,name,type,[notnull],COALESCE(dflt_value,''),pk
+		FROM pragma_table_info('sync_recoveries') ORDER BY cid`)
+	if err != nil {
+		return err
+	}
+	var columns []string
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, kind, defaultValue string
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		columns = append(columns, fmt.Sprintf("%d|%s|%s|%d|%s|%d", cid, name, kind, notNull, defaultValue, pk))
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if !slices.Equal(columns, expectedColumns) {
+		return fmt.Errorf("v%d sync recovery column fingerprint changed", version)
+	}
+	var indexes, primary, triggers, views int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_index_list('sync_recoveries')").Scan(&indexes); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('sync_recoveries') AS i
+		JOIN pragma_index_info(i.name) AS c ON c.seqno=0 WHERE i.[unique]=1 AND i.partial=0 AND i.origin='pk'
+		AND c.name='worktree'`).Scan(&primary); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND tbl_name='sync_recoveries'`).Scan(&triggers); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND instr(upper(sql),'SYNC_RECOVERIES')<>0`).Scan(&views); err != nil {
+		return err
+	}
+	if indexes != 1 || primary != 1 || triggers != 0 || views != 0 {
+		return fmt.Errorf("v%d sync recovery index/trigger/view fingerprint changed", version)
+	}
+	return nil
+}
+
+func _validateClientSyncRecoveryPromotionSchema(ctx context.Context, db clientSchemaQuerier) error {
+	var createSQL string
+	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema WHERE type='table' AND name='sync_recovery_promotions'`).Scan(&createSQL); err != nil {
+		return fmt.Errorf("read v22 sync recovery promotion schema: %w", err)
+	}
+	if canonicalSQLiteSQL(createSQL) != canonicalSQLiteSQL(_clientV22SyncRecoveryPromotionSQL) {
+		return errors.New("v22 sync recovery promotion canonical SQL changed")
+	}
+	rows, err := db.QueryContext(ctx, `SELECT cid,name,type,[notnull],COALESCE(dflt_value,''),pk
+		FROM pragma_table_info('sync_recovery_promotions') ORDER BY cid`)
+	if err != nil {
+		return err
+	}
+	var columns []string
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, kind, defaultValue string
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		columns = append(columns, fmt.Sprintf("%d|%s|%s|%d|%s|%d", cid, name, kind, notNull, defaultValue, pk))
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if !slices.Equal(columns, _clientV22SyncRecoveryPromotionColumns) {
+		return errors.New("v22 sync recovery promotion column fingerprint changed")
+	}
+	var indexes, exactIndexes, triggers, views int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_index_list('sync_recovery_promotions')").Scan(&indexes); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('sync_recovery_promotions') AS i
+		WHERE i.[unique]=1 AND ((i.partial=0 AND i.origin='pk' AND
+		(SELECT group_concat(name, ',') FROM pragma_index_info(i.name))='worktree,source_path') OR
+		(i.partial=0 AND i.origin='u' AND
+		(SELECT group_concat(name, ',') FROM pragma_index_info(i.name))='worktree,current_action_id') OR
+		(i.partial=1 AND i.origin='c' AND i.name='sync_recovery_promotions_rollback_action' AND
+		(SELECT group_concat(name, ',') FROM pragma_index_info(i.name))='worktree,rollback_action_id'))`).Scan(&exactIndexes); err != nil {
+		return err
+	}
+	var rollbackIndexSQL string
+	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema WHERE type='index'
+		AND name='sync_recovery_promotions_rollback_action'`).Scan(&rollbackIndexSQL); err != nil ||
+		canonicalSQLiteSQL(rollbackIndexSQL) != canonicalSQLiteSQL(_clientV22SyncRecoveryPromotionRollbackIndexSQL) {
+		return errors.Join(errors.New("v22 sync recovery promotion rollback index changed"), err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND tbl_name='sync_recovery_promotions'`).Scan(&triggers); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND instr(upper(sql),'SYNC_RECOVERY_PROMOTIONS')<>0`).Scan(&views); err != nil {
+		return err
+	}
+	if indexes != 3 || exactIndexes != 3 || triggers != 0 || views != 0 {
+		return errors.New("v22 sync recovery promotion index/trigger/view fingerprint changed")
+	}
+	return nil
+}
+
+func _validateClientCheckoutSchema(ctx context.Context, db clientSchemaQuerier, version int, expectedSQL string,
+	withPromotions bool) error {
+	var createSQL string
+	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema WHERE type='table' AND name='pending_checkouts'`).Scan(&createSQL); err != nil {
+		return fmt.Errorf("read v%d pending checkout schema: %w", version, err)
+	}
+	if canonicalSQLiteSQL(createSQL) != canonicalSQLiteSQL(expectedSQL) {
+		return fmt.Errorf("v%d pending checkout canonical SQL changed", version)
+	}
+	wantColumns := 9
+	if withPromotions {
+		wantColumns = 12
+	}
+	var columns int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('pending_checkouts')").Scan(&columns); err != nil || columns != wantColumns {
+		return errors.Join(fmt.Errorf("v%d pending checkout column fingerprint changed", version), err)
+	}
+	var indexes, expectedIndexes int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_index_list('pending_checkouts')").Scan(&indexes); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('pending_checkouts') AS indexes
+		JOIN pragma_index_info(indexes.name) AS columns ON columns.seqno=0
+		WHERE indexes.[unique]=1 AND indexes.partial=0 AND columns.name IN ('worktree','server_url')`).Scan(&expectedIndexes); err != nil {
+		return err
+	}
+	if indexes != 2 || expectedIndexes != 2 {
+		return fmt.Errorf("v%d pending checkout index fingerprint changed", version)
+	}
+	return nil
+}
+
+func _validateClientV22CheckoutSchema(ctx context.Context, db clientSchemaQuerier) error {
+	return _validateClientCheckoutSchema(ctx, db, 22, _clientV22CheckoutSQL, true)
 }
 
 func validatePendingPublicationSchema(ctx context.Context, db clientSchemaQuerier, version int, expectedSQL string, expectedColumns []string) error {
@@ -1525,7 +1735,25 @@ func validateClientSchemaVersion(ctx context.Context, db *sql.DB) error {
 	}
 	version := versions[len(versions)-1]
 	if version == clientSchemaVersion {
-		return _validateClientV21Schema(ctx, db)
+		if err := _validateClientV21Schema(ctx, db); err != nil {
+			return err
+		}
+		if err := _validateClientV22CheckoutSchema(ctx, db); err != nil {
+			return err
+		}
+		if err := _validateClientSyncRecoverySchema(ctx, db, 22, _clientV22SyncRecoverySQL, _clientV22SyncRecoveryColumns); err != nil {
+			return err
+		}
+		return _validateClientSyncRecoveryPromotionSchema(ctx, db)
+	}
+	if version == 21 {
+		if err := _validateClientV21Schema(ctx, db); err != nil {
+			return err
+		}
+		if err := _validateClientCheckoutSchema(ctx, db, 21, _clientV21CheckoutSQL, false); err != nil {
+			return err
+		}
+		return _validateClientSyncRecoverySchema(ctx, db, 21, _clientV21SyncRecoverySQL, _clientV21SyncRecoveryColumns)
 	}
 	if version == 20 {
 		return validateClientV20Schema(ctx, db)
@@ -1578,7 +1806,7 @@ func migrateFSActionProvenance(ctx context.Context, tx *sql.Tx) error {
 				FOREIGN KEY(worktree, origin_action_id) REFERENCES fs_actions(worktree, action_id),
 				CHECK((origin_action_id IS NOT NULL AND attempt >= 1) OR (origin_action_id IS NULL AND attempt = 0)),
 				CHECK(phase IN ('pre_base', 'rollback', 'post_base')),
-				CHECK(op IN ('create_file', 'create_directory', 'rename', 'unlink', 'rmdir', 'mtime')),
+				CHECK(op IN ('create_file', 'create_directory', 'rename', 'restore_promotion', 'unlink', 'rmdir', 'mtime')),
 				CHECK(state IN ('intent', 'completed')), UNIQUE(worktree, action_order));
 			INSERT INTO fs_actions(worktree, action_id, action_order, phase, op, parent_path, parent_device, parent_inode,
 				source_name, target_name, expected_kind, expected_device, expected_inode, expected_object, expected_size,
@@ -1592,6 +1820,47 @@ func migrateFSActionProvenance(ctx context.Context, tx *sql.Tx) error {
 	}
 	_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS fs_actions_pending ON fs_actions(worktree, phase, state, action_order);
 		CREATE UNIQUE INDEX IF NOT EXISTS fs_actions_preserve_attempt ON fs_actions(worktree, origin_action_id, attempt)
+			WHERE origin_action_id IS NOT NULL`)
+	return err
+}
+
+func migrateFSActionRestorePromotionOp(ctx context.Context, tx *sql.Tx) error {
+	var createSQL string
+	if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema WHERE type='table' AND name='fs_actions'`).Scan(&createSQL); err != nil {
+		return err
+	}
+	if strings.Contains(createSQL, "'restore_promotion'") {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `DROP INDEX IF EXISTS fs_actions_pending;
+		DROP INDEX IF EXISTS fs_actions_preserve_attempt;
+		ALTER TABLE fs_actions RENAME TO old_fs_actions_restore_op;
+		CREATE TABLE fs_actions (
+			worktree TEXT NOT NULL, action_id TEXT NOT NULL, origin_action_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+			action_order INTEGER NOT NULL, phase TEXT NOT NULL, op TEXT NOT NULL, parent_path TEXT NOT NULL,
+			parent_device INTEGER NOT NULL, parent_inode INTEGER NOT NULL,
+			source_name TEXT NOT NULL, target_name TEXT NOT NULL, expected_kind TEXT NOT NULL,
+			expected_device INTEGER NOT NULL, expected_inode INTEGER NOT NULL,
+			expected_object TEXT NOT NULL DEFAULT '', expected_size INTEGER NOT NULL DEFAULT 0,
+			expected_mtime TEXT NOT NULL DEFAULT '', internal_name TEXT NOT NULL DEFAULT '',
+			internal_source TEXT NOT NULL DEFAULT '', internal_target TEXT NOT NULL DEFAULT '',
+			action_outcome TEXT NOT NULL DEFAULT '', state TEXT NOT NULL,
+			PRIMARY KEY(worktree, action_id), FOREIGN KEY(worktree) REFERENCES fs_journal_bindings(worktree),
+			FOREIGN KEY(worktree, origin_action_id) REFERENCES fs_actions(worktree, action_id),
+			CHECK((origin_action_id IS NOT NULL AND attempt >= 1) OR (origin_action_id IS NULL AND attempt = 0)),
+			CHECK(phase IN ('pre_base', 'rollback', 'post_base')),
+			CHECK(op IN ('create_file', 'create_directory', 'rename', 'restore_promotion', 'unlink', 'rmdir', 'mtime')),
+			CHECK(state IN ('intent', 'completed')), UNIQUE(worktree, action_order));
+		INSERT INTO fs_actions(worktree,action_id,origin_action_id,attempt,action_order,phase,op,parent_path,
+			parent_device,parent_inode,source_name,target_name,expected_kind,expected_device,expected_inode,
+			expected_object,expected_size,expected_mtime,internal_name,internal_source,internal_target,action_outcome,state)
+		SELECT worktree,action_id,origin_action_id,attempt,action_order,phase,op,parent_path,
+			parent_device,parent_inode,source_name,target_name,expected_kind,expected_device,expected_inode,
+			expected_object,expected_size,expected_mtime,internal_name,internal_source,internal_target,action_outcome,state
+		FROM old_fs_actions_restore_op;
+		DROP TABLE old_fs_actions_restore_op;
+		CREATE INDEX fs_actions_pending ON fs_actions(worktree,phase,state,action_order);
+		CREATE UNIQUE INDEX fs_actions_preserve_attempt ON fs_actions(worktree,origin_action_id,attempt)
 			WHERE origin_action_id IS NOT NULL`)
 	return err
 }
@@ -1665,6 +1934,30 @@ func migrateCheckoutCreateOrigins(ctx context.Context, tx *sql.Tx) error {
 func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 	if err := validateClientSchemaVersion(ctx, db); err != nil {
 		return fmt.Errorf("validate client schema before migration: %w", err)
+	}
+	var startedAtV21 bool
+	var migrationTable int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='client_schema_migrations'").Scan(&migrationTable); err != nil {
+		return err
+	}
+	if migrationTable != 0 {
+		var version int
+		if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM client_schema_migrations").Scan(&version); err != nil {
+			return err
+		}
+		startedAtV21 = version == 21
+	}
+	if startedAtV21 {
+		// v21 pending rows have not mutated the worktree; finalized rows only need cleanup.
+		// Every other state may require rollback, which v21 cannot perform with an exact root mtime.
+		var unsafeCheckouts int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_checkouts
+			WHERE apply_state NOT IN ('pending', 'finalized')`).Scan(&unsafeCheckouts); err != nil {
+			return fmt.Errorf("preflight v21 pending checkout state: %w", err)
+		}
+		if unsafeCheckouts != 0 {
+			return errors.New("v21 pending checkout in-flight state has no exact rollback root mtime")
+		}
 	}
 	var pendingTableExists int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema
@@ -1751,7 +2044,7 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		FOREIGN KEY(worktree, origin_action_id) REFERENCES fs_actions(worktree, action_id),
 		CHECK((origin_action_id IS NOT NULL AND attempt >= 1) OR (origin_action_id IS NULL AND attempt = 0)),
 		CHECK(phase IN ('pre_base', 'rollback', 'post_base')),
-		CHECK(op IN ('create_file', 'create_directory', 'rename', 'unlink', 'rmdir', 'mtime')),
+		CHECK(op IN ('create_file', 'create_directory', 'rename', 'restore_promotion', 'unlink', 'rmdir', 'mtime')),
 		CHECK(state IN ('intent', 'completed')),
 		UNIQUE(worktree, action_order));
 	CREATE INDEX IF NOT EXISTS fs_actions_pending ON fs_actions(worktree, phase, state, action_order);
@@ -1759,7 +2052,11 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		server_url TEXT NOT NULL, library_id TEXT NOT NULL,
 		worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
 		target_commit TEXT NOT NULL, target_root TEXT NOT NULL, head_etag TEXT NOT NULL,
-		apply_state TEXT NOT NULL DEFAULT 'pending', UNIQUE(server_url, library_id));
+		apply_state TEXT NOT NULL DEFAULT 'pending',
+		conflict_promotions BLOB NOT NULL DEFAULT X'4643503100000000', rollback_root_mtime_ns INTEGER NOT NULL DEFAULT 0,
+		rollback_root_mtime_valid INTEGER NOT NULL DEFAULT 0,
+		CHECK(length(conflict_promotions) BETWEEN 8 AND 33554432), CHECK(rollback_root_mtime_valid IN (0, 1)),
+		CHECK(apply_state NOT IN ('applying', 'rolling_back') OR rollback_root_mtime_valid = 1), UNIQUE(server_url, library_id));
 		CREATE TABLE IF NOT EXISTS sync_recoveries (
 		worktree TEXT NOT NULL, path TEXT NOT NULL, recovery_name TEXT NOT NULL,
 		type TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '', canonical_mtime TEXT NOT NULL DEFAULT '',
@@ -1814,6 +2111,9 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 	if err := migrateFSActionProvenance(ctx, tx); err != nil {
 		return fail(err)
 	}
+	if err := migrateFSActionRestorePromotionOp(ctx, tx); err != nil {
+		return fail(fmt.Errorf("migrate filesystem restore promotion operation: %w", err))
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE fs_actions SET internal_source = internal_name
 		WHERE internal_source = '' AND internal_name <> '' AND source_name = internal_name AND target_name <> internal_name;
 		UPDATE fs_actions SET internal_target = internal_name
@@ -1853,6 +2153,64 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 	if checkoutTokenColumn != 0 {
 		if _, err := tx.ExecContext(ctx, "ALTER TABLE pending_checkouts DROP COLUMN access_token"); err != nil {
 			return fail(err)
+		}
+	}
+	var promotionColumn int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('pending_checkouts') WHERE name='conflict_promotions'").Scan(&promotionColumn); err != nil {
+		return fail(err)
+	}
+	if promotionColumn == 0 {
+		if err := _validateClientCheckoutSchema(ctx, tx, 21, _clientV21CheckoutSQL, false); err != nil {
+			return fail(fmt.Errorf("validate pending checkout schema before provenance migration: %w", err))
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE pending_checkouts RENAME TO old_pending_checkouts;
+			CREATE TABLE pending_checkouts (
+				server_url TEXT NOT NULL, library_id TEXT NOT NULL, worktree TEXT PRIMARY KEY NOT NULL,
+				user_id TEXT NOT NULL, device_id TEXT NOT NULL, target_commit TEXT NOT NULL, target_root TEXT NOT NULL,
+				head_etag TEXT NOT NULL, apply_state TEXT NOT NULL DEFAULT 'pending',
+				conflict_promotions BLOB NOT NULL DEFAULT X'4643503100000000', rollback_root_mtime_ns INTEGER NOT NULL DEFAULT 0,
+				rollback_root_mtime_valid INTEGER NOT NULL DEFAULT 0,
+				CHECK(length(conflict_promotions) BETWEEN 8 AND 33554432), CHECK(rollback_root_mtime_valid IN (0, 1)),
+				CHECK(apply_state NOT IN ('applying', 'rolling_back') OR rollback_root_mtime_valid = 1), UNIQUE(server_url, library_id));
+			INSERT INTO pending_checkouts(server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state,conflict_promotions,rollback_root_mtime_ns,rollback_root_mtime_valid)
+			SELECT server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state,X'4643503100000000',0,0 FROM old_pending_checkouts;
+			DROP TABLE old_pending_checkouts`); err != nil {
+			return fail(fmt.Errorf("migrate pending checkout conflict provenance: %w", err))
+		}
+	}
+	var recoveryPromotionTable int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='sync_recovery_promotions'").Scan(&recoveryPromotionTable); err != nil {
+		return fail(err)
+	}
+	if recoveryPromotionTable == 0 {
+		if startedAtV21 {
+			if err := _validateClientSyncRecoverySchema(ctx, tx, 21, _clientV21SyncRecoverySQL, _clientV21SyncRecoveryColumns); err != nil {
+				return fail(fmt.Errorf("validate v21 sync recovery schema before linkage migration: %w", err))
+			}
+		}
+		var recoveries int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sync_recoveries").Scan(&recoveries); err != nil {
+			return fail(err)
+		}
+		if recoveries != 0 {
+			return fail(errors.New("v21 sync recovery linkage migration requires an empty recovery table"))
+		}
+		if !startedAtV21 {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE sync_recoveries RENAME TO old_sync_recoveries;
+				CREATE TABLE sync_recoveries (
+					worktree TEXT NOT NULL, path TEXT NOT NULL, recovery_name TEXT NOT NULL,
+					type TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '', canonical_mtime TEXT NOT NULL DEFAULT '',
+					size INTEGER NOT NULL DEFAULT 0, device INTEGER NOT NULL DEFAULT 0, inode INTEGER NOT NULL DEFAULT 0,
+					completed INTEGER NOT NULL DEFAULT 0, tombstone_name TEXT NOT NULL DEFAULT '', PRIMARY KEY(worktree, path));
+				DROP TABLE old_sync_recoveries`); err != nil {
+				return fail(fmt.Errorf("normalize sync recovery schema: %w", err))
+			}
+		}
+		if _, err := tx.ExecContext(ctx, _clientV22SyncRecoveryPromotionSQL); err != nil {
+			return fail(fmt.Errorf("migrate sync recovery action linkage: %w", err))
+		}
+		if _, err := tx.ExecContext(ctx, _clientV22SyncRecoveryPromotionRollbackIndexSQL); err != nil {
+			return fail(fmt.Errorf("index sync recovery rollback action linkage: %w", err))
 		}
 	}
 	var pendingDeletionColumns int
@@ -1935,11 +2293,21 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (18);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (19);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (20);
-		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (21)`); err != nil {
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (21);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (22)`); err != nil {
 		return fail(err)
 	}
 	if err := _validateClientV21Schema(ctx, tx); err != nil {
 		return fail(fmt.Errorf("validate migrated client schema: %w", err))
+	}
+	if err := _validateClientV22CheckoutSchema(ctx, tx); err != nil {
+		return fail(fmt.Errorf("validate migrated checkout provenance schema: %w", err))
+	}
+	if err := _validateClientSyncRecoverySchema(ctx, tx, 22, _clientV22SyncRecoverySQL, _clientV22SyncRecoveryColumns); err != nil {
+		return fail(fmt.Errorf("validate migrated sync recovery linkage schema: %w", err))
+	}
+	if err := _validateClientSyncRecoveryPromotionSchema(ctx, tx); err != nil {
+		return fail(fmt.Errorf("validate migrated sync recovery promotion schema: %w", err))
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("initialize client state: %w", err)

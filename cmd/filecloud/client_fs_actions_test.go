@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -568,7 +570,7 @@ func TestClientV21PendingPublicationFingerprint(t *testing.T) {
 				t.Fatal("v21 rejection changed schema or database bytes")
 			}
 			var version int
-			if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&version); err != nil || version != 21 {
+			if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&version); err != nil || version != clientSchemaVersion {
 				t.Fatalf("schema rejection changed version=%d err=%v", version, err)
 			}
 		})
@@ -614,7 +616,7 @@ func TestPendingPublicationBlobLimits(t *testing.T) {
 		}
 		defer db.Close()
 		if _, err := db.Exec(`DROP TABLE pending_publications;
-			DELETE FROM client_schema_migrations WHERE version=21`); err != nil {
+			DELETE FROM client_schema_migrations WHERE version>=21`); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.Exec(clientV20PendingSQL); err != nil {
@@ -1075,8 +1077,9 @@ func TestFSActionPreserveProvenanceValidation(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(rootPath, source), []byte("unknown"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`INSERT INTO pending_checkouts(server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state)
-			VALUES('s','l',?,'u','d','c','r','e','rolling_back')`, rootPath); err != nil {
+		if _, err := db.Exec(`INSERT INTO pending_checkouts(server_url,library_id,worktree,user_id,device_id,target_commit,target_root,
+			head_etag,apply_state,rollback_root_mtime_ns,rollback_root_mtime_valid)
+			VALUES('s','l',?,'u','d','c','r','e','rolling_back',0,1)`, rootPath); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.Exec(`INSERT INTO checkout_paths(worktree,path,type,object_id,canonical_mtime,temp_name)
@@ -1438,13 +1441,18 @@ func assertExactTree(t *testing.T, root string, before map[string]exactPathState
 	if len(after) != len(before) {
 		t.Fatalf("tree entry count=%d want=%d", len(after), len(before))
 	}
+	var changed []string
 	for path, want := range before {
 		got, ok := after[path]
 		if !ok || !os.SameFile(want.info, got.info) || !want.info.ModTime().Equal(got.info.ModTime()) ||
-			want.info.Mode().Type() != got.info.Mode().Type() || want.linkTarget != got.linkTarget ||
+			want.info.Mode() != got.info.Mode() || want.linkTarget != got.linkTarget ||
 			want.nlink != got.nlink || !bytes.Equal(want.data, got.data) {
-			t.Fatalf("tree path %q changed: before=%v after=%v data=%q want=%q", path, want.info, got.info, got.data, want.data)
+			changed = append(changed, fmt.Sprintf("%q: before=%v after=%v data=%q want=%q", path, want.info, got.info, got.data, want.data))
 		}
+	}
+	if len(changed) != 0 {
+		sort.Strings(changed)
+		t.Fatalf("tree changed:\n%s", strings.Join(changed, "\n"))
 	}
 }
 
@@ -2833,23 +2841,119 @@ func TestPublicSyncFSActionCrashHelper(t *testing.T) {
 	if os.Getenv("FILECLOUD_PUBLIC_SYNC_HELPER") != "1" {
 		t.Skip("subprocess helper")
 	}
+	collisionInjected := false
+	mutationInjected := false
+	mixedPromotionDisturbed := false
+	mixedRecoveryNames := make(map[string]string)
+	var mixedOriginalMtime time.Time
+	matchedFaults := 0
 	fault := func(point string, action fsAction) error {
+		role := os.Getenv("FILECLOUD_PUBLIC_CRASH_ROLE")
+		if role == "promotion-collision" && point == "before_action" && action.ExpectedObject != "" &&
+			action.OriginActionID == "" && !collisionInjected {
+			collisionInjected = true
+			if err := os.WriteFile(filepath.Join(os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE"), filepath.FromSlash(action.Target)),
+				[]byte("racing"), 0o600); err != nil {
+				return err
+			}
+		}
+		if role == "mixed-restore-promotion" && point == "after_completed" && action.Phase == fsPhasePreBase &&
+			action.Op == fsOpRename && action.ExpectedObject != "" && action.OriginActionID == "" && !mixedPromotionDisturbed {
+			second := mixedRecoveryNames[os.Getenv("FILECLOUD_PUBLIC_SECOND_PATH")]
+			info, err := os.Stat(filepath.Join(os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE"), second))
+			if err != nil {
+				return err
+			}
+			mixedOriginalMtime = info.ModTime()
+			mixedPromotionDisturbed = true
+			changed := mixedOriginalMtime.Add(time.Hour)
+			if err := os.Chtimes(filepath.Join(os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE"), second), changed, changed); err != nil {
+				return err
+			}
+		}
+		if role == "mixed-restore-promotion" && point == "before_intent_commit" && action.Op == fsOpRestorePromotion &&
+			mixedPromotionDisturbed {
+			second := mixedRecoveryNames[os.Getenv("FILECLOUD_PUBLIC_SECOND_PATH")]
+			if err := os.Chtimes(filepath.Join(os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE"), second),
+				mixedOriginalMtime, mixedOriginalMtime); err != nil {
+				return err
+			}
+		}
 		matches := point == os.Getenv("FILECLOUD_PUBLIC_CRASH_POINT") && action.Phase == os.Getenv("FILECLOUD_PUBLIC_CRASH_PHASE") &&
 			action.Op == os.Getenv("FILECLOUD_PUBLIC_CRASH_OP") && action.ExpectedKind == os.Getenv("FILECLOUD_PUBLIC_CRASH_KIND")
-		if matches && strings.HasPrefix(os.Getenv("FILECLOUD_PUBLIC_CRASH_ROLE"), "capture-") {
+		if matches && strings.HasPrefix(role, "capture-") {
 			matches = strings.HasPrefix(action.InternalTarget, syncRecoveryPrefix)
+		}
+		if matches && (role == "promotion" || role == "pre-promotion-mutation") {
+			matches = action.ExpectedObject != "" && action.OriginActionID == ""
+		}
+		if matches && (role == "promotion-collision" || role == "late-promotion") {
+			matches = action.ExpectedObject != "" && action.OriginActionID != ""
 		}
 		if target := os.Getenv("FILECLOUD_PUBLIC_CRASH_TARGET"); target != "" {
 			matches = matches && action.Target == target
 		}
 		if matches {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			matchedFaults++
+			matchIndex, _ := strconv.Atoi(os.Getenv("FILECLOUD_PUBLIC_CRASH_MATCH_INDEX"))
+			if matchIndex <= 1 || matchedFaults == matchIndex {
+				_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			}
 		}
 		return nil
 	}
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }, fsActionFault: fault}
+	if os.Getenv("FILECLOUD_PUBLIC_CRASH_ROLE") == "mixed-restore-promotion" {
+		config.afterSyncRecoveryRename = func(path, recoveryName string) error {
+			mixedRecoveryNames[path] = recoveryName
+			return nil
+		}
+	}
+	if os.Getenv("FILECLOUD_PUBLIC_CRASH_ROLE") == "pre-promotion-mutation" {
+		config.afterSyncRecoveryRename = func(path, _ string) error {
+			mutationPath := os.Getenv("FILECLOUD_PUBLIC_MUTATION_PATH")
+			if mutationInjected || (mutationPath != path && !strings.HasPrefix(mutationPath, path+"/")) {
+				return nil
+			}
+			mutationInjected = true
+			held := os.NewFile(3, "held-conflict")
+			if held == nil {
+				return errors.New("inherited conflict descriptor is absent")
+			}
+			if _, err := held.WriteAt([]byte("changed"), 0); err != nil {
+				return err
+			}
+			if err := held.Sync(); err != nil {
+				return err
+			}
+			if os.Getenv("FILECLOUD_PUBLIC_CRASH_COLLISION") != "1" {
+				return nil
+			}
+			db, err := openClientDB(filepath.Join(os.Getenv("FILECLOUD_PUBLIC_CRASH_CLIENT"), _clientDatabaseName), true)
+			if err != nil {
+				return err
+			}
+			promotions, loadErr := loadConflictPromotions(context.Background(), db, os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE"))
+			closeErr := db.Close()
+			if loadErr != nil || closeErr != nil {
+				return errors.Join(loadErr, closeErr)
+			}
+			for _, promotion := range promotions {
+				if promotion.source != mutationPath {
+					continue
+				}
+				suffix, err := nextConflictChainPath(promotion.target)
+				if err != nil {
+					return err
+				}
+				parent, leaf := splitFSActionPath(suffix)
+				return os.WriteFile(filepath.Join(os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE"), filepath.FromSlash(parent), strings.ToUpper(leaf)), []byte("occupied"), 0o600)
+			}
+			return errors.New("conflict provenance for inherited descriptor is absent")
+		}
+	}
 	_ = runLibraryWithConfig(context.Background(), []string{"sync", "--client-dir", os.Getenv("FILECLOUD_PUBLIC_CRASH_CLIENT"),
-		"--worktree", os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE")}, strings.NewReader(""), io.Discard, io.Discard,
-		libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }, fsActionFault: fault})
+		"--worktree", os.Getenv("FILECLOUD_PUBLIC_CRASH_WORKTREE")}, strings.NewReader(""), io.Discard, io.Discard, config)
 	os.Exit(98)
 }
 

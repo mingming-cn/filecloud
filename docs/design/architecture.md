@@ -236,9 +236,11 @@ stateDiagram-v2
 
 mtime 规则：只有一侧路径状态改变时采用该侧；双方 FileId 或 DirectoryId 相同而只有 mtime 不同时采用字典序较大的规范 UTC 时间；双方内容冲突时原路径和冲突副本各保留各自 mtime。递归合并目录后，仅结果 DirectoryId 只等于单独一侧时采用该侧 mtime；结果同时等于两侧或产生新 DirectoryId 时采用 Local/Remote 规范 mtime 中字典序较大的值。目录 mtime 在全部子项 checkout 后最后设置。该规则不依赖本地时钟正确性，只要求确定性。
 
-当前递归合并只处理不同精确路径上的无冲突变化：名称集合按规范字节排序，目录即使双方 DirectoryId 都变化也按名称递归；双方新建目录以空目录为 Base。双方文件 ID 相同而仅 mtime 不同时取较大规范时间；新建或重建目录 entry 的 mtime 取两侧较大值，完整复用一侧 entry 时保留该侧 mtime。遍历限制为目录深 256、路径 1024 bytes，并共享有界对象/entry 工作预算；缓存和远端对象每次按规范内容与 ID 验证。
+当前递归合并按规范字节顺序处理名称集合，目录即使双方 DirectoryId 都变化也按名称递归；双方新建目录以空目录为 Base。双方文件 ID 相同而仅 mtime 不同时取较大规范时间；双方同路径 FileId 不同时保留 Remote 原路径，并按本地父 Commit 的规范 DeviceId、CreatedAt 生成 Local 冲突副本。初次合并使用 Captured Commit，连续 HeadConflict 使用旧 Candidate；新结果 Candidate 永不作为自身命名输入。新建或重建目录 entry 的 mtime 取两侧较大值，完整复用一侧 entry 时保留该侧 mtime。遍历限制为目录深 256、路径 1024 bytes，并共享有界对象/entry 工作预算；缓存和远端对象每次按规范内容与 ID 验证。
 
-同一路径双方出现不同 FileId 属于 Issue #17；删除与修改、目录删除与子树修改以及文件/目录类型冲突属于 Issue #18。当前实现对这些情况返回边界错误，不生成文本合并或冲突副本，不改变工作目录、pending、Head 或绑定，也不上传新的合并对象。同目录出现大小写折叠或规范名称碰撞同样作为结构边界失败。后续实现 #17/#18 时再启用上表中的冲突副本和子树保留语义。重命名仍由树差异表现为删除加新增。
+删除与修改、目录删除与子树修改以及文件/目录类型冲突属于 Issue #18，当前仍返回耐久边界错误。同目录出现大小写折叠或规范名称碰撞同样作为结构边界失败。Issue #19 完成前，冲突名超过 240 bytes 或完整路径超过 1024 bytes 时返回明确边界，不截短、不创建根回退目录，也不保存 pending 或上传对象。重命名仍由树差异表现为删除加新增。
+
+合并 Candidate checkout 时，捕获的本地冲突文件从内部 recovery 直接以 journaled no-replace rename 提升到 Candidate 的固定冲突路径，保留 inode 和旧文件描述符身份。promotion 后再次变化的同一 inode 被提升到下一个确定后缀，固定 Candidate 路径从不可变对象恢复；Sync Base 只推进到固定 Candidate，并明确要求下一轮同步发布 late 可见副本。跨父 rename 的源父身份记录在 `fs_actions`，目标父身份取同一 checkout 的耐久 `checkout_paths`，两侧父目录均在 Completed 前同步。
 
 ## 路径规则
 

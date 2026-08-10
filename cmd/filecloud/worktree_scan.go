@@ -44,6 +44,7 @@ type scanFault struct {
 
 type worktreeScanConfig struct {
 	ignoredRootNames           map[string]bool
+	ignoredPaths               map[string]bool
 	trackedPaths               map[string]bool
 	warning                    io.Writer
 	fault                      func(scanFault) error
@@ -230,6 +231,9 @@ func (session *scanSession) enumerateDirectory(directory *os.File, relative stri
 			continue
 		}
 		path := joinScanPath(relative, name)
+		if session.config.ignoredPaths[path] {
+			continue
+		}
 		if !utf8.ValidString(name) || len(path) > 1024 {
 			return nil, fmt.Errorf("invalid worktree path %q", path)
 		}
