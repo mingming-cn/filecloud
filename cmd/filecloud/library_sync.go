@@ -20,15 +20,34 @@ import (
 )
 
 const (
-	syncRecoveryPrefix  = ".filecloud-internal-sync-"
-	syncTombstonePrefix = ".filecloud-internal-sync-trash-"
-	maxSyncParentWalk   = 1024
+	syncRecoveryPrefix       = ".filecloud-internal-sync-"
+	syncTombstonePrefix      = ".filecloud-internal-sync-trash-"
+	maxSyncParentWalk        = 1024
+	deleteCandidatePrefixLen = 12
 )
 
 type pendingPublication struct {
 	BaseCommit, BaseRoot, ExpectedETag string
 	CandidateCommit, CandidateRoot     string
 	CandidateData                      []byte
+	DeletionCount, TrackedCount        int64
+	RequiresDeleteConfirmation         bool
+	DeleteConfirmed                    bool
+	LegacyRevalidationRequired         bool
+}
+
+type deleteConfirmationRequiredError struct {
+	candidate        string
+	deleted, tracked int64
+}
+
+func (value *deleteConfirmationRequiredError) Error() string {
+	percentage := 0.0
+	if value.tracked > 0 {
+		percentage = float64(value.deleted) * 100 / float64(value.tracked)
+	}
+	return fmt.Sprintf("candidate %s deletes %d of %d tracked paths (%.1f%%; protection threshold: more than 100 or at least 10%%); rerun sync --confirm-delete %s",
+		value.candidate[:deleteCandidatePrefixLen], value.deleted, value.tracked, percentage, value.candidate[:deleteCandidatePrefixLen])
 }
 
 type syncRecovery struct {
@@ -42,6 +61,9 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 	pending, err := loadPendingPublication(ctx, db, binding.Worktree)
 	if err != nil {
 		return err
+	}
+	if options.confirmDeleteSet && (pending == nil || (!pending.RequiresDeleteConfirmation && !pending.LegacyRevalidationRequired)) {
+		return errors.New("--confirm-delete requires a protected pending deletion candidate for this worktree")
 	}
 	checkout, err := loadPendingCheckout(ctx, db, binding.ServerURL, binding.LibraryID, binding.Worktree)
 	if err != nil {
@@ -89,26 +111,28 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 		if err != nil {
 			return err
 		}
+		deleted, tracked := deletionStats(options.scanConfig.trackedPaths, snapshot.paths)
+		protected := protectedDeletion(deleted, tracked)
 		pending = &pendingPublication{BaseCommit: binding.SyncBase, BaseRoot: binding.SyncBaseRoot, ExpectedETag: head.ETag,
-			CandidateCommit: id, CandidateRoot: snapshot.root, CandidateData: data}
-		if err := uploadSnapshot(ctx, options, snapshot); err != nil {
-			return err
-		}
-		if err := putMetadata(ctx, options.base, options.libraryID, options.token, "commits", id, data); err != nil {
-			return err
-		}
+			CandidateCommit: id, CandidateRoot: snapshot.root, CandidateData: data, DeletionCount: deleted,
+			TrackedCount: tracked, RequiresDeleteConfirmation: protected}
 		if err := savePendingPublication(ctx, db, binding.Worktree, *pending); err != nil {
 			return err
 		}
-		return publishPending(ctx, db, options, binding, snapshot, *pending, stdout, config)
+		if protected {
+			return deletionConfirmationError(*pending)
+		}
+		return uploadAndPublishPending(ctx, db, options, binding, snapshot, *pending, stdout, config)
 	}
 }
 
 func loadPendingPublication(ctx context.Context, db *sql.DB, worktree string) (*pendingPublication, error) {
 	var value pendingPublication
-	err := db.QueryRowContext(ctx, `SELECT base_commit, base_root, expected_etag, candidate_commit, candidate_root, candidate_data
+	err := db.QueryRowContext(ctx, `SELECT base_commit, base_root, expected_etag, candidate_commit, candidate_root, candidate_data,
+		deletion_count, tracked_count, requires_delete_confirmation, delete_confirmed, legacy_revalidation_required
 		FROM pending_publications WHERE worktree = ?`, worktree).Scan(&value.BaseCommit, &value.BaseRoot, &value.ExpectedETag,
-		&value.CandidateCommit, &value.CandidateRoot, &value.CandidateData)
+		&value.CandidateCommit, &value.CandidateRoot, &value.CandidateData, &value.DeletionCount, &value.TrackedCount,
+		&value.RequiresDeleteConfirmation, &value.DeleteConfirmed, &value.LegacyRevalidationRequired)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -120,8 +144,11 @@ func loadPendingPublication(ctx context.Context, db *sql.DB, worktree string) (*
 
 func savePendingPublication(ctx context.Context, db *sql.DB, worktree string, value pendingPublication) error {
 	_, err := db.ExecContext(ctx, `INSERT INTO pending_publications(worktree, base_commit, base_root, expected_etag,
-		candidate_commit, candidate_root, candidate_data) VALUES (?, ?, ?, ?, ?, ?, ?)`, worktree, value.BaseCommit,
-		value.BaseRoot, value.ExpectedETag, value.CandidateCommit, value.CandidateRoot, value.CandidateData)
+		candidate_commit, candidate_root, candidate_data, deletion_count, tracked_count, requires_delete_confirmation,
+		delete_confirmed, legacy_revalidation_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, worktree,
+		value.BaseCommit, value.BaseRoot, value.ExpectedETag, value.CandidateCommit, value.CandidateRoot,
+		value.CandidateData, value.DeletionCount, value.TrackedCount, value.RequiresDeleteConfirmation,
+		value.DeleteConfirmed, value.LegacyRevalidationRequired)
 	if err != nil {
 		return fmt.Errorf("save pending publication: %w", err)
 	}
@@ -132,7 +159,11 @@ func verifyPendingPublication(value pendingPublication, binding clientBinding) e
 	commit, err := object.VerifyCommit(value.CandidateData, value.CandidateCommit)
 	if err != nil || value.BaseCommit != binding.SyncBase || value.BaseRoot != binding.SyncBaseRoot ||
 		commit.Root != value.CandidateRoot || commit.AuthorUserID != binding.UserID || commit.DeviceID != binding.DeviceID ||
-		len(commit.Parents) != 1 || commit.Parents[0] != value.BaseCommit {
+		len(commit.Parents) != 1 || commit.Parents[0] != value.BaseCommit || value.DeletionCount < 0 ||
+		value.TrackedCount < value.DeletionCount || value.DeleteConfirmed && !value.RequiresDeleteConfirmation ||
+		(value.LegacyRevalidationRequired && (value.DeletionCount != 0 || value.TrackedCount != 0 ||
+			value.RequiresDeleteConfirmation || value.DeleteConfirmed)) ||
+		(!value.LegacyRevalidationRequired && value.RequiresDeleteConfirmation != protectedDeletion(value.DeletionCount, value.TrackedCount)) {
 		return errors.New("pending publication is corrupt or does not match the binding")
 	}
 	return nil
@@ -143,21 +174,149 @@ func resumePublication(ctx context.Context, db *sql.DB, options bindOptions, bin
 	if err := verifyPendingPublication(pending, binding); err != nil {
 		return err
 	}
-	if snapshot.root != pending.CandidateRoot {
-		return errors.New("worktree changed after pending publication was created")
-	}
 	if *head.CommitID == pending.CandidateCommit {
-		return finalizePublished(ctx, db, binding, snapshot, head, pending, stdout)
+		if snapshot.root == pending.CandidateRoot {
+			return finalizePublished(ctx, db, binding, snapshot, head, pending, stdout)
+		}
+		return recoverPublishedCandidate(ctx, db, options, binding, head, pending)
 	}
 	if *head.CommitID != pending.BaseCommit || head.ETag != pending.ExpectedETag {
 		ancestor, err := remoteCommitDescendsFrom(ctx, options, *head.CommitID, pending.CandidateCommit, binding.UserID)
 		if err != nil {
 			return err
 		}
-		if !ancestor {
+		if !ancestor || snapshot.root != pending.CandidateRoot {
 			return errors.New("local and remote libraries both changed; merge is not supported yet")
 		}
 		return transitionPublishedSuccessor(ctx, db, options, binding, snapshot, head, pending, stdout, config)
+	}
+	if pending.LegacyRevalidationRequired {
+		if snapshot.root != pending.CandidateRoot {
+			if err := discardPendingPublication(ctx, db, binding.Worktree, pending); err != nil {
+				return err
+			}
+			return errors.New("worktree changed after legacy pending publication was created; stale candidate discarded, rerun sync")
+		}
+		deleted, tracked := deletionStats(options.scanConfig.trackedPaths, snapshot.paths)
+		protected := protectedDeletion(deleted, tracked)
+		result, err := db.ExecContext(ctx, `UPDATE pending_publications SET deletion_count = ?, tracked_count = ?,
+			requires_delete_confirmation = ?, delete_confirmed = 0, legacy_revalidation_required = 0
+			WHERE worktree = ? AND base_commit = ? AND base_root = ? AND expected_etag = ? AND candidate_commit = ?
+			AND candidate_root = ? AND candidate_data = ? AND legacy_revalidation_required = 1`, deleted, tracked, protected,
+			binding.Worktree, pending.BaseCommit, pending.BaseRoot, pending.ExpectedETag, pending.CandidateCommit,
+			pending.CandidateRoot, pending.CandidateData)
+		if err != nil {
+			return fmt.Errorf("revalidate legacy pending publication: %w", err)
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return errors.Join(errors.New("legacy pending publication changed during revalidation"), err)
+		}
+		pending.DeletionCount, pending.TrackedCount = deleted, tracked
+		pending.RequiresDeleteConfirmation, pending.DeleteConfirmed, pending.LegacyRevalidationRequired = protected, false, false
+	}
+	if snapshot.root != pending.CandidateRoot {
+		if err := discardPendingPublication(ctx, db, binding.Worktree, pending); err != nil {
+			return err
+		}
+		return errors.New("worktree changed after pending publication was created; stale candidate discarded, rerun sync")
+	}
+	if pending.RequiresDeleteConfirmation && !pending.DeleteConfirmed {
+		if !options.confirmDeleteSet {
+			return deletionConfirmationError(pending)
+		}
+		if len(options.confirmDelete) != deleteCandidatePrefixLen || options.confirmDelete != pending.CandidateCommit[:deleteCandidatePrefixLen] {
+			return errors.New("--confirm-delete must exactly match the 12-character prefix of this worktree's protected candidate")
+		}
+		result, err := db.ExecContext(ctx, `UPDATE pending_publications SET delete_confirmed = 1 WHERE worktree = ?
+			AND candidate_commit = ? AND candidate_root = ? AND base_commit = ? AND requires_delete_confirmation = 1
+			AND delete_confirmed = 0`, binding.Worktree, pending.CandidateCommit, pending.CandidateRoot, pending.BaseCommit)
+		if err != nil {
+			return fmt.Errorf("confirm pending deletion: %w", err)
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return errors.Join(errors.New("protected deletion candidate changed before confirmation"), err)
+		}
+		pending.DeleteConfirmed = true
+	} else if options.confirmDeleteSet && (len(options.confirmDelete) != deleteCandidatePrefixLen || options.confirmDelete != pending.CandidateCommit[:deleteCandidatePrefixLen]) {
+		return errors.New("--confirm-delete must exactly match the 12-character prefix of this worktree's protected candidate")
+	}
+	return uploadAndPublishPending(ctx, db, options, binding, snapshot, pending, stdout, config)
+}
+
+func discardPendingPublication(ctx context.Context, db *sql.DB, worktree string, pending pendingPublication) error {
+	result, err := db.ExecContext(ctx, `DELETE FROM pending_publications WHERE worktree = ? AND base_commit = ?
+		AND base_root = ? AND expected_etag = ? AND candidate_commit = ? AND candidate_root = ? AND candidate_data = ?`,
+		worktree, pending.BaseCommit, pending.BaseRoot, pending.ExpectedETag, pending.CandidateCommit,
+		pending.CandidateRoot, pending.CandidateData)
+	if err != nil {
+		return fmt.Errorf("discard changed pending publication: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.Join(errors.New("pending publication changed before discard"), err)
+	}
+	return nil
+}
+
+func recoverPublishedCandidate(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding,
+	head remoteHead, pending pendingPublication) error {
+	cacheRoot, err := openVerifiedCacheRoot(options.clientDir)
+	if err != nil {
+		return err
+	}
+	defer cacheRoot.Close()
+	options.cacheRoot = cacheRoot
+	commit, err := downloadTargetCommit(ctx, options, pending.CandidateCommit, binding.UserID)
+	if err != nil {
+		return fmt.Errorf("recover published candidate metadata: %w", err)
+	}
+	if commit.Root != pending.CandidateRoot {
+		return errors.New("published candidate commit has a different root")
+	}
+	paths, err := deriveRemotePaths(ctx, options, commit.Root, false)
+	if err != nil {
+		return fmt.Errorf("recover published candidate paths: %w", err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE bindings SET sync_base_commit = ?, sync_base_root = ?, head_etag = ?
+		WHERE worktree = ? AND sync_base_commit = ? AND sync_base_root = ?`, pending.CandidateCommit,
+		pending.CandidateRoot, head.ETag, binding.Worktree, pending.BaseCommit, pending.BaseRoot)
+	if err != nil {
+		return errors.Join(err, tx.Rollback())
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.Join(errors.New("published candidate recovery did not advance the expected binding"), err, tx.Rollback())
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM path_index WHERE worktree = ?", binding.Worktree); err != nil {
+		return errors.Join(err, tx.Rollback())
+	}
+	for _, path := range paths {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO path_index(worktree, path, type, object_id, canonical_mtime, actual_mtime, size)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`, binding.Worktree, path.path, path.kind, path.id, path.mtime, path.mtime, path.size); err != nil {
+			return errors.Join(err, tx.Rollback())
+		}
+	}
+	result, err = tx.ExecContext(ctx, `DELETE FROM pending_publications WHERE worktree = ? AND base_commit = ?
+		AND candidate_commit = ? AND candidate_root = ?`, binding.Worktree, pending.BaseCommit,
+		pending.CandidateCommit, pending.CandidateRoot)
+	if err != nil {
+		return errors.Join(err, tx.Rollback())
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.Join(errors.New("published candidate recovery did not clear the expected pending publication"), err, tx.Rollback())
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("recover published candidate: %w", err)
+	}
+	return errors.New("published candidate recovered as Sync Base while preserving local changes; rerun sync")
+}
+
+func uploadAndPublishPending(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding, snapshot worktreeSnapshot,
+	pending pendingPublication, stdout io.Writer, config libraryClientConfig) error {
+	if pending.LegacyRevalidationRequired {
+		return errors.New("legacy pending publication requires deletion revalidation before publication")
 	}
 	if err := uploadSnapshot(ctx, options, snapshot); err != nil {
 		return err
@@ -166,6 +325,38 @@ func resumePublication(ctx context.Context, db *sql.DB, options bindOptions, bin
 		return err
 	}
 	return publishPending(ctx, db, options, binding, snapshot, pending, stdout, config)
+}
+
+func deletionStats(trackedPaths map[string]bool, paths []checkoutPath) (deleted, tracked int64) {
+	present := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		present[path.path] = true
+	}
+	for path := range trackedPaths {
+		tracked++
+		if !present[path] {
+			deleted++
+		}
+	}
+	return deleted, tracked
+}
+
+func protectedDeletion(deleted, tracked int64) bool {
+	if deleted > 100 {
+		return true
+	}
+	if tracked == 0 {
+		return false
+	}
+	threshold := tracked / 10
+	if tracked%10 != 0 {
+		threshold++
+	}
+	return deleted >= threshold
+}
+
+func deletionConfirmationError(pending pendingPublication) error {
+	return &deleteConfirmationRequiredError{candidate: pending.CandidateCommit, deleted: pending.DeletionCount, tracked: pending.TrackedCount}
 }
 
 func remoteCommitDescendsFrom(ctx context.Context, options bindOptions, head, ancestor, owner string) (bool, error) {

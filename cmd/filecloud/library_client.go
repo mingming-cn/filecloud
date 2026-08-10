@@ -83,6 +83,8 @@ type bindOptions struct {
 	worktreeRoot                                        *openedWorktree
 	cacheRoot                                           *os.File
 	importLocal                                         bool
+	confirmDelete                                       string
+	confirmDeleteSet                                    bool
 	scanConfig                                          worktreeScanConfig
 }
 
@@ -703,11 +705,14 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 	flags := newFlagSet("library sync", stderr)
 	clientDir := flags.String("client-dir", "", "Filecloud client state directory")
 	worktree := flags.String("worktree", "", "Worktree directory")
+	confirmDelete := flags.String("confirm-delete", "", "Confirm a protected deletion candidate")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	confirmDeleteSet := false
+	flags.Visit(func(value *flag.Flag) { confirmDeleteSet = confirmDeleteSet || value.Name == "confirm-delete" })
 	if *clientDir == "" || *worktree == "" || flags.NArg() != 0 {
-		return errors.New("usage: filecloud library sync --client-dir path --worktree path")
+		return errors.New("usage: filecloud library sync --client-dir path --worktree path [--confirm-delete 12-hex-prefix]")
 	}
 	canonicalClientDir, err := canonicalStateDir(*clientDir)
 	if err != nil {
@@ -761,6 +766,7 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 	options := bindOptions{clientDir: canonicalClientDir, serverURL: binding.ServerURL, libraryID: binding.LibraryID,
 		worktree: binding.Worktree, deviceID: binding.DeviceID, base: base, token: token, worktreeRoot: root,
+		confirmDelete: *confirmDelete, confirmDeleteSet: confirmDeleteSet,
 		scanConfig: worktreeScanConfig{trackedPaths: tracked, warning: stderr, fault: config.scanFault, ignoreUntrackedUnsupported: true}}
 	if len(tracked) == 0 {
 		tracked, err = loadRemoteTrackedPaths(ctx, options, binding)
@@ -1128,7 +1134,7 @@ func initializeClientDB(ctx context.Context, clientDir string, syncDir func(stri
 	return db, nil
 }
 
-const clientSchemaVersion = 17
+const clientSchemaVersion = 19
 
 var legacyClientV12Columns = map[string][]string{
 	"bindings":             {"server_url|TEXT|1||0", "library_id|TEXT|1||0", "worktree|TEXT|1||1", "user_id|TEXT|1||0", "device_id|TEXT|1||0", "sync_base_commit|TEXT|1||0", "sync_base_root|TEXT|1||0", "head_etag|TEXT|1||0", "access_token|BLOB|1||0"},
@@ -1150,6 +1156,41 @@ var legacyClientV12SQL = map[string]string{
 	"path_index":           `CREATE TABLE path_index (worktree TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, object_id TEXT NOT NULL, canonical_mtime TEXT NOT NULL, actual_mtime TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(worktree, path))`,
 }
 
+const legacyClientV18PendingSQL = `CREATE TABLE pending_publications (
+	worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL, base_root TEXT NOT NULL,
+	expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL, candidate_root TEXT NOT NULL,
+	candidate_data BLOB NOT NULL, deletion_count INTEGER NOT NULL DEFAULT 0,
+	tracked_count INTEGER NOT NULL DEFAULT 0, requires_delete_confirmation INTEGER NOT NULL DEFAULT 0,
+	delete_confirmed INTEGER NOT NULL DEFAULT 0,
+	CHECK(deletion_count >= 0 AND tracked_count >= deletion_count),
+	CHECK(requires_delete_confirmation IN (0, 1) AND delete_confirmed IN (0, 1)),
+	CHECK(delete_confirmed = 0 OR requires_delete_confirmation = 1),
+	CHECK(requires_delete_confirmation = (deletion_count > 100 OR (tracked_count > 0 AND
+		deletion_count >= tracked_count / 10 + CASE WHEN tracked_count % 10 = 0 THEN 0 ELSE 1 END))))`
+
+const clientV19PendingSQL = `CREATE TABLE pending_publications (
+	worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL, base_root TEXT NOT NULL,
+	expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL, candidate_root TEXT NOT NULL,
+	candidate_data BLOB NOT NULL, deletion_count INTEGER NOT NULL DEFAULT 0,
+	tracked_count INTEGER NOT NULL DEFAULT 0, requires_delete_confirmation INTEGER NOT NULL DEFAULT 0,
+	delete_confirmed INTEGER NOT NULL DEFAULT 0, legacy_revalidation_required INTEGER NOT NULL DEFAULT 0,
+	CHECK(deletion_count >= 0 AND tracked_count >= deletion_count),
+	CHECK(requires_delete_confirmation IN (0, 1) AND delete_confirmed IN (0, 1)
+		AND legacy_revalidation_required IN (0, 1)),
+	CHECK((legacy_revalidation_required = 1 AND deletion_count = 0 AND tracked_count = 0
+		AND requires_delete_confirmation = 0 AND delete_confirmed = 0) OR
+		(legacy_revalidation_required = 0 AND delete_confirmed <= requires_delete_confirmation AND
+		requires_delete_confirmation = (deletion_count > 100 OR (tracked_count > 0 AND
+		deletion_count >= tracked_count / 10 + CASE WHEN tracked_count % 10 = 0 THEN 0 ELSE 1 END)))))`
+
+var clientV19PendingColumns = []string{
+	"0|worktree|TEXT|1||1", "1|base_commit|TEXT|1||0", "2|base_root|TEXT|1||0",
+	"3|expected_etag|TEXT|1||0", "4|candidate_commit|TEXT|1||0", "5|candidate_root|TEXT|1||0",
+	"6|candidate_data|BLOB|1||0", "7|deletion_count|INTEGER|1|0|0", "8|tracked_count|INTEGER|1|0|0",
+	"9|requires_delete_confirmation|INTEGER|1|0|0", "10|delete_confirmed|INTEGER|1|0|0",
+	"11|legacy_revalidation_required|INTEGER|1|0|0",
+}
+
 var legacyClientV12Indexes = map[string][]string{
 	"bindings": {"server_url,library_id", "worktree"}, "bind_intents": {"server_url,library_id", "worktree"},
 	"pending_checkouts": {"server_url,library_id", "worktree"}, "pending_publications": {"worktree"},
@@ -1159,6 +1200,7 @@ var legacyClientV12Indexes = map[string][]string{
 func canonicalSQLiteSQL(value string) string {
 	var result strings.Builder
 	var quote byte
+	space := false
 	for index := 0; index < len(value); index++ {
 		char := value[index]
 		if quote != 0 {
@@ -1168,20 +1210,86 @@ func canonicalSQLiteSQL(value string) string {
 			}
 			continue
 		}
+		if char == ' ' || char == '\n' || char == '\r' || char == '\t' {
+			space = result.Len() != 0
+			continue
+		}
+		if space {
+			result.WriteByte(' ')
+			space = false
+		}
 		if char == '\'' || char == '"' || char == '`' || char == '[' {
 			quote = char
-			result.WriteByte(char)
-			continue
-		}
-		if char == ' ' || char == '\n' || char == '\r' || char == '\t' {
-			continue
-		}
-		if char >= 'a' && char <= 'z' {
+		} else if char >= 'a' && char <= 'z' {
 			char -= 'a' - 'A'
 		}
 		result.WriteByte(char)
 	}
 	return result.String()
+}
+
+type clientSchemaQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func validateClientV19Schema(ctx context.Context, db clientSchemaQuerier) error {
+	var createSQL string
+	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema
+		WHERE type='table' AND name='pending_publications'`).Scan(&createSQL); err != nil {
+		return fmt.Errorf("read v19 pending publication schema: %w", err)
+	}
+	if canonicalSQLiteSQL(createSQL) != canonicalSQLiteSQL(clientV19PendingSQL) {
+		return errors.New("v19 pending publication canonical SQL changed")
+	}
+	rows, err := db.QueryContext(ctx, `SELECT cid,name,type,[notnull],COALESCE(dflt_value,''),pk
+		FROM pragma_table_info('pending_publications') ORDER BY cid`)
+	if err != nil {
+		return err
+	}
+	var columns []string
+	for rows.Next() {
+		var cid, notnull, primary int
+		var name, kind, defaultValue string
+		if err := rows.Scan(&cid, &name, &kind, &notnull, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return err
+		}
+		columns = append(columns, fmt.Sprintf("%d|%s|%s|%d|%s|%d", cid, name, kind, notnull, defaultValue, primary))
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if strings.Join(columns, "\n") != strings.Join(clientV19PendingColumns, "\n") {
+		return errors.New("v19 pending publication column fingerprint changed")
+	}
+	var indexes int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('pending_publications')
+		WHERE [unique]=1 AND origin='pk' AND partial=0`).Scan(&indexes); err != nil || indexes != 1 {
+		return errors.Join(errors.New("v19 pending publication primary index fingerprint changed"), err)
+	}
+	var allIndexes, worktreeIndexes int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('pending_publications')`).Scan(&allIndexes); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('pending_publications') AS indexes
+		JOIN pragma_index_info(indexes.name) AS columns
+		WHERE indexes.[unique]=1 AND indexes.origin='pk' AND indexes.partial=0
+		AND columns.seqno=0 AND columns.cid=0 AND columns.name='worktree'`).Scan(&worktreeIndexes); err != nil {
+		return err
+	}
+	if allIndexes != 1 || worktreeIndexes != 1 {
+		return errors.New("v19 pending publication index fingerprint changed")
+	}
+	var unsafeObjects int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema
+		WHERE type IN ('trigger','view') AND name NOT LIKE 'sqlite_%'`).Scan(&unsafeObjects); err != nil {
+		return err
+	}
+	if unsafeObjects != 0 {
+		return errors.New("client schema has an unexpected trigger or view")
+	}
+	return nil
 }
 
 func validateLegacyClientV12(ctx context.Context, db *sql.DB) error {
@@ -1333,6 +1441,23 @@ func validateClientSchemaVersion(ctx context.Context, db *sql.DB) error {
 	for index, version := range versions {
 		if version != 13+index || version > clientSchemaVersion {
 			return errors.New("client schema migration history is unknown, gapped, or newer than this client")
+		}
+	}
+	version := versions[len(versions)-1]
+	if version == clientSchemaVersion {
+		return validateClientV19Schema(ctx, db)
+	}
+	if version == 17 || version == 18 {
+		var createSQL string
+		if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema WHERE type='table' AND name='pending_publications'`).Scan(&createSQL); err != nil {
+			return fmt.Errorf("read v%d pending publication schema: %w", version, err)
+		}
+		expected := legacyClientV18PendingSQL
+		if version == 17 {
+			expected = legacyClientV12SQL["pending_publications"]
+		}
+		if canonicalSQLiteSQL(createSQL) != canonicalSQLiteSQL(expected) {
+			return fmt.Errorf("v%d pending publication schema fingerprint changed", version)
 		}
 	}
 	return nil
@@ -1534,10 +1659,6 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		worktree TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
 		target_commit TEXT NOT NULL, target_root TEXT NOT NULL, head_etag TEXT NOT NULL,
 		apply_state TEXT NOT NULL DEFAULT 'pending', UNIQUE(server_url, library_id));
-		CREATE TABLE IF NOT EXISTS pending_publications (
-		worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL, base_root TEXT NOT NULL,
-		expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL, candidate_root TEXT NOT NULL,
-		candidate_data BLOB NOT NULL);
 		CREATE TABLE IF NOT EXISTS sync_recoveries (
 		worktree TEXT NOT NULL, path TEXT NOT NULL, recovery_name TEXT NOT NULL,
 		type TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '', canonical_mtime TEXT NOT NULL DEFAULT '',
@@ -1555,6 +1676,16 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		canonical_mtime TEXT NOT NULL, actual_mtime TEXT NOT NULL, size INTEGER NOT NULL,
 		PRIMARY KEY(worktree, path));`); err != nil {
 		return fail(err)
+	}
+	var pendingPublications int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema
+		WHERE type='table' AND name='pending_publications'`).Scan(&pendingPublications); err != nil {
+		return fail(err)
+	}
+	if pendingPublications == 0 {
+		if _, err := tx.ExecContext(ctx, clientV19PendingSQL); err != nil {
+			return fail(err)
+		}
 	}
 	for table, columns := range map[string]map[string]string{
 		"pending_checkouts": {"apply_state": "TEXT NOT NULL DEFAULT 'pending'"},
@@ -1623,12 +1754,40 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 			return fail(err)
 		}
 	}
+	var pendingDeletionColumns int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('pending_publications')
+		WHERE name IN ('deletion_count','tracked_count','requires_delete_confirmation','delete_confirmed',
+		'legacy_revalidation_required')`).Scan(&pendingDeletionColumns); err != nil {
+		return fail(err)
+	}
+	if pendingDeletionColumns == 0 || pendingDeletionColumns == 4 {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE pending_publications RENAME TO old_pending_publications`); err != nil {
+			return fail(err)
+		}
+		if _, err := tx.ExecContext(ctx, clientV19PendingSQL); err != nil {
+			return fail(err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO pending_publications(worktree,base_commit,base_root,expected_etag,candidate_commit,candidate_root,
+			candidate_data,deletion_count,tracked_count,requires_delete_confirmation,delete_confirmed,legacy_revalidation_required)
+			SELECT worktree,base_commit,base_root,expected_etag,candidate_commit,candidate_root,candidate_data,0,0,0,0,1
+			FROM old_pending_publications;
+			DROP TABLE old_pending_publications`); err != nil {
+			return fail(err)
+		}
+	} else if pendingDeletionColumns != 5 {
+		return fail(errors.New("pending publication deletion schema is incomplete"))
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (13);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (14);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (15);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (16);
-		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (17)`); err != nil {
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (17);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (18);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (19)`); err != nil {
 		return fail(err)
+	}
+	if err := validateClientV19Schema(ctx, tx); err != nil {
+		return fail(fmt.Errorf("validate migrated client schema: %w", err))
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("initialize client state: %w", err)

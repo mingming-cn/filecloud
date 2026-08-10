@@ -162,6 +162,10 @@ func downloadTargetCommit(ctx context.Context, options bindOptions, target, owne
 }
 
 func downloadCheckoutTree(ctx context.Context, options bindOptions, root string) ([]checkoutPath, error) {
+	return deriveRemotePaths(ctx, options, root, true)
+}
+
+func deriveRemotePaths(ctx context.Context, options bindOptions, root string, downloadBlocks bool) ([]checkoutPath, error) {
 	paths := make([]checkoutPath, 0)
 	var walk func(string, string, int) error
 	walk = func(id, prefix string, depth int) error {
@@ -201,9 +205,11 @@ func downloadCheckoutTree(ctx context.Context, options bindOptions, root string)
 				return errors.New("remote file is not valid canonical content")
 			}
 			value.size = file.Size
-			for _, block := range file.Blocks {
-				if _, err := cachedRemoteBlock(ctx, options, block); err != nil {
-					return err
+			if downloadBlocks {
+				for _, block := range file.Blocks {
+					if _, err := cachedRemoteBlock(ctx, options, block); err != nil {
+						return err
+					}
 				}
 			}
 			paths = append(paths, value)

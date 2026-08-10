@@ -196,7 +196,7 @@ stateDiagram-v2
 
 客户端先上传候选 Commit 及所有引用对象。对象 PUT 天然幂等；批量检查只减少请求，不影响正确性。CAS 前在本地事务中保存 `PendingPublication{Base, ExpectedHead, ExpectedETag, CommitId}`，再以 `If-Match` 发布 Head。
 
-恢复 pending publication 时先读取远端 Head：若等于 CommitId，直接继续 checkout；若 CommitId 是当前 Head 的可达祖先，说明它已发布且被后继提交包含，直接 checkout 当前 Head；若远端仍等于 ExpectedHead，重试 CAS；否则进入三方合并。祖先检查沿 parent 图执行并受与 Head 验证相同的深度和工作量预算约束。
+恢复 pending publication 时先读取远端 Head，再根据工作树变化决定是否丢弃候选：若等于 CommitId 且工作树仍等于候选 root，直接完成发布；若工作树已变化，则从远端候选 Commit/Directory 元数据重建 Sync Base 和路径索引、清除 pending，但不修改工作树，并要求重跑同步以把当前本地变化发布为后继提交。若 CommitId 是当前 Head 的可达祖先，说明它已发布且被后继提交包含，继续现有后继处理；若远端仍等于 ExpectedHead，才允许按候选状态重试 CAS；否则进入三方合并。祖先检查沿 parent 图执行并受与 Head 验证相同的深度和工作量预算约束。
 
 每次 `HeadConflict` 都以前一次请求的 ExpectedHead 作为新 Base、以上一次候选作为 Local、以最新 Head 作为 Remote 重新合并；上传新对象后，在下一次 CAS 前原子替换 pending publication。不得一直使用最初 Sync Base 重放合并。只有 Sync Base 推进后才能清除 pending 状态。
 
@@ -259,7 +259,9 @@ JCS 本身不做 Unicode normalization，因此名称必须先按 Unicode 15.1 N
 
 ## 删除保护
 
-若候选提交删除超过 100 个已跟踪路径或当前路径总数的 10%，客户端默认中止且不上传/发布，并持久化该候选及扫描指纹。错误返回 Candidate Commit 前缀和删除统计；只有 `sync --confirm-delete <prefix>` 可确认完全相同的持久候选。确认前重新扫描：工作树变化时删除旧候选并要求重新确认，未变化则复用原 CommitId。这是误操作保护，不改变三方合并的删除语义。
+若候选提交删除超过 100 个已跟踪路径或当前已跟踪路径总数的 10%（含边界），客户端先持久化候选、扫描根和删除统计，再默认中止；此时不上传任何对象、不更新 Head，也不改变 Sync Base 或路径索引。删除数按 `path_index` 中不存在于新扫描结果的文件和目录路径计算。错误仅返回 Candidate Commit 的固定 12 位小写十六进制前缀、删除数、已跟踪总数、百分比和阈值，不返回路径名或内容。
+
+只有 `sync --confirm-delete <prefix>` 可确认当前工作目录完全相同的受保护 pending 候选；参数必须恰好为错误给出的 12 位前缀，不能使用更短前缀、完整 CommitId、其他工作目录的候选或任意大小写变体。没有受保护 pending 候选时使用该参数会明确失败且不改变状态。确认前使用完整扫描器重新扫描：扫描根变化时删除旧候选并要求普通 `sync` 生成新候选；扫描根未变化时原子记录确认并复用已持久化的 CommitId 和提交正文。旧 schema 中没有删除统计的 pending 在迁移后标记为必须重验证，不得直接上传或发布；仅当远端仍是其 Expected Head 且扫描 root 相同时，才从当前路径索引重算统计并清除标记，受保护候选仍需一次新的精确确认。已确认候选的上传、网络或 CAS 失败保留确认状态，后续普通 `sync` 可继续；确认不转移到不同候选或不同同步基线。这是误操作保护，不改变三方合并的删除语义。
 
 ## 认证与安全
 

@@ -173,7 +173,7 @@ func TestClientLegacyV12FingerprintBeforeDDL(t *testing.T) {
 			t.Fatal(err)
 		}
 		var versions int
-		if err := db.QueryRow("SELECT COUNT(*) FROM client_schema_migrations").Scan(&versions); err != nil || versions != 5 {
+		if err := db.QueryRow("SELECT COUNT(*) FROM client_schema_migrations").Scan(&versions); err != nil || versions != clientSchemaVersion-12 {
 			t.Fatalf("versions=%d err=%v", versions, err)
 		}
 	})
@@ -324,7 +324,7 @@ func TestFSActionV15ProvenanceMigration(t *testing.T) {
 		if err := db.QueryRow("SELECT MAX(version) FROM client_schema_migrations").Scan(&version); err != nil {
 			t.Fatal(err)
 		}
-		if err := db.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil || rows != 1 || version != 17 || foreignKeys != 1 {
+		if err := db.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil || rows != 1 || version != clientSchemaVersion || foreignKeys != 1 {
 			t.Fatalf("rows=%d version=%d foreign_keys=%d err=%v", rows, version, foreignKeys, err)
 		}
 	})
@@ -338,6 +338,171 @@ func TestFSActionV15ProvenanceMigration(t *testing.T) {
 			t.Fatalf("failed migration changed schema: origin=%d err=%v", hasOrigin, err)
 		}
 	})
+}
+
+func TestClientV19PendingPublicationFingerprintBeforeDDL(t *testing.T) {
+	rebuild := func(db *sql.DB, createSQL string) error {
+		_, err := db.Exec(`ALTER TABLE pending_publications RENAME TO old_pending_publications`)
+		if err != nil {
+			return err
+		}
+		if _, err = db.Exec(createSQL); err != nil {
+			return err
+		}
+		_, err = db.Exec(`INSERT INTO pending_publications SELECT * FROM old_pending_publications;
+			DROP TABLE old_pending_publications`)
+		return err
+	}
+	cases := []struct {
+		name   string
+		mutate func(*sql.DB) error
+	}{
+		{"removed check", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(clientV19PendingSQL,
+				"CHECK(deletion_count >= 0 AND tracked_count >= deletion_count)", "CHECK(deletion_count >= 0)", 1))
+		}},
+		{"altered check", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(clientV19PendingSQL, "deletion_count > 100", "deletion_count > 101", 1))
+		}},
+		{"altered default", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(clientV19PendingSQL,
+				"deletion_count INTEGER NOT NULL DEFAULT 0", "deletion_count INTEGER NOT NULL DEFAULT 1", 1))
+		}},
+		{"altered notnull", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(clientV19PendingSQL,
+				"tracked_count INTEGER NOT NULL DEFAULT 0", "tracked_count INTEGER DEFAULT 0", 1))
+		}},
+		{"altered type", func(db *sql.DB) error {
+			return rebuild(db, strings.Replace(clientV19PendingSQL,
+				"tracked_count INTEGER NOT NULL DEFAULT 0", "tracked_count TEXT NOT NULL DEFAULT 0", 1))
+		}},
+		{"extra trigger", func(db *sql.DB) error {
+			_, err := db.Exec(`CREATE TRIGGER confirm_candidate AFTER UPDATE OF candidate_commit ON pending_publications
+				BEGIN UPDATE pending_publications SET delete_confirmed=1 WHERE worktree=NEW.worktree; END`)
+			return err
+		}},
+		{"extra view", func(db *sql.DB) error {
+			_, err := db.Exec(`CREATE VIEW pending_candidates AS SELECT worktree,candidate_commit FROM pending_publications`)
+			return err
+		}},
+		{"extra explicit index", func(db *sql.DB) error {
+			_, err := db.Exec(`CREATE INDEX pending_candidate_commit ON pending_publications(candidate_commit)`)
+			return err
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			clientDir := t.TempDir()
+			db, err := initializeClientDB(t.Context(), clientDir, syncDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec(`INSERT INTO pending_publications VALUES
+				('/work','base','root','etag','candidate','candidate-root',X'0102',101,101,1,0,0)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.mutate(db); err != nil {
+				t.Fatal(err)
+			}
+			var databasePath, beforeSchema, beforeData string
+			if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow("SELECT file FROM pragma_database_list WHERE name='main'").Scan(&databasePath); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT group_concat(type || ':' || name || ':' || COALESCE(sql,''), char(10))
+				FROM (SELECT type,name,sql FROM sqlite_schema ORDER BY type,name)`).Scan(&beforeSchema); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT quote(worktree)||'|'||quote(candidate_commit)||'|'||delete_confirmed
+				FROM pending_publications ORDER BY worktree`).Scan(&beforeData); err != nil {
+				t.Fatal(err)
+			}
+			beforeBytes, err := os.ReadFile(databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := initializeClientSchema(t.Context(), db); err == nil {
+				t.Fatal("invalid v19 schema was accepted")
+			}
+			var afterSchema, afterData string
+			if err := db.QueryRow(`SELECT group_concat(type || ':' || name || ':' || COALESCE(sql,''), char(10))
+				FROM (SELECT type,name,sql FROM sqlite_schema ORDER BY type,name)`).Scan(&afterSchema); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT quote(worktree)||'|'||quote(candidate_commit)||'|'||delete_confirmed
+				FROM pending_publications ORDER BY worktree`).Scan(&afterData); err != nil {
+				t.Fatal(err)
+			}
+			afterBytes, err := os.ReadFile(databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if beforeSchema != afterSchema || beforeData != afterData || !bytes.Equal(beforeBytes, afterBytes) {
+				t.Fatal("v19 rejection changed schema, data, or database bytes")
+			}
+			if test.name == "extra trigger" && afterData != "'/work'|'candidate'|0" {
+				t.Fatalf("trigger confirmed candidate: %s", afterData)
+			}
+		})
+	}
+	t.Run("valid", func(t *testing.T) {
+		db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if err := initializeClientSchema(t.Context(), db); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestPendingPublicationV17DeletionConfirmationMigration(t *testing.T) {
+	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO new_pending_publications;
+		CREATE TABLE pending_publications (worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL,
+		base_root TEXT NOT NULL, expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL,
+		candidate_root TEXT NOT NULL, candidate_data BLOB NOT NULL);
+		INSERT INTO pending_publications VALUES('/work','base','root','etag','candidate','candidate-root',X'0102');
+		DROP TABLE new_pending_publications;
+		DELETE FROM client_schema_migrations WHERE version>=18`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeClientSchema(t.Context(), db); err != nil {
+		t.Fatal(err)
+	}
+	var columns, version, rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pending_publications') WHERE name IN
+		('deletion_count','tracked_count','requires_delete_confirmation','delete_confirmed',
+		'legacy_revalidation_required')`).Scan(&columns); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT MAX(version) FROM client_schema_migrations").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pending_publications WHERE worktree='/work' AND deletion_count=0
+		AND tracked_count=0 AND requires_delete_confirmation=0 AND delete_confirmed=0
+		AND legacy_revalidation_required=1`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if columns != 5 || version != clientSchemaVersion || rows != 1 {
+		t.Fatalf("columns=%d version=%d preserved_rows=%d", columns, version, rows)
+	}
+	for _, values := range []string{
+		"'/bad','base','root','etag','candidate','root',X'00',1,20,0,0,1",
+		"'/bad','base','root','etag','candidate','root',X'00',1,20,0,1,0",
+	} {
+		if _, err := db.Exec("INSERT INTO pending_publications VALUES(" + values + ")"); err == nil {
+			t.Fatal("pending publication CHECK accepted inconsistent legacy or confirmation state")
+		}
+	}
 }
 
 func TestCheckoutCreateOriginV16Migration(t *testing.T) {
@@ -367,7 +532,7 @@ func TestCheckoutCreateOriginV16Migration(t *testing.T) {
 			}
 		}
 		if _, err := db.Exec(`ALTER TABLE checkout_paths DROP COLUMN create_action_id;
-			DELETE FROM client_schema_migrations WHERE version=17`); err != nil {
+			DELETE FROM client_schema_migrations WHERE version>=17`); err != nil {
 			t.Fatal(err)
 		}
 		return db
@@ -1937,7 +2102,7 @@ func TestPublicSyncSubprocessCrashMatrix(t *testing.T) {
 				} else if err := os.WriteFile(filepath.Join(publisherTree, "remote"), []byte("remote"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				if err := syncTestWorktreeConfirmingDeletes(t, publisherDir, publisherTree); err != nil {
 					t.Fatal(err)
 				}
 				command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
@@ -2341,7 +2506,7 @@ func TestPublicUnbindRollbackSubprocessCrash(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(publisherTree, "remote"), []byte("remote"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+				if err := syncTestWorktreeConfirmingDeletes(t, publisherDir, publisherTree); err != nil {
 					t.Fatal(err)
 				}
 				setup := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")

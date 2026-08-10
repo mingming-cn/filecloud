@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -80,7 +81,13 @@ func TestLibrarySyncPublishesLocalTreeOperations(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := syncTestWorktree(t, state.clientDir, state.worktree); err != nil {
-				t.Fatal(err)
+				var required *deleteConfirmationRequiredError
+				if !errors.As(err, &required) {
+					t.Fatal(err)
+				}
+				if err := confirmTestDeletion(t, state.clientDir, state.worktree, required.candidate[:deleteCandidatePrefixLen], libraryClientConfig{}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			after := assertTestConverged(t, state.environment, state.clientDir, state.worktree)
 			commit, err := object.VerifyCommit(getTestObject(t, state.environment.server.URL, state.environment.token, "commits", after.SyncBase), after.SyncBase)
@@ -113,7 +120,7 @@ func TestLibrarySyncAppliesRemoteTreeOperationsWithoutPUT(t *testing.T) {
 		if err := operation(); err != nil {
 			t.Fatal(err)
 		}
-		if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		if err := syncTestWorktreeConfirmingDeletes(t, publisherDir, publisherTree); err != nil {
 			t.Fatalf("publish operation %d: %v", index, err)
 		}
 		puts.Store(0)
@@ -149,6 +156,290 @@ func TestLibrarySyncRejectsBothSidesChanged(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(subscriberTree, "local")); err != nil || string(data) != "local" {
 		t.Fatalf("rejected merge changed local data=%q err=%v", data, err)
+	}
+}
+
+func TestProtectedDeletionBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		deleted, tracked int64
+		want             bool
+	}{
+		{"more than 100 below ratio", 101, 2000, true},
+		{"exactly 100 below ratio", 100, 2000, false},
+		{"exactly ten percent", 10, 100, true},
+		{"below both", 9, 100, false},
+		{"low count one deletion", 1, 2, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := protectedDeletion(test.deleted, test.tracked); got != test.want {
+				t.Fatalf("protectedDeletion(%d, %d)=%v want=%v", test.deleted, test.tracked, got, test.want)
+			}
+		})
+	}
+}
+
+func TestLibrarySyncProtectedDeletionConfirmation(t *testing.T) {
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	var puts atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			puts.Add(1)
+		}
+		environment.handler.ServeHTTP(w, r)
+	}))
+	defer proxy.Close()
+	clientDir, worktree := newClientPaths(t)
+	const deletedName = "private-name.txt"
+	const deletedContent = "private-content"
+	if err := os.WriteFile(filepath.Join(worktree, deletedName), []byte(deletedContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "kept.txt"), []byte("kept"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := append(bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testClientDeviceID), "--import-local")
+	if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	before := readTestBinding(t, clientDir, worktree)
+	if err := os.Remove(filepath.Join(worktree, deletedName)); err != nil {
+		t.Fatal(err)
+	}
+	puts.Store(0)
+	err := syncTestWorktree(t, clientDir, worktree)
+	var required *deleteConfirmationRequiredError
+	if !errors.As(err, &required) {
+		t.Fatalf("protected deletion error=%v", err)
+	}
+	prefix := required.candidate[:deleteCandidatePrefixLen]
+	if puts.Load() != 0 || strings.Contains(err.Error(), deletedName) || strings.Contains(err.Error(), deletedContent) {
+		t.Fatalf("protected error=%q puts=%d", err, puts.Load())
+	}
+	if after := readTestBinding(t, clientDir, worktree); after != before {
+		t.Fatalf("protected deletion changed binding: before=%+v after=%+v", before, after)
+	}
+	pending := readTestPendingPublication(t, clientDir, worktree)
+	if pending.CandidateCommit != required.candidate || pending.DeletionCount != 1 || pending.TrackedCount != 2 ||
+		!pending.RequiresDeleteConfirmation || pending.DeleteConfirmed {
+		t.Fatalf("pending=%+v", pending)
+	}
+	if err := syncTestWorktree(t, clientDir, worktree); !errors.As(err, &required) || required.candidate[:deleteCandidatePrefixLen] != prefix {
+		t.Fatalf("repeat protected error=%v", err)
+	}
+	other := newImportedBinding(t)
+	if err := os.Remove(filepath.Join(other.worktree, "local")); err != nil {
+		t.Fatal(err)
+	}
+	otherErr := syncTestWorktree(t, other.clientDir, other.worktree)
+	var otherRequired *deleteConfirmationRequiredError
+	if !errors.As(otherErr, &otherRequired) {
+		t.Fatalf("other worktree protected error=%v", otherErr)
+	}
+	for _, wrong := range []string{prefix[:11], required.candidate, strings.Repeat("0", deleteCandidatePrefixLen),
+		otherRequired.candidate[:deleteCandidatePrefixLen]} {
+		if err := confirmTestDeletion(t, clientDir, worktree, wrong, libraryClientConfig{}); err == nil {
+			t.Fatalf("confirmation %q succeeded", wrong)
+		}
+		if got := readTestPendingPublication(t, clientDir, worktree); got.CandidateCommit != pending.CandidateCommit || got.DeleteConfirmed {
+			t.Fatalf("wrong confirmation changed pending=%+v", got)
+		}
+	}
+	if err := confirmTestDeletion(t, clientDir, worktree, prefix, libraryClientConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	binding := assertTestConverged(t, environment, clientDir, worktree)
+	if binding.SyncBase != pending.CandidateCommit {
+		t.Fatalf("confirmation rebuilt candidate: got=%s want=%s", binding.SyncBase, pending.CandidateCommit)
+	}
+}
+
+func TestLibrarySyncProtects101DeletionsBelowTenPercent(t *testing.T) {
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	var puts atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			puts.Add(1)
+		}
+		environment.handler.ServeHTTP(w, r)
+	}))
+	defer proxy.Close()
+	clientDir, worktree := newClientPaths(t)
+	for index := 0; index < 1111; index++ {
+		name := fmt.Sprintf("tracked-%04d", index)
+		if err := os.WriteFile(filepath.Join(worktree, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := append(bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testClientDeviceID), "--import-local")
+	if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	before := readTestBinding(t, clientDir, worktree)
+	beforeIndex := countClientRows(t, clientDir, "path_index", worktree)
+	for index := 0; index < 101; index++ {
+		if err := os.Remove(filepath.Join(worktree, fmt.Sprintf("tracked-%04d", index))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	puts.Store(0)
+	err := syncTestWorktree(t, clientDir, worktree)
+	var required *deleteConfirmationRequiredError
+	if !errors.As(err, &required) {
+		t.Fatalf("101 deletion error=%v", err)
+	}
+	pending := readTestPendingPublication(t, clientDir, worktree)
+	if pending.DeletionCount != 101 || pending.TrackedCount != 1111 || !pending.RequiresDeleteConfirmation ||
+		pending.DeleteConfirmed || pending.LegacyRevalidationRequired {
+		t.Fatalf("pending=%+v", pending)
+	}
+	if puts.Load() != 0 || readTestBinding(t, clientDir, worktree) != before ||
+		countClientRows(t, clientDir, "path_index", worktree) != beforeIndex {
+		t.Fatalf("protected state changed puts=%d binding=%+v index=%d", puts.Load(),
+			readTestBinding(t, clientDir, worktree), countClientRows(t, clientDir, "path_index", worktree))
+	}
+	if strings.Contains(err.Error(), "tracked-0000") {
+		t.Fatalf("protected error leaked a path: %v", err)
+	}
+	if err := confirmTestDeletion(t, clientDir, worktree, pending.CandidateCommit[:deleteCandidatePrefixLen], libraryClientConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if binding := assertTestConverged(t, environment, clientDir, worktree); binding.SyncBase != pending.CandidateCommit {
+		t.Fatalf("confirmed candidate=%s binding=%+v", pending.CandidateCommit, binding)
+	}
+}
+
+func TestLibrarySyncProtectedDeletionMutationRequiresNewCandidate(t *testing.T) {
+	state := newImportedBinding(t)
+	if err := os.Remove(filepath.Join(state.worktree, "local")); err != nil {
+		t.Fatal(err)
+	}
+	err := syncTestWorktree(t, state.clientDir, state.worktree)
+	var required *deleteConfirmationRequiredError
+	if !errors.As(err, &required) {
+		t.Fatal(err)
+	}
+	old := required.candidate
+	if err := os.WriteFile(filepath.Join(state.worktree, "changed"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := confirmTestDeletion(t, state.clientDir, state.worktree, old[:deleteCandidatePrefixLen], libraryClientConfig{}); err == nil ||
+		!strings.Contains(err.Error(), "stale candidate discarded") {
+		t.Fatalf("changed confirmation error=%v", err)
+	}
+	if count := countClientRows(t, state.clientDir, "pending_publications", state.worktree); count != 0 {
+		t.Fatalf("stale pending rows=%d", count)
+	}
+	if err := syncTestWorktree(t, state.clientDir, state.worktree); !errors.As(err, &required) || required.candidate == old {
+		t.Fatalf("new candidate error=%v candidate=%+v", err, required)
+	}
+}
+
+func TestLibrarySyncConfirmedDeletionResumesUploadFailure(t *testing.T) {
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	var fail atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && fail.CompareAndSwap(true, false) {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		environment.handler.ServeHTTP(w, r)
+	}))
+	defer proxy.Close()
+	clientDir, worktree := newClientPaths(t)
+	if err := os.WriteFile(filepath.Join(worktree, "delete"), []byte("delete"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := append(bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testClientDeviceID), "--import-local")
+	if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(worktree, "delete")); err != nil {
+		t.Fatal(err)
+	}
+	err := syncTestWorktree(t, clientDir, worktree)
+	var required *deleteConfirmationRequiredError
+	if !errors.As(err, &required) {
+		t.Fatal(err)
+	}
+	candidate := required.candidate
+	fail.Store(true)
+	if err := confirmTestDeletion(t, clientDir, worktree, candidate[:deleteCandidatePrefixLen], libraryClientConfig{}); err == nil {
+		t.Fatal("confirmation upload failure succeeded")
+	}
+	if pending := readTestPendingPublication(t, clientDir, worktree); !pending.DeleteConfirmed || pending.CandidateCommit != candidate {
+		t.Fatalf("confirmed pending=%+v", pending)
+	}
+	if err := syncTestWorktree(t, clientDir, worktree); err != nil {
+		t.Fatal(err)
+	}
+	if binding := assertTestConverged(t, environment, clientDir, worktree); binding.SyncBase != candidate {
+		t.Fatalf("resumed candidate=%s want=%s", binding.SyncBase, candidate)
+	}
+}
+
+func TestLibrarySyncRevalidatesLegacyPendingDeletion(t *testing.T) {
+	state := newImportedBinding(t)
+	if err := os.Remove(filepath.Join(state.worktree, "local")); err != nil {
+		t.Fatal(err)
+	}
+	err := syncTestWorktree(t, state.clientDir, state.worktree)
+	var required *deleteConfirmationRequiredError
+	if !errors.As(err, &required) {
+		t.Fatal(err)
+	}
+	candidate := required.candidate
+	downgradePendingPublicationToV17(t, state.clientDir)
+	err = syncTestWorktree(t, state.clientDir, state.worktree)
+	if !errors.As(err, &required) || required.candidate != candidate {
+		t.Fatalf("legacy revalidation error=%v required=%+v", err, required)
+	}
+	pending := readTestPendingPublication(t, state.clientDir, state.worktree)
+	if pending.CandidateCommit != candidate || pending.DeletionCount != 1 || pending.TrackedCount != 1 ||
+		!pending.RequiresDeleteConfirmation || pending.DeleteConfirmed || pending.LegacyRevalidationRequired {
+		t.Fatalf("revalidated pending=%+v", pending)
+	}
+	if err := confirmTestDeletion(t, state.clientDir, state.worktree, candidate[:deleteCandidatePrefixLen], libraryClientConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if binding := assertTestConverged(t, state.environment, state.clientDir, state.worktree); binding.SyncBase != candidate {
+		t.Fatalf("legacy candidate changed: binding=%+v candidate=%s", binding, candidate)
+	}
+}
+
+func TestLibrarySyncDiscardsMutatedLegacyPendingWithoutAuthorizationReuse(t *testing.T) {
+	state := newImportedBinding(t)
+	if err := os.Remove(filepath.Join(state.worktree, "local")); err != nil {
+		t.Fatal(err)
+	}
+	err := syncTestWorktree(t, state.clientDir, state.worktree)
+	var required *deleteConfirmationRequiredError
+	if !errors.As(err, &required) {
+		t.Fatal(err)
+	}
+	downgradePendingPublicationToV17(t, state.clientDir)
+	if err := os.WriteFile(filepath.Join(state.worktree, "changed"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = confirmTestDeletion(t, state.clientDir, state.worktree, required.candidate[:deleteCandidatePrefixLen], libraryClientConfig{})
+	if err == nil || !strings.Contains(err.Error(), "legacy pending publication") ||
+		countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 {
+		t.Fatalf("mutated legacy confirmation error=%v", err)
+	}
+}
+
+func TestLibrarySyncConfirmDeleteRequiresProtectedPending(t *testing.T) {
+	state := newImportedBinding(t)
+	before := readTestBinding(t, state.clientDir, state.worktree)
+	if err := confirmTestDeletion(t, state.clientDir, state.worktree, strings.Repeat("0", deleteCandidatePrefixLen), libraryClientConfig{}); err == nil ||
+		!strings.Contains(err.Error(), "requires a protected pending") {
+		t.Fatalf("confirmation without pending error=%v", err)
+	}
+	if after := readTestBinding(t, state.clientDir, state.worktree); after != before {
+		t.Fatalf("confirmation without pending changed binding: before=%+v after=%+v", before, after)
+	}
+	if count := countClientRows(t, state.clientDir, "pending_publications", state.worktree); count != 0 {
+		t.Fatalf("pending rows=%d", count)
 	}
 }
 
@@ -293,6 +584,74 @@ func TestLibrarySyncResolvesLostCASResponse(t *testing.T) {
 		t.Fatalf("lost response sync: %v", err)
 	}
 	assertTestConverged(t, environment, clientDir, worktree)
+}
+
+func TestLibrarySyncRecoversPublishedCandidateBeforeDiscardingMutatedWorktree(t *testing.T) {
+	var updates atomic.Int32
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{AfterHeadUpdate: func() error {
+		if updates.Add(1) == 3 {
+			return errors.New("response lost")
+		}
+		return nil
+	}})
+	var published, failedGet atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/head") && published.Load() && failedGet.CompareAndSwap(false, true) {
+			http.Error(w, "unavailable", http.StatusInternalServerError)
+			return
+		}
+		environment.handler.ServeHTTP(w, r)
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/head") && updates.Load() == 3 {
+			published.Store(true)
+		}
+	}))
+	defer proxy.Close()
+	clientDir, worktree := newClientPaths(t)
+	if err := os.WriteFile(filepath.Join(worktree, "base"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := append(bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testClientDeviceID), "--import-local")
+	if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "published"), []byte("candidate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, clientDir, worktree); err == nil {
+		t.Fatal("expected unknown publication result")
+	}
+	pending := readTestPendingPublication(t, clientDir, worktree)
+	if err := os.WriteFile(filepath.Join(worktree, "published"), []byte("local mutation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "after-cas"), []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := syncTestWorktree(t, clientDir, worktree)
+	if err == nil || !strings.Contains(err.Error(), "preserving local changes; rerun sync") {
+		t.Fatalf("published candidate recovery error=%v", err)
+	}
+	binding := readTestBinding(t, clientDir, worktree)
+	if binding.SyncBase != pending.CandidateCommit || binding.SyncBaseRoot != pending.CandidateRoot {
+		t.Fatalf("recovered binding=%+v pending=%+v", binding, pending)
+	}
+	if count := countClientRows(t, clientDir, "pending_publications", worktree); count != 0 {
+		t.Fatalf("pending rows=%d", count)
+	}
+	if count := countClientRows(t, clientDir, "path_index", worktree); count != 2 {
+		t.Fatalf("candidate path index rows=%d", count)
+	}
+	for name, want := range map[string]string{"published": "local mutation", "after-cas": "preserved"} {
+		if data, err := os.ReadFile(filepath.Join(worktree, name)); err != nil || string(data) != want {
+			t.Fatalf("local %s=%q err=%v", name, data, err)
+		}
+	}
+	if err := syncTestWorktree(t, clientDir, worktree); err != nil {
+		t.Fatal(err)
+	}
+	if binding := assertTestConverged(t, environment, clientDir, worktree); binding.SyncBase == pending.CandidateCommit {
+		t.Fatal("next sync did not publish the preserved local changes as a successor")
+	}
 }
 
 func TestLibrarySyncRemoteApplyRejectsLocalSaveBeforeRecovery(t *testing.T) {
@@ -1262,6 +1621,16 @@ func syncTestWorktree(t *testing.T, clientDir, worktree string) error {
 	return runTest(t.Context(), []string{"library", "sync", "--client-dir", clientDir, "--worktree", worktree}, strings.NewReader(""), io.Discard, io.Discard)
 }
 
+func syncTestWorktreeConfirmingDeletes(t *testing.T, clientDir, worktree string) error {
+	t.Helper()
+	err := syncTestWorktree(t, clientDir, worktree)
+	var required *deleteConfirmationRequiredError
+	if !errors.As(err, &required) {
+		return err
+	}
+	return confirmTestDeletion(t, clientDir, worktree, required.candidate[:deleteCandidatePrefixLen], libraryClientConfig{})
+}
+
 func assertTestConverged(t *testing.T, environment libraryCLIEnvironment, clientDir, worktree string) clientBinding {
 	t.Helper()
 	binding := readTestBinding(t, clientDir, worktree)
@@ -1283,16 +1652,36 @@ func assertTestConverged(t *testing.T, environment libraryCLIEnvironment, client
 
 func readPendingCandidate(t *testing.T, clientDir, worktree string) string {
 	t.Helper()
+	return readTestPendingPublication(t, clientDir, worktree).CandidateCommit
+}
+
+func readTestPendingPublication(t *testing.T, clientDir, worktree string) pendingPublication {
+	t.Helper()
 	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var candidate string
-	if err := db.QueryRow("SELECT candidate_commit FROM pending_publications WHERE worktree = ?", worktree).Scan(&candidate); err != nil {
+	pending, err := loadPendingPublication(t.Context(), db, worktree)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return candidate
+	if pending == nil {
+		t.Fatal("pending publication is missing")
+	}
+	return *pending
+}
+
+func confirmTestDeletion(t *testing.T, clientDir, worktree, prefix string, config libraryClientConfig) error {
+	t.Helper()
+	if config.checkFilesystem == nil {
+		config.checkFilesystem = func(*os.File) error { return nil }
+	}
+	if config.now == nil {
+		config.now = time.Now
+	}
+	return runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", clientDir, "--worktree", worktree,
+		"--confirm-delete", prefix}, strings.NewReader(""), io.Discard, io.Discard, config)
 }
 
 func scanTestRoot(t *testing.T, worktree string) string {
@@ -1306,6 +1695,25 @@ func scanTestRoot(t *testing.T, worktree string) string {
 		t.Fatal(err)
 	}
 	return snapshot.root
+}
+
+func downgradePendingPublicationToV17(t *testing.T, clientDir string) {
+	t.Helper()
+	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO new_pending_publications;
+		CREATE TABLE pending_publications (worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL,
+		base_root TEXT NOT NULL, expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL,
+		candidate_root TEXT NOT NULL, candidate_data BLOB NOT NULL);
+		INSERT INTO pending_publications SELECT worktree,base_commit,base_root,expected_etag,candidate_commit,
+			candidate_root,candidate_data FROM new_pending_publications;
+		DROP TABLE new_pending_publications;
+		DELETE FROM client_schema_migrations WHERE version>=18`); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func countClientRows(t *testing.T, clientDir, table, worktree string) int {
