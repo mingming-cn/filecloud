@@ -57,6 +57,31 @@ func (s *Store) putObject(ctx context.Context, ownerUserID, libraryID, kind, obj
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	if _, err := os.Stat(destination); err == nil {
+		written, digest, err := objectDigest(ctx, source, expectedSize)
+		if err != nil {
+			return false, err
+		}
+		if digest != objectID {
+			return false, ErrObjectHashMismatch
+		}
+		matches, err := objectFileMatches(destination, objectID, written)
+		if err != nil {
+			return false, fmt.Errorf("verify existing object: %w", err)
+		}
+		if !matches {
+			return false, ErrObjectConflict
+		}
+		if err := s.syncObjectDirectory(filepath.Dir(destination)); err != nil {
+			return false, fmt.Errorf("sync replayed object directory: %w", err)
+		}
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat existing object: %w", err)
+	}
+	if err := s.reserveUploadBytes(0); err != nil {
+		return false, err
+	}
 
 	parent := filepath.Dir(destination)
 	if err := s.mkdirObjectPath(parent); err != nil {
@@ -94,6 +119,16 @@ func (s *Store) putObject(ctx context.Context, ownerUserID, libraryID, kind, obj
 	if digest := hex.EncodeToString(hash.Sum(nil)); digest != objectID {
 		return false, ErrObjectHashMismatch
 	}
+	releaseBudget, err := s.reserveUploadBudget(ctx, ownerUserID, written)
+	if err != nil {
+		return false, err
+	}
+	published := false
+	defer func() {
+		if !published {
+			retErr = errors.Join(retErr, releaseBudget())
+		}
+	}()
 	if err := temporary.Sync(); err != nil {
 		return false, fmt.Errorf("sync temporary object: %w", err)
 	}
@@ -120,6 +155,7 @@ func (s *Store) putObject(ctx context.Context, ownerUserID, libraryID, kind, obj
 		}
 		return false, nil
 	}
+	published = true
 	if err := s.syncObjectDirectory(parent); err != nil {
 		return false, fmt.Errorf("sync published object directory: %w", err)
 	}
@@ -221,6 +257,25 @@ func (s *Store) releaseObjectPublication(key string, publication *objectPublicat
 		delete(s.objectLocks, key)
 	}
 	s.objectLocksMu.Unlock()
+}
+
+func objectDigest(ctx context.Context, source io.Reader, expectedSize int64) (int64, string, error) {
+	limited := source
+	if expectedSize >= 0 {
+		limited = io.LimitReader(source, expectedSize+1)
+	}
+	hash := sha256.New()
+	written, err := io.Copy(hash, limited)
+	if err != nil {
+		return 0, "", fmt.Errorf("read object: %w", err)
+	}
+	if expectedSize >= 0 && written != expectedSize {
+		return 0, "", io.ErrUnexpectedEOF
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, "", err
+	}
+	return written, hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func objectFileMatches(path, objectID string, size int64) (bool, error) {

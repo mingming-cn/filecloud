@@ -74,6 +74,12 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		globalKDFCapacity := flags.Int("kdf-global-capacity", _defaultGlobalKDFCapacity, "Global concurrent password KDF capacity")
 		sourceIPKDFCapacity := flags.Int("kdf-source-ip-capacity", _defaultSourceIPKDFCapacity, "Concurrent password KDF capacity per direct source IP")
 		usernameKDFCapacity := flags.Int("kdf-username-capacity", _defaultUsernameKDFCapacity, "Concurrent password KDF capacity per canonical username")
+		uploadDefaults := storage.DefaultUploadConfig()
+		uploadGlobalCapacity := flags.Int("upload-global-capacity", uploadDefaults.GlobalConcurrency, "Global concurrent object PUT capacity")
+		uploadUserCapacity := flags.Int("upload-user-capacity", uploadDefaults.UserConcurrency, "Concurrent object PUT capacity per user")
+		uploadReadTimeout := flags.Duration("upload-read-timeout", uploadDefaults.RequestTimeout, "Maximum time to read one object PUT")
+		uploadBudgetBytes := flags.Int64("upload-budget-bytes", uploadDefaults.BudgetBytes, "Object bytes accepted per user upload window")
+		uploadBudgetWindow := flags.Duration("upload-budget-window", uploadDefaults.BudgetWindow, "Rolling object upload accounting window")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -83,11 +89,21 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		if *globalKDFCapacity < 1 || *sourceIPKDFCapacity < 1 || *usernameKDFCapacity < 1 {
 			return errors.New("kdf concurrency limits must be positive")
 		}
+		uploadConfig := storage.UploadConfig{
+			GlobalConcurrency: *uploadGlobalCapacity,
+			UserConcurrency:   *uploadUserCapacity,
+			RequestTimeout:    *uploadReadTimeout,
+			BudgetBytes:       *uploadBudgetBytes,
+			BudgetWindow:      *uploadBudgetWindow,
+		}
+		if uploadConfig.GlobalConcurrency < 1 || uploadConfig.UserConcurrency < 1 || uploadConfig.RequestTimeout <= 0 || uploadConfig.BudgetBytes < 1 || uploadConfig.BudgetWindow <= 0 {
+			return errors.New("upload limits must be positive")
+		}
 		return serve(ctx, *dataDir, *listen, stdout, stderr, auth.HandlerConfig{
 			GlobalKDFLimit:   *globalKDFCapacity,
 			SourceIPKDFLimit: *sourceIPKDFCapacity,
 			UsernameKDFLimit: *usernameKDFCapacity,
-		})
+		}, uploadConfig)
 	case "user":
 		return runUser(ctx, args[1:], stdin, stdout, stderr)
 	case "login":
@@ -308,7 +324,7 @@ func noRedirectClient() *http.Client {
 	}
 }
 
-func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Writer, authConfig auth.HandlerConfig) (retErr error) {
+func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Writer, authConfig auth.HandlerConfig, uploadConfig storage.UploadConfig) (retErr error) {
 	store, err := storage.OpenForServe(ctx, dataDir)
 	if err != nil {
 		return err
@@ -324,7 +340,7 @@ func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Write
 	if err != nil {
 		return errors.Join(err, listener.Close())
 	}
-	libraries, err := libraryapi.NewHandler(store, logger, libraryapi.Config{})
+	libraries, err := libraryapi.NewHandler(store, logger, libraryapi.Config{Upload: uploadConfig})
 	if err != nil {
 		return errors.Join(err, listener.Close())
 	}

@@ -311,6 +311,10 @@ type listEnvelope struct {
 }
 
 func newTestHandler(t *testing.T) (http.Handler, *storage.Store, time.Time) {
+	return newTestHandlerWithConfig(t, Config{})
+}
+
+func newTestHandlerWithConfig(t *testing.T, config Config) (http.Handler, *storage.Store, time.Time) {
 	t.Helper()
 	dataDir := filepath.Join(t.TempDir(), "data")
 	if err := storage.Init(t.Context(), dataDir); err != nil {
@@ -335,9 +339,13 @@ func newTestHandler(t *testing.T) (http.Handler, *storage.Store, time.Time) {
 			t.Fatalf("CreateSession: %v", err)
 		}
 	}
-	handler, err := NewHandler(store, log.New(io.Discard, "", 0), Config{
-		Now: func() time.Time { return now }, PageTokenKey: bytes.Repeat([]byte{7}, 32),
-	})
+	if config.Now == nil {
+		config.Now = func() time.Time { return now }
+	}
+	if config.PageTokenKey == nil {
+		config.PageTokenKey = bytes.Repeat([]byte{7}, 32)
+	}
+	handler, err := NewHandler(store, log.New(io.Discard, "", 0), config)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}

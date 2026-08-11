@@ -57,7 +57,10 @@ func TestServeKDFCapacityFlags(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("serve --help error = %v, want flag.ErrHelp", err)
 	}
-	for _, name := range []string{"kdf-global-capacity", "kdf-source-ip-capacity", "kdf-username-capacity"} {
+	for _, name := range []string{
+		"kdf-global-capacity", "kdf-source-ip-capacity", "kdf-username-capacity",
+		"upload-global-capacity", "upload-user-capacity", "upload-read-timeout", "upload-budget-bytes", "upload-budget-window",
+	} {
 		if !strings.Contains(help.String(), name) {
 			t.Errorf("serve --help missing %s: %q", name, help.String())
 		}
@@ -75,6 +78,18 @@ func TestServeKDFCapacityFlags(t *testing.T) {
 		fullArgs := append([]string{"serve", "--data-dir", dataDir, "--listen", "127.0.0.1:0"}, args...)
 		if err := run(t.Context(), fullArgs, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "kdf concurrency limits must be positive") {
 			t.Errorf("run(%q) error = %v, want invalid KDF capacity", fullArgs, err)
+		}
+	}
+	for _, args := range [][]string{
+		{"--upload-global-capacity", "0"},
+		{"--upload-user-capacity", "-1"},
+		{"--upload-read-timeout", "0s"},
+		{"--upload-budget-bytes", "0"},
+		{"--upload-budget-window", "0s"},
+	} {
+		fullArgs := append([]string{"serve", "--data-dir", dataDir, "--listen", "127.0.0.1:0"}, args...)
+		if err := run(t.Context(), fullArgs, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "upload limits must be positive") {
+			t.Errorf("run(%q) error = %v, want invalid upload limits", fullArgs, err)
 		}
 	}
 

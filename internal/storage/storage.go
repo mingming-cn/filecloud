@@ -74,6 +74,15 @@ func metadataMigrations() []migration {
 			`INSERT INTO published_commits(owner_user_id, library_id, commit_id)
 			 SELECT owner_user_id, id, head_commit_id FROM libraries WHERE head_commit_id IS NOT NULL`,
 		}},
+		{version: 5, statements: []string{
+			`CREATE TABLE upload_charges (
+				id INTEGER PRIMARY KEY NOT NULL,
+				user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+				accepted_at INTEGER NOT NULL,
+				bytes INTEGER NOT NULL CHECK(bytes > 0)
+			)`,
+			`CREATE INDEX upload_charges_window ON upload_charges(user_id, accepted_at)`,
+		}},
 	}
 }
 
@@ -86,6 +95,8 @@ type Store struct {
 	objectLocks         map[string]*objectPublication
 	objectLockQueued    func(string)
 	syncObjectDirectory func(string) error
+	uploadMu            sync.Mutex
+	upload              uploadState
 }
 
 // Init creates a usable data directory and applies all metadata migrations.
@@ -181,6 +192,10 @@ func openForServe(ctx context.Context, dataDir string, migrations []migration) (
 		lock:                lock,
 		objectLocks:         make(map[string]*objectPublication),
 		syncObjectDirectory: syncDirectory,
+		upload: uploadState{
+			config: DefaultUploadConfig(),
+			users:  make(map[string]int),
+		},
 	}, nil
 }
 

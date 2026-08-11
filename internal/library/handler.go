@@ -3,6 +3,7 @@ package library
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -45,6 +46,7 @@ type Config struct {
 	PageTokenKey     []byte
 	BeforeHeadUpdate func() error
 	AfterHeadUpdate  func() error
+	Upload           storage.UploadConfig
 }
 
 type handler struct {
@@ -54,6 +56,7 @@ type handler struct {
 	pageTokenAEAD    cipher.AEAD
 	beforeHeadUpdate func() error
 	afterHeadUpdate  func() error
+	uploadTimeout    time.Duration
 }
 
 // NewHandler constructs authenticated create, list, and get library endpoints.
@@ -76,6 +79,13 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 	if len(config.PageTokenKey) != _pageTokenKeySize {
 		return nil, errors.New("page token key must be 32 bytes")
 	}
+	if config.Upload.Now == nil {
+		config.Upload.Now = config.Now
+	}
+	upload, err := store.ConfigureUpload(config.Upload)
+	if err != nil {
+		return nil, err
+	}
 	block, err := aes.NewCipher(config.PageTokenKey)
 	if err != nil {
 		return nil, fmt.Errorf("create page token cipher: %w", err)
@@ -87,6 +97,7 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 	h := &handler{
 		store: store, logger: logger, now: config.Now, pageTokenAEAD: pageTokenAEAD,
 		beforeHeadUpdate: config.BeforeHeadUpdate, afterHeadUpdate: config.AfterHeadUpdate,
+		uploadTimeout: upload.RequestTimeout,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}", h.create)
@@ -367,6 +378,11 @@ func (h *handler) putMetadataObject(w http.ResponseWriter, r *http.Request) {
 		h.invalid(w)
 		return
 	}
+	r, release, ok := h.admitObjectPut(w, r, owner, libraryID, kind, objectID, 0)
+	if !ok {
+		return
+	}
+	defer release()
 	data, ok := h.readJSONBody(w, r, maximum)
 	if !ok {
 		return
@@ -436,6 +452,11 @@ func (h *handler) putBlock(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusRequestEntityTooLarge, 3005, "block too large")
 		return
 	}
+	r, release, ok := h.admitObjectPut(w, r, owner, libraryID, "blocks", objectID, r.ContentLength)
+	if !ok {
+		return
+	}
+	defer release()
 	created, err := h.store.PutObjectSized(r.Context(), owner, libraryID, "blocks", objectID, r.Body, r.ContentLength)
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		h.invalid(w)
@@ -540,6 +561,43 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request, owner, libra
 	}
 }
 
+func (h *handler) admitObjectPut(w http.ResponseWriter, r *http.Request, owner, libraryID, kind, objectID string, blockSize int64) (*http.Request, func(), bool) {
+	ctx, cancel := context.WithTimeout(r.Context(), h.uploadTimeout)
+	releaseSlot, err := h.store.AcquireObjectUpload(owner)
+	if err != nil {
+		cancel()
+		h.handleUploadError(w, err)
+		return nil, nil, false
+	}
+	if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(h.uploadTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		releaseSlot()
+		cancel()
+		h.internal(w, "set object upload deadline", err)
+		return nil, nil, false
+	}
+	var releaseBytes func()
+	if kind == "blocks" {
+		releaseBytes, err = h.store.ReserveBlockUpload(ctx, owner, libraryID, objectID, blockSize)
+	} else {
+		err = h.store.CheckObjectUpload(ctx, owner, libraryID, kind, objectID)
+	}
+	if err != nil {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+		releaseSlot()
+		cancel()
+		h.handleUploadError(w, err)
+		return nil, nil, false
+	}
+	return r.WithContext(ctx), func() {
+		if releaseBytes != nil {
+			releaseBytes()
+		}
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+		releaseSlot()
+		cancel()
+	}, true
+}
+
 func (h *handler) handlePutError(w http.ResponseWriter, err error) bool {
 	switch {
 	case err == nil:
@@ -548,10 +606,24 @@ func (h *handler) handlePutError(w http.ResponseWriter, err error) bool {
 		h.writeError(w, http.StatusUnprocessableEntity, 3004, "object hash mismatch")
 	case errors.Is(err, storage.ErrObjectConflict):
 		h.writeError(w, http.StatusConflict, 3001, "object conflicts with existing id")
+	case errors.Is(err, storage.ErrUploadRateLimited), errors.Is(err, storage.ErrUploadUnavailable):
+		h.handleUploadError(w, err)
 	default:
 		h.internal(w, "put object", err)
 	}
 	return false
+}
+
+func (h *handler) handleUploadError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, storage.ErrUploadRateLimited):
+		w.Header().Set("Retry-After", "1")
+		h.writeError(w, http.StatusTooManyRequests, 4000, "upload rate limited")
+	case errors.Is(err, storage.ErrUploadUnavailable):
+		h.writeError(w, http.StatusServiceUnavailable, 5001, "upload unavailable")
+	default:
+		h.internal(w, "admit object upload", err)
+	}
 }
 
 func metadataType(kind string) (int64, string, bool) {

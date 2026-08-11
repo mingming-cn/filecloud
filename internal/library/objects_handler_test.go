@@ -12,11 +12,141 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mingming-cn/filecloud/internal/object"
+	"github.com/mingming-cn/filecloud/internal/storage"
 )
+
+func TestObjectPUTRejectsBusyRequestsBeforeReadingBody(t *testing.T) {
+	handler, store, _ := newTestHandlerWithConfig(t, Config{Upload: storage.UploadConfig{
+		GlobalConcurrency: 1, UserConcurrency: 1,
+	}})
+	defer closeStore(t, store)
+	libraryID := "01234567-89ab-4def-8123-456789abcdef"
+	assertStatusCode(t, serve(handler, http.MethodPut, "/v1/libraries/"+libraryID, `{"Name":"upload slots"}`, _ownerToken), 201, 0)
+
+	firstData := []byte("first")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		reader := &blockingReader{data: firstData, started: started, release: release}
+		request := httptest.NewRequest(http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+digestBytes(firstData), reader)
+		request.ContentLength = int64(len(firstData))
+		request.Header.Set("Content-Type", "application/octet-stream")
+		request.Header.Set("Authorization", "Bearer "+_ownerToken)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		firstDone <- response
+	}()
+	<-started
+
+	secondData := []byte("second")
+	secondBody := &observedBody{reader: bytes.NewReader(secondData)}
+	request := httptest.NewRequest(http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+digestBytes(secondData), secondBody)
+	request.ContentLength = int64(len(secondData))
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set("Authorization", "Bearer "+_ownerToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertStatusCode(t, response, http.StatusTooManyRequests, 4000)
+	if response.Header().Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q, want 1", response.Header().Get("Retry-After"))
+	}
+	if secondBody.read {
+		t.Fatal("busy PUT read its body")
+	}
+
+	close(release)
+	assertStatusCode(t, <-firstDone, http.StatusCreated, 0)
+}
+
+func TestObjectPUTRollsBudgetAcrossRestartWithoutChargingReplays(t *testing.T) {
+	now := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	config := Config{Now: func() time.Time { return now }, Upload: storage.UploadConfig{
+		BudgetBytes: 1, BudgetWindow: time.Hour,
+	}}
+	handler, store, _ := newTestHandlerWithConfig(t, config)
+	libraryID := "01234567-89ab-4def-8123-456789abcdef"
+	assertStatusCode(t, serve(handler, http.MethodPut, "/v1/libraries/"+libraryID, `{"Name":"upload budget"}`, _ownerToken), 201, 0)
+
+	first := []byte("a")
+	firstPath := "/v1/libraries/" + libraryID + "/blocks/" + digestBytes(first)
+	assertStatusCode(t, serveBlock(handler, http.MethodPut, firstPath, first, 1, _ownerToken), http.StatusCreated, 0)
+	assertStatusCode(t, serveBlock(handler, http.MethodPut, firstPath, first, 1, _ownerToken), http.StatusOK, 0)
+
+	dataDir := filepath.Dir(store.ObjectsDir())
+	closeStore(t, store)
+	store, err := storage.OpenForServe(t.Context(), dataDir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer closeStore(t, store)
+	handler, err = NewHandler(store, nil, config)
+	if err != nil {
+		t.Fatalf("reopen handler: %v", err)
+	}
+	assertStatusCode(t, serveBlock(handler, http.MethodPut, firstPath, first, 1, _ownerToken), http.StatusOK, 0)
+
+	second := []byte("b")
+	response := serveBlock(handler, http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+digestBytes(second), second, 1, _ownerToken)
+	assertStatusCode(t, response, http.StatusTooManyRequests, 4000)
+	if response.Header().Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q, want 1", response.Header().Get("Retry-After"))
+	}
+	now = now.Add(55 * time.Minute)
+	assertStatusCode(t, serveBlock(handler, http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+digestBytes(second), second, 1, _ownerToken), http.StatusTooManyRequests, 4000)
+	now = now.Add(5 * time.Minute)
+	assertStatusCode(t, serveBlock(handler, http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+digestBytes(second), second, 1, _ownerToken), http.StatusCreated, 0)
+}
+
+func TestBlockPUTReleasesTemporaryReservationAfterFailure(t *testing.T) {
+	free := uint64((1 << 30) + 2)
+	handler, store, _ := newTestHandlerWithConfig(t, Config{Upload: storage.UploadConfig{
+		DiskUsage: func(string) (uint64, uint64, error) { return free, 2 << 30, nil },
+	}})
+	defer closeStore(t, store)
+	libraryID := "01234567-89ab-4def-8123-456789abcdef"
+	assertStatusCode(t, serve(handler, http.MethodPut, "/v1/libraries/"+libraryID, `{"Name":"reservation release"}`, _ownerToken), 201, 0)
+
+	truncated := serveBlock(handler, http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+strings.Repeat("a", 64), []byte("x"), 2, _ownerToken)
+	assertStatusCode(t, truncated, http.StatusBadRequest, 1000)
+	data := []byte("ok")
+	assertStatusCode(t, serveBlock(handler, http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+digestBytes(data), data, 2, _ownerToken), http.StatusCreated, 0)
+}
+
+func TestObjectPUTRejectsLowDiskBeforeReadingBody(t *testing.T) {
+	free := uint64(2 << 30)
+	handler, store, _ := newTestHandlerWithConfig(t, Config{Upload: storage.UploadConfig{
+		DiskUsage: func(string) (uint64, uint64, error) { return free, 2 << 30, nil },
+	}})
+	defer closeStore(t, store)
+	libraryID := "01234567-89ab-4def-8123-456789abcdef"
+	assertStatusCode(t, serve(handler, http.MethodPut, "/v1/libraries/"+libraryID, `{"Name":"disk waterline"}`, _ownerToken), 201, 0)
+
+	data := []byte("a")
+	path := "/v1/libraries/" + libraryID + "/blocks/" + digestBytes(data)
+	assertStatusCode(t, serveBlock(handler, http.MethodPut, path, data, 1, _ownerToken), http.StatusCreated, 0)
+	free = 1 << 30
+	assertStatusCode(t, serveBlock(handler, http.MethodPut, path, data, 1, _ownerToken), http.StatusOK, 0)
+
+	newData := []byte("b")
+	body := &observedBody{reader: bytes.NewReader(newData)}
+	request := httptest.NewRequest(http.MethodPut, "/v1/libraries/"+libraryID+"/blocks/"+digestBytes(newData), body)
+	request.ContentLength = int64(len(newData))
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set("Authorization", "Bearer "+_ownerToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertStatusCode(t, response, http.StatusServiceUnavailable, 5001)
+	if body.read {
+		t.Fatal("low disk PUT read its body")
+	}
+}
 
 func TestMetadataObjectHTTPContract(t *testing.T) {
 	handler, store, _ := newTestHandler(t)
@@ -358,6 +488,36 @@ func TestCheckObjectsReturnsOnlyOwnerLibraryMissingObjects(t *testing.T) {
 	}
 	limitFirst.WriteString(`,{"not":"decoded"}]}`)
 	assertStatusCode(t, serve(handler, http.MethodPost, "/v1/libraries/"+libraryID+"/object-checks", limitFirst.String(), _ownerToken), 413, 3005)
+}
+
+type blockingReader struct {
+	data             []byte
+	started, release chan struct{}
+	read             bool
+}
+
+func (reader *blockingReader) Read(buffer []byte) (int, error) {
+	if !reader.read {
+		reader.read = true
+		close(reader.started)
+		<-reader.release
+	}
+	if len(reader.data) == 0 {
+		return 0, io.EOF
+	}
+	count := copy(buffer, reader.data)
+	reader.data = reader.data[count:]
+	return count, nil
+}
+
+type observedBody struct {
+	reader io.Reader
+	read   bool
+}
+
+func (reader *observedBody) Read(buffer []byte) (int, error) {
+	reader.read = true
+	return reader.reader.Read(buffer)
 }
 
 func serveBlock(handler http.Handler, method, path string, body []byte, contentLength int64, token string) *httptest.ResponseRecorder {
