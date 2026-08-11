@@ -21,6 +21,74 @@ import (
 
 const _headLibraryID = "01234567-89ab-4def-8123-456789abcdef"
 
+func TestHeadValidationAdmissionBoundsConcurrentWork(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		globalCapacity   int
+		occupiedLibrary  string
+		requestedLibrary string
+	}{
+		{name: "same library", globalCapacity: 2, occupiedLibrary: _headLibraryID, requestedLibrary: _headLibraryID},
+		{name: "global pool", globalCapacity: 1, occupiedLibrary: _headLibraryID, requestedLibrary: "00000000-0000-4000-8000-000000000001"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			limiter, err := newHeadValidationLimiter(test.globalCapacity)
+			if err != nil {
+				t.Fatalf("newHeadValidationLimiter: %v", err)
+			}
+			handler, store, _ := newTestHandlerWithConfig(t, Config{
+				HeadValidation: HeadValidationConfig{GlobalConcurrency: test.globalCapacity},
+				headLimiter:    limiter,
+			})
+			defer closeStore(t, store)
+			createHeadLibrary(t, handler)
+			if test.requestedLibrary != _headLibraryID {
+				assertStatusCode(t, serve(handler, http.MethodPut, "/v1/libraries/"+test.requestedLibrary, `{"Name":"other"}`, _ownerToken), http.StatusCreated, 0)
+			}
+
+			release, ok := limiter.tryAcquire(_ownerID, test.occupiedLibrary)
+			if !ok {
+				t.Fatal("failed to occupy Head validation slot")
+			}
+			response := headRequest(handler, http.MethodPut, "/v1/libraries/"+test.requestedLibrary+"/head", `{"CommitId":"`+strings.Repeat("a", 64)+`"}`, `"head-version-0"`, "")
+			assertStatusCode(t, response, http.StatusTooManyRequests, 4000)
+			if response.Header().Get("Retry-After") != "1" {
+				t.Fatalf("Retry-After = %q, want 1", response.Header().Get("Retry-After"))
+			}
+			release()
+
+			secondRelease, ok := limiter.tryAcquire(_ownerID, test.requestedLibrary)
+			if !ok {
+				t.Fatal("Head validation slot was not released")
+			}
+			secondRelease()
+		})
+	}
+}
+
+func TestHeadValidationDeadlineReleasesWorkPool(t *testing.T) {
+	limiter, err := newHeadValidationLimiter(1)
+	if err != nil {
+		t.Fatalf("newHeadValidationLimiter: %v", err)
+	}
+	handler, store, _ := newTestHandlerWithConfig(t, Config{
+		HeadValidation: HeadValidationConfig{GlobalConcurrency: 1, RequestTimeout: time.Nanosecond},
+		headLimiter:    limiter,
+	})
+	defer closeStore(t, store)
+	createHeadLibrary(t, handler)
+	root := putMetadata(t, store, "directories", `{"Entries":[],"Type":"Directory","Version":1}`)
+	candidate := putCommit(t, store, _ownerID, nil, root)
+
+	publishHead(t, handler, candidate, `"head-version-0"`, http.StatusServiceUnavailable, 5001)
+	assertCurrentHead(t, handler, "", `"head-version-0"`)
+	release, ok := limiter.tryAcquire(_ownerID, _headLibraryID)
+	if !ok {
+		t.Fatal("timed-out Head validation retained its work-pool slot")
+	}
+	release()
+}
+
 func TestHeadHTTPPreconditionsAndConditionalGet(t *testing.T) {
 	handler, store, _ := newTestHandler(t)
 	defer closeStore(t, store)
@@ -75,6 +143,108 @@ func TestHeadHTTPPreconditionsAndConditionalGet(t *testing.T) {
 	assertStatusCode(t, missing, 404, 2000)
 	if foreign.Body.String() != missing.Body.String() {
 		t.Fatalf("foreign and missing Head responses differ: %q vs %q", foreign.Body.String(), missing.Body.String())
+	}
+}
+
+func TestHeadValidationSharesDeduplicatedObjectBudgetAcrossRoots(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		uniqueRoot bool
+		status     int
+		code       int
+	}{
+		{name: "shared root stays within budget", status: http.StatusOK},
+		{name: "unique second-parent root exceeds budget", uniqueRoot: true, status: http.StatusRequestEntityTooLarge, code: 3005},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler, store, _ := newTestHandlerWithConfig(t, Config{HeadValidation: HeadValidationConfig{MaxValidatedObjects: 3}})
+			defer closeStore(t, store)
+			createHeadLibrary(t, handler)
+			root := putMetadata(t, store, "directories", `{"Entries":[],"Type":"Directory","Version":1}`)
+			base := putCommit(t, store, _ownerID, nil, root)
+			publishHead(t, handler, base, `"head-version-0"`, http.StatusOK, 0)
+
+			branchRoot := root
+			if test.uniqueRoot {
+				branchRoot = putMetadata(t, store, "directories", `{"Entries":[{"Id":"`+root+`","ModifiedAt":"2026-08-09T00:00:00Z","Name":"child","Type":"Directory"}],"Type":"Directory","Version":1}`)
+			}
+			branch := putCommit(t, store, _ownerID, []string{base}, branchRoot)
+			merge := putCommit(t, store, _ownerID, []string{base, branch}, root)
+			publishHead(t, handler, merge, `"head-version-1"`, test.status, test.code)
+			if test.status == http.StatusOK {
+				assertCurrentHead(t, handler, merge, `"head-version-2"`)
+			} else {
+				assertCurrentHead(t, handler, base, `"head-version-1"`)
+			}
+		})
+	}
+}
+
+func TestHeadValidationCommitBudgetBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		config      HeadValidationConfig
+		branchDepth int
+		status      int
+		code        int
+	}{
+		{name: "introduced Commit boundary accepted", config: HeadValidationConfig{MaxIntroducedCommits: 2}, branchDepth: 2, status: http.StatusOK},
+		{name: "introduced Commit over boundary rejected", config: HeadValidationConfig{MaxIntroducedCommits: 2}, branchDepth: 3, status: http.StatusRequestEntityTooLarge, code: 3005},
+		{name: "parent depth boundary accepted", config: HeadValidationConfig{MaxCommitDepth: 2}, branchDepth: 2, status: http.StatusOK},
+		{name: "parent depth over boundary rejected", config: HeadValidationConfig{MaxCommitDepth: 2}, branchDepth: 3, status: http.StatusRequestEntityTooLarge, code: 3005},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler, store, _ := newTestHandlerWithConfig(t, Config{HeadValidation: test.config})
+			defer closeStore(t, store)
+			createHeadLibrary(t, handler)
+			root := putMetadata(t, store, "directories", `{"Entries":[],"Type":"Directory","Version":1}`)
+			base := putCommit(t, store, _ownerID, nil, root)
+			publishHead(t, handler, base, `"head-version-0"`, http.StatusOK, 0)
+
+			branch := base
+			for range test.branchDepth {
+				branch = putCommit(t, store, _ownerID, []string{branch}, root)
+			}
+			merge := putCommit(t, store, _ownerID, []string{base, branch}, root)
+			publishHead(t, handler, merge, `"head-version-1"`, test.status, test.code)
+			if test.status == http.StatusOK {
+				assertCurrentHead(t, handler, merge, `"head-version-2"`)
+			} else {
+				assertCurrentHead(t, handler, base, `"head-version-1"`)
+			}
+		})
+	}
+}
+
+func TestHeadValidationConfiguredSnapshotDepthPreservesOldHead(t *testing.T) {
+	handler, store, _ := newTestHandlerWithConfig(t, Config{HeadValidation: HeadValidationConfig{MaxSnapshotDepth: 1}})
+	defer closeStore(t, store)
+	createHeadLibrary(t, handler)
+	empty := putMetadata(t, store, "directories", `{"Entries":[],"Type":"Directory","Version":1}`)
+	root := putMetadata(t, store, "directories", `{"Entries":[{"Id":"`+empty+`","ModifiedAt":"2026-08-09T00:00:00Z","Name":"child","Type":"Directory"}],"Type":"Directory","Version":1}`)
+	candidate := putCommit(t, store, _ownerID, nil, root)
+
+	publishHead(t, handler, candidate, `"head-version-0"`, http.StatusBadRequest, 1000)
+	assertCurrentHead(t, handler, "", `"head-version-0"`)
+}
+
+func TestDefaultHeadValidationProtocolBudgets(t *testing.T) {
+	config := DefaultHeadValidationConfig()
+	if config.MaxSnapshotDepth != 256 || config.MaxTraversalContexts != 65_536 || config.MaxCommitDepth != 1024 ||
+		config.MaxIntroducedCommits != 1024 || config.MaxValidatedObjects != 2_000_000 {
+		t.Fatalf("DefaultHeadValidationConfig() = %+v, want protocol depth and work budgets", config)
+	}
+
+	for _, invalid := range []HeadValidationConfig{
+		{MaxSnapshotDepth: config.MaxSnapshotDepth + 1},
+		{MaxTraversalContexts: config.MaxTraversalContexts + 1},
+		{MaxCommitDepth: config.MaxCommitDepth + 1},
+		{MaxIntroducedCommits: config.MaxIntroducedCommits + 1},
+		{MaxValidatedObjects: config.MaxValidatedObjects + 1},
+	} {
+		if _, err := normalizeHeadValidationConfig(invalid); err == nil || !strings.Contains(err.Error(), "exceed protocol maximum") {
+			t.Fatalf("normalizeHeadValidationConfig(%+v) error = %v, want protocol maximum error", invalid, err)
+		}
 	}
 }
 

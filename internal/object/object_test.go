@@ -88,6 +88,24 @@ func TestCanonicalMetadataRejectsInvalidInput(t *testing.T) {
 func TestCanonicalMetadataRejectsCollectionPastLimit(t *testing.T) {
 	validID := strings.Repeat("a", 64)
 
+	oversizedFile := `{"Size":"1099511627777","Blocks":[{"not":"decoded"`
+	if _, _, err := object.Canonicalize("files", []byte(oversizedFile)); !errors.Is(err, object.ErrPayloadTooLarge) {
+		t.Fatalf("oversized File size error = %v, want ErrPayloadTooLarge", err)
+	}
+
+	var blocksFirst strings.Builder
+	blocksFirst.WriteString(`{"Blocks":[`)
+	for i := range 262144 {
+		if i > 0 {
+			blocksFirst.WriteByte(',')
+		}
+		fmt.Fprintf(&blocksFirst, "%q", validID)
+	}
+	blocksFirst.WriteString(`],"Size":"1099511627777","Type":{"not":"decoded"`)
+	if _, _, err := object.Canonicalize("files", []byte(blocksFirst.String())); !errors.Is(err, object.ErrPayloadTooLarge) {
+		t.Fatalf("blocks-first oversized File error = %v, want ErrPayloadTooLarge", err)
+	}
+
 	var file strings.Builder
 	file.WriteString(`{"Blocks":[`)
 	for i := 0; i < 262144; i++ {
@@ -146,6 +164,19 @@ func TestMetadataJSONNestingBudget(t *testing.T) {
 			overLimit := test.prefix + strings.Repeat("[", test.boundaryContainers+1) + `not-json`
 			if _, _, err := object.Canonicalize(test.kind, []byte(overLimit)); !errors.Is(err, object.ErrPayloadTooLarge) {
 				t.Fatalf("nesting over limit error = %v, want ErrPayloadTooLarge", err)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name, input string
+	}{
+		{name: "unknown File field rejects before value", input: `{"Extra":` + strings.Repeat("[", 256) + `not-json`},
+		{name: "duplicate File field rejects before value", input: `{"Type":"File","Type":` + strings.Repeat("[", 256) + `not-json`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := object.Canonicalize("files", []byte(test.input)); err == nil || errors.Is(err, object.ErrPayloadTooLarge) {
+				t.Fatalf("Canonicalize error = %v, want ordinary field validation error", err)
 			}
 		})
 	}

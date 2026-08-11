@@ -47,6 +47,8 @@ type Config struct {
 	BeforeHeadUpdate func() error
 	AfterHeadUpdate  func() error
 	Upload           storage.UploadConfig
+	HeadValidation   HeadValidationConfig
+	headLimiter      *headValidationLimiter
 }
 
 type handler struct {
@@ -57,6 +59,8 @@ type handler struct {
 	beforeHeadUpdate func() error
 	afterHeadUpdate  func() error
 	uploadTimeout    time.Duration
+	headValidation   HeadValidationConfig
+	headLimiter      *headValidationLimiter
 }
 
 // NewHandler constructs authenticated create, list, and get library endpoints.
@@ -86,6 +90,16 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 	if err != nil {
 		return nil, err
 	}
+	headValidation, err := normalizeHeadValidationConfig(config.HeadValidation)
+	if err != nil {
+		return nil, err
+	}
+	if config.headLimiter == nil {
+		config.headLimiter, err = newHeadValidationLimiter(headValidation.GlobalConcurrency)
+		if err != nil {
+			return nil, err
+		}
+	}
 	block, err := aes.NewCipher(config.PageTokenKey)
 	if err != nil {
 		return nil, fmt.Errorf("create page token cipher: %w", err)
@@ -95,9 +109,15 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 		return nil, fmt.Errorf("create page token aead: %w", err)
 	}
 	h := &handler{
-		store: store, logger: logger, now: config.Now, pageTokenAEAD: pageTokenAEAD,
-		beforeHeadUpdate: config.BeforeHeadUpdate, afterHeadUpdate: config.AfterHeadUpdate,
-		uploadTimeout: upload.RequestTimeout,
+		store:            store,
+		logger:           logger,
+		now:              config.Now,
+		pageTokenAEAD:    pageTokenAEAD,
+		beforeHeadUpdate: config.BeforeHeadUpdate,
+		afterHeadUpdate:  config.AfterHeadUpdate,
+		uploadTimeout:    upload.RequestTimeout,
+		headValidation:   headValidation,
+		headLimiter:      config.headLimiter,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}", h.create)

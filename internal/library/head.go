@@ -2,6 +2,7 @@ package library
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -86,7 +87,13 @@ func (h *handler) updateHead(w http.ResponseWriter, r *http.Request) {
 		h.invalid(w)
 		return
 	}
-	missing, introduced, err := h.validateCandidate(r, owner, libraryID, current.HeadCommitID, commitID)
+	validationRequest, releaseValidation, ok := h.admitHeadValidation(w, r, owner, libraryID)
+	if !ok {
+		return
+	}
+	defer releaseValidation()
+	missing, introduced, err := h.validateCandidate(validationRequest, owner, libraryID, current.HeadCommitID, commitID)
+	releaseValidation()
 	switch {
 	case errors.Is(err, object.ErrPayloadTooLarge):
 		h.writeError(w, http.StatusRequestEntityTooLarge, 3005, "snapshot too large")
@@ -96,6 +103,9 @@ func (h *handler) updateHead(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, errCorruptObject):
 		h.writeError(w, http.StatusUnprocessableEntity, 3004, "object validation failed")
+		return
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		h.writeError(w, http.StatusServiceUnavailable, 5001, "head validation unavailable")
 		return
 	case err != nil:
 		h.internal(w, "validate library head", err)
@@ -292,6 +302,9 @@ type commitWork struct {
 }
 
 func (h *handler) validateCandidate(r *http.Request, owner, libraryID string, currentHead *string, commitID string) (missingObjects, []string, error) {
+	if err := r.Context().Err(); err != nil {
+		return missingObjects{}, nil, err
+	}
 	state := validationState{
 		h: h, r: r, owner: owner, libraryID: libraryID,
 		missing: missingObjects{seen: make(map[string]struct{})},
@@ -316,9 +329,12 @@ func (h *handler) validateCandidate(r *http.Request, owner, libraryID string, cu
 	queue := []commitWork{{id: commit.Parents[1], depth: 1}}
 	seenDepth := make(map[string]int)
 	introducedSet := make(map[string]struct{})
-	introduced := make([]string, 0, _maxIntroducedCommits)
+	introduced := make([]string, 0, state.h.headValidation.MaxIntroducedCommits)
 	commitContexts := 1
 	for len(queue) > 0 {
+		if err := state.r.Context().Err(); err != nil {
+			return state.missing, nil, err
+		}
 		work := queue[0]
 		queue = queue[1:]
 		if seenDepth[work.id] >= work.depth {
@@ -335,7 +351,7 @@ func (h *handler) validateCandidate(r *http.Request, owner, libraryID string, cu
 			}
 			continue
 		}
-		if work.depth > _maxCommitDepth {
+		if work.depth > state.h.headValidation.MaxCommitDepth {
 			return state.missing, nil, object.ErrPayloadTooLarge
 		}
 		value, found, err := state.loadCommit(work.id)
@@ -349,7 +365,7 @@ func (h *handler) validateCandidate(r *http.Request, owner, libraryID string, cu
 			return state.missing, nil, errInvalidSnapshot
 		}
 		if _, exists := introducedSet[work.id]; !exists {
-			if len(introduced) == _maxIntroducedCommits {
+			if len(introduced) == state.h.headValidation.MaxIntroducedCommits {
 				return state.missing, nil, object.ErrPayloadTooLarge
 			}
 			introducedSet[work.id] = struct{}{}
@@ -359,7 +375,7 @@ func (h *handler) validateCandidate(r *http.Request, owner, libraryID string, cu
 			}
 		}
 		for _, parent := range value.Parents {
-			if commitContexts == _maxSnapshotContexts {
+			if commitContexts == state.h.headValidation.MaxTraversalContexts {
 				return state.missing, nil, object.ErrPayloadTooLarge
 			}
 			commitContexts++
@@ -410,6 +426,9 @@ func (state *validationState) validateRoot(root string) error {
 	rootPath := &directoryPath{id: root}
 	queue := []directoryWork{{id: root, depth: 1, ancestor: rootPath}}
 	for len(queue) > 0 {
+		if err := state.r.Context().Err(); err != nil {
+			return err
+		}
 		work := queue[0]
 		queue = queue[1:]
 		directory, found, err := state.loadDirectory(work.id)
@@ -424,7 +443,7 @@ func (state *validationState) validateRoot(root string) error {
 			if work.path != "" {
 				pathBytes += len(work.path) + 1
 			}
-			if pathBytes > _maxSnapshotPathBytes || work.depth == _maxSnapshotDepth {
+			if pathBytes > _maxSnapshotPathBytes || work.depth == state.h.headValidation.MaxSnapshotDepth {
 				return errInvalidSnapshot
 			}
 			switch entry.Type {
@@ -466,7 +485,10 @@ func hasDirectoryAncestor(path *directoryPath, id string) bool {
 }
 
 func (state *validationState) addContext() error {
-	if state.contexts == _maxSnapshotContexts {
+	if err := state.r.Context().Err(); err != nil {
+		return err
+	}
+	if state.contexts == state.h.headValidation.MaxTraversalContexts {
 		return object.ErrPayloadTooLarge
 	}
 	state.contexts++
@@ -474,11 +496,14 @@ func (state *validationState) addContext() error {
 }
 
 func (state *validationState) plan(kind, id string) error {
+	if err := state.r.Context().Err(); err != nil {
+		return err
+	}
 	key := kind + "/" + id
 	if _, exists := state.planned[key]; exists {
 		return nil
 	}
-	if len(state.planned) == _maxValidatedObjects {
+	if len(state.planned) == state.h.headValidation.MaxValidatedObjects {
 		return object.ErrPayloadTooLarge
 	}
 	state.planned[key] = struct{}{}
@@ -545,7 +570,7 @@ func (state *validationState) validateFile(fileID string) error {
 				return err
 			}
 			hash := sha256.New()
-			_, copyErr := io.Copy(hash, reader)
+			_, copyErr := io.Copy(hash, contextReader{ctx: state.r.Context(), reader: reader})
 			closeErr := reader.Close()
 			if copyErr != nil || closeErr != nil {
 				return errors.Join(copyErr, closeErr)
@@ -583,7 +608,7 @@ func (h *handler) readMetadata(r *http.Request, owner, libraryID, kind, id strin
 	if size > maximum {
 		return nil, false, errCorruptObject
 	}
-	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	data, err := io.ReadAll(io.LimitReader(contextReader{ctx: r.Context(), reader: file}, maximum+1))
 	if err != nil {
 		return nil, false, fmt.Errorf("read persisted object: %w", err)
 	}
@@ -591,6 +616,24 @@ func (h *handler) readMetadata(r *http.Request, owner, libraryID, kind, id strin
 		return nil, false, errCorruptObject
 	}
 	return data, true, nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	count, err := r.reader.Read(buffer)
+	if err == nil {
+		if contextErr := r.ctx.Err(); contextErr != nil {
+			return count, contextErr
+		}
+	}
+	return count, err
 }
 
 func (missing *missingObjects) add(id string) {

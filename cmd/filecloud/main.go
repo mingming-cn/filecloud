@@ -80,6 +80,14 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		uploadReadTimeout := flags.Duration("upload-read-timeout", uploadDefaults.RequestTimeout, "Maximum time to read one object PUT")
 		uploadBudgetBytes := flags.Int64("upload-budget-bytes", uploadDefaults.BudgetBytes, "Object bytes accepted per user upload window")
 		uploadBudgetWindow := flags.Duration("upload-budget-window", uploadDefaults.BudgetWindow, "Rolling object upload accounting window")
+		headDefaults := libraryapi.DefaultHeadValidationConfig()
+		headGlobalCapacity := flags.Int("head-global-capacity", headDefaults.GlobalConcurrency, "Global concurrent Head validation capacity")
+		headValidationTimeout := flags.Duration("head-validation-timeout", headDefaults.RequestTimeout, "Maximum time for one Head validation")
+		headMaxSnapshotDepth := flags.Int("head-max-snapshot-depth", headDefaults.MaxSnapshotDepth, "Maximum Head snapshot tree depth")
+		headMaxTraversalContexts := flags.Int("head-max-traversal-contexts", headDefaults.MaxTraversalContexts, "Maximum Head graph traversal contexts")
+		headMaxParentDepth := flags.Int("head-max-parent-depth", headDefaults.MaxCommitDepth, "Maximum second-parent traversal depth")
+		headMaxIntroducedCommits := flags.Int("head-max-introduced-commits", headDefaults.MaxIntroducedCommits, "Maximum commits introduced by a Head update")
+		headMaxValidatedObjects := flags.Int("head-max-validated-objects", headDefaults.MaxValidatedObjects, "Maximum deduplicated objects validated by a Head update")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -99,11 +107,24 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		if uploadConfig.GlobalConcurrency < 1 || uploadConfig.UserConcurrency < 1 || uploadConfig.RequestTimeout <= 0 || uploadConfig.BudgetBytes < 1 || uploadConfig.BudgetWindow <= 0 {
 			return errors.New("upload limits must be positive")
 		}
+		headConfig := libraryapi.HeadValidationConfig{
+			GlobalConcurrency:    *headGlobalCapacity,
+			RequestTimeout:       *headValidationTimeout,
+			MaxSnapshotDepth:     *headMaxSnapshotDepth,
+			MaxTraversalContexts: *headMaxTraversalContexts,
+			MaxCommitDepth:       *headMaxParentDepth,
+			MaxIntroducedCommits: *headMaxIntroducedCommits,
+			MaxValidatedObjects:  *headMaxValidatedObjects,
+		}
+		if headConfig.GlobalConcurrency < 1 || headConfig.RequestTimeout <= 0 || headConfig.MaxSnapshotDepth < 1 ||
+			headConfig.MaxTraversalContexts < 1 || headConfig.MaxCommitDepth < 1 || headConfig.MaxIntroducedCommits < 1 || headConfig.MaxValidatedObjects < 1 {
+			return errors.New("head validation limits must be positive")
+		}
 		return serve(ctx, *dataDir, *listen, stdout, stderr, auth.HandlerConfig{
 			GlobalKDFLimit:   *globalKDFCapacity,
 			SourceIPKDFLimit: *sourceIPKDFCapacity,
 			UsernameKDFLimit: *usernameKDFCapacity,
-		}, uploadConfig)
+		}, uploadConfig, headConfig)
 	case "user":
 		return runUser(ctx, args[1:], stdin, stdout, stderr)
 	case "login":
@@ -324,7 +345,7 @@ func noRedirectClient() *http.Client {
 	}
 }
 
-func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Writer, authConfig auth.HandlerConfig, uploadConfig storage.UploadConfig) (retErr error) {
+func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Writer, authConfig auth.HandlerConfig, uploadConfig storage.UploadConfig, headConfig libraryapi.HeadValidationConfig) (retErr error) {
 	store, err := storage.OpenForServe(ctx, dataDir)
 	if err != nil {
 		return err
@@ -340,7 +361,7 @@ func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Write
 	if err != nil {
 		return errors.Join(err, listener.Close())
 	}
-	libraries, err := libraryapi.NewHandler(store, logger, libraryapi.Config{Upload: uploadConfig})
+	libraries, err := libraryapi.NewHandler(store, logger, libraryapi.Config{Upload: uploadConfig, HeadValidation: headConfig})
 	if err != nil {
 		return errors.Join(err, listener.Close())
 	}

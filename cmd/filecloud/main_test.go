@@ -51,7 +51,7 @@ func TestDefaultListenIsLoopback(t *testing.T) {
 	}
 }
 
-func TestServeKDFCapacityFlags(t *testing.T) {
+func TestServeResourceLimitFlags(t *testing.T) {
 	var help bytes.Buffer
 	err := run(t.Context(), []string{"serve", "--help"}, strings.NewReader(""), io.Discard, &help)
 	if !errors.Is(err, flag.ErrHelp) {
@@ -60,6 +60,8 @@ func TestServeKDFCapacityFlags(t *testing.T) {
 	for _, name := range []string{
 		"kdf-global-capacity", "kdf-source-ip-capacity", "kdf-username-capacity",
 		"upload-global-capacity", "upload-user-capacity", "upload-read-timeout", "upload-budget-bytes", "upload-budget-window",
+		"head-global-capacity", "head-validation-timeout", "head-max-snapshot-depth", "head-max-traversal-contexts",
+		"head-max-parent-depth", "head-max-introduced-commits", "head-max-validated-objects",
 	} {
 		if !strings.Contains(help.String(), name) {
 			t.Errorf("serve --help missing %s: %q", name, help.String())
@@ -81,6 +83,20 @@ func TestServeKDFCapacityFlags(t *testing.T) {
 		}
 	}
 	for _, args := range [][]string{
+		{"--head-global-capacity", "0"},
+		{"--head-validation-timeout", "0s"},
+		{"--head-max-snapshot-depth", "-1"},
+		{"--head-max-traversal-contexts", "0"},
+		{"--head-max-parent-depth", "0"},
+		{"--head-max-introduced-commits", "0"},
+		{"--head-max-validated-objects", "0"},
+	} {
+		fullArgs := append([]string{"serve", "--data-dir", dataDir, "--listen", "127.0.0.1:0"}, args...)
+		if err := run(t.Context(), fullArgs, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "head validation limits must be positive") {
+			t.Errorf("run(%q) error = %v, want invalid Head validation limits", fullArgs, err)
+		}
+	}
+	for _, args := range [][]string{
 		{"--upload-global-capacity", "0"},
 		{"--upload-user-capacity", "-1"},
 		{"--upload-read-timeout", "0s"},
@@ -97,6 +113,9 @@ func TestServeKDFCapacityFlags(t *testing.T) {
 	command := startCommand(t, []string{
 		"serve", "--data-dir", dataDir, "--listen", "127.0.0.1:0",
 		"--kdf-global-capacity", "3", "--kdf-source-ip-capacity", "2", "--kdf-username-capacity", "2",
+		"--head-global-capacity", "3", "--head-validation-timeout", "30s", "--head-max-snapshot-depth", "128",
+		"--head-max-traversal-contexts", "1024", "--head-max-parent-depth", "128",
+		"--head-max-introduced-commits", "128", "--head-max-validated-objects", "10000",
 	}, addressOutput, io.Discard)
 	select {
 	case <-addressOutput.lines:

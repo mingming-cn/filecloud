@@ -79,6 +79,9 @@ type fileObject struct {
 }
 
 func decodeFile(data []byte) (fileObject, error) {
+	if err := checkFileBudgets(data); err != nil {
+		return fileObject{}, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	if err := decodeJSONContainer(decoder, json.Delim('{'), 1, "file object"); err != nil {
@@ -144,6 +147,69 @@ func decodeFile(data []byte) (fileObject, error) {
 		return fileObject{}, errors.New("trailing JSON data")
 	}
 	return value, nil
+}
+
+func checkFileBudgets(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decodeJSONContainer(decoder, json.Delim('{'), 1, "file object"); err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, 4)
+	for decoder.More() {
+		fieldToken, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("decode file budget field: %w", err)
+		}
+		field, ok := fieldToken.(string)
+		if !ok {
+			return errors.New("file field is not a string")
+		}
+		if _, exists := seen[field]; exists {
+			return errors.New("duplicate file field")
+		}
+		seen[field] = struct{}{}
+		switch field {
+		case "Blocks":
+			if err := decodeJSONContainer(decoder, json.Delim('['), 2, "file blocks"); err != nil {
+				return err
+			}
+			count := 0
+			for decoder.More() {
+				if count == _maxBlocks {
+					return ErrPayloadTooLarge
+				}
+				if _, err := decodeJSONString(decoder, "block id", 3); err != nil {
+					return err
+				}
+				count++
+			}
+			if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
+				return errors.New("invalid file blocks")
+			}
+		case "Size":
+			size, err := decodeJSONString(decoder, "file size", 2)
+			if err != nil {
+				return err
+			}
+			if _, err := parseDecimal(size, _maxFileSize); err != nil {
+				return err
+			}
+		case "Type", "Version":
+			if err := consumeJSONValue(decoder, 2); err != nil {
+				return err
+			}
+		default:
+			return errors.New("unknown file field")
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		return errors.New("invalid file object")
+	}
+	if token, err := decoder.Token(); !errors.Is(err, io.EOF) || token != nil {
+		return errors.New("trailing JSON data")
+	}
+	return nil
 }
 
 func canonicalFile(data []byte) ([]byte, error) {
@@ -530,6 +596,17 @@ func decodeCommitParents(decoder *json.Decoder) ([]string, error) {
 		return nil, errors.New("invalid commit Parents")
 	}
 	return parents, nil
+}
+
+func consumeJSONValue(decoder *json.Decoder, depth int) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("decode JSON value: %w", err)
+	}
+	if delim, ok := token.(json.Delim); ok {
+		return consumeJSONContainer(decoder, delim, depth)
+	}
+	return nil
 }
 
 func consumeJSONContainer(decoder *json.Decoder, open json.Delim, depth int) error {
