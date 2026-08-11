@@ -1,8 +1,5 @@
 {
   "mcpServers": {
-    "serena": {
-      "disabled": false
-    },
     "codegraph": {
       "disabled": false
     }
