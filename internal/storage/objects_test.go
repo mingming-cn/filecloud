@@ -444,11 +444,11 @@ const (
 
 func newObjectPublicationCrashStore(t *testing.T) (string, string, string) {
 	t.Helper()
-	root := os.Getenv("FILECLOUD_ISSUE22_EXT4_ROOT")
+	root := os.Getenv("FILECLOUD_LINUX_EXT4_ROOT")
 	if root == "" {
 		root = "."
 	}
-	dataDir, err := os.MkdirTemp(root, ".issue22-object-store-")
+	dataDir, err := os.MkdirTemp(root, ".linux-ext4-object-store-")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -704,11 +704,11 @@ func TestHeadUpdateCrashHelper(t *testing.T) {
 
 func newHeadCrashFixture(t *testing.T) (string, string, string) {
 	t.Helper()
-	root := os.Getenv("FILECLOUD_ISSUE22_EXT4_ROOT")
+	root := os.Getenv("FILECLOUD_LINUX_EXT4_ROOT")
 	if root == "" {
 		root = t.TempDir()
 	}
-	dataDir, err := os.MkdirTemp(root, ".issue22-head-store-")
+	dataDir, err := os.MkdirTemp(root, ".linux-ext4-head-store-")
 	if err != nil {
 		t.Fatal(err)
 	}

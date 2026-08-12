@@ -23,14 +23,14 @@ import (
 	"github.com/mingming-cn/filecloud/internal/storage"
 )
 
-func TestIssue22LinuxExt4AcceptanceMatrix(t *testing.T) {
-	if os.Getenv("FILECLOUD_ISSUE22_MATRIX_CHILD") == "1" {
-		t.Skip("issue #22 child suite does not recurse")
+func TestLinuxExt4AcceptanceMatrix(t *testing.T) {
+	if os.Getenv("FILECLOUD_LINUX_EXT4_MATRIX_CHILD") == "1" {
+		t.Skip("Linux/ext4 acceptance child suite does not recurse")
 	}
 	if os.Getenv("FILECLOUD_RUN_1A") != "1" {
 		t.Skip("set FILECLOUD_RUN_1A=1 to run the Linux/ext4 acceptance matrix")
 	}
-	ext4Temp, err := os.MkdirTemp(".", ".issue22-matrix-")
+	ext4Temp, err := os.MkdirTemp(".", ".linux-ext4-matrix-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,13 +41,13 @@ func TestIssue22LinuxExt4AcceptanceMatrix(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		if err := os.RemoveAll(ext4Temp); err != nil {
-			t.Errorf("remove issue #22 matrix directory: %v", err)
+			t.Errorf("remove Linux/ext4 matrix directory: %v", err)
 		}
 	})
-	requireIssue22Ext4(t, ext4Temp)
+	requireLinuxExt4(t, ext4Temp)
 
-	scenarios := []issue22MatrixScenario{
-		{category: "correctness oracle", packagePath: "./cmd/filecloud", test: "TestIssue22LinuxExt4CorrectnessLoop"},
+	scenarios := []linuxExt4MatrixScenario{
+		{category: "correctness oracle", packagePath: "./cmd/filecloud", test: "TestLinuxExt4CorrectnessLoop"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindConcurrentInitializationAdoptsWinner"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindImportsLocalSnapshotAndSyncNoOps"},
@@ -90,49 +90,49 @@ func TestIssue22LinuxExt4AcceptanceMatrix(t *testing.T) {
 		{category: "raw HTTP contract", packagePath: "./cmd/filecloud", test: "TestUpdateRemoteHeadDoesNotRetryUnknownNetworkResult"},
 		{category: "raw HTTP contract", packagePath: "./cmd/filecloud", test: "TestCheckRemoteObjectsBatchesAt1000"},
 	}
-	runIssue22Matrix(t, ext4Temp, scenarios)
+	runLinuxExt4Matrix(t, ext4Temp, scenarios)
 }
 
-type issue22MatrixScenario struct {
+type linuxExt4MatrixScenario struct {
 	category    string
 	packagePath string
 	test        string
 }
 
-type issue22TestEvent struct {
+type linuxExt4TestEvent struct {
 	Action  string
 	Package string
 	Test    string
 	Output  string
 }
 
-type issue22TestKey struct {
+type linuxExt4TestKey struct {
 	packagePath string
 	test        string
 }
 
-func runIssue22Matrix(t *testing.T, ext4Temp string, scenarios []issue22MatrixScenario) {
+func runLinuxExt4Matrix(t *testing.T, ext4Temp string, scenarios []linuxExt4MatrixScenario) {
 	t.Helper()
 	command := exec.CommandContext(t.Context(), "go", "test", "-json", "./...", "-count=1", "-timeout=10m")
 	command.Dir = filepath.Join("..", "..")
 	command.Env = append(os.Environ(),
 		"TMPDIR="+ext4Temp,
 		"FILECLOUD_RUN_1A=1",
-		"FILECLOUD_ISSUE22_EXT4_ROOT="+ext4Temp,
-		"FILECLOUD_ISSUE22_MATRIX_CHILD=1",
+		"FILECLOUD_LINUX_EXT4_ROOT="+ext4Temp,
+		"FILECLOUD_LINUX_EXT4_MATRIX_CHILD=1",
 	)
 	output, runErr := command.CombinedOutput()
 	if runErr != nil {
-		t.Fatalf("issue #22 full ext4 suite: %v\n%s", runErr, output)
+		t.Fatalf("Linux/ext4 full suite: %v\n%s", runErr, output)
 	}
 
 	const module = "github.com/mingming-cn/filecloud/"
-	required := make(map[issue22TestKey]issue22MatrixScenario, len(scenarios))
+	required := make(map[linuxExt4TestKey]linuxExt4MatrixScenario, len(scenarios))
 	for _, scenario := range scenarios {
 		packagePath := module + strings.TrimPrefix(scenario.packagePath, "./")
-		required[issue22TestKey{packagePath: packagePath, test: scenario.test}] = scenario
+		required[linuxExt4TestKey{packagePath: packagePath, test: scenario.test}] = scenario
 	}
-	passed := make(map[issue22TestKey]bool, len(required))
+	passed := make(map[linuxExt4TestKey]bool, len(required))
 	allowedSkips := map[string]bool{
 		"TestHeadUpdateCrashHelper":                      true,
 		"TestObjectStorePublicationCrashHelper":          true,
@@ -142,26 +142,26 @@ func runIssue22Matrix(t *testing.T, ext4Temp string, scenarios []issue22MatrixSc
 		"TestPublicSyncFSActionCrashHelper":              true,
 		"TestPublicFSActionCrashHelper":                  true,
 		"TestFSActionCrashHelper":                        true,
-		"TestIssue22LinuxExt4AcceptanceMatrix":           true,
+		"TestLinuxExt4AcceptanceMatrix":                  true,
 	}
 	var attestations []string
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	for {
-		var event issue22TestEvent
+		var event linuxExt4TestEvent
 		err := decoder.Decode(&event)
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			t.Fatalf("decode issue #22 full-suite event: %v\n%s", err, output)
+			t.Fatalf("decode Linux/ext4 full-suite event: %v\n%s", err, output)
 		}
 		if event.Action == "fail" {
-			t.Fatalf("issue #22 ext4 test failed: package=%s test=%s\n%s", event.Package, event.Test, output)
+			t.Fatalf("Linux/ext4 test failed: package=%s test=%s\n%s", event.Package, event.Test, output)
 		}
 		if event.Action == "skip" && !allowedSkips[event.Test] {
-			t.Fatalf("issue #22 ext4 test skipped: package=%s test=%s\n%s", event.Package, event.Test, output)
+			t.Fatalf("Linux/ext4 test skipped: package=%s test=%s\n%s", event.Package, event.Test, output)
 		}
-		key := issue22TestKey{packagePath: event.Package, test: event.Test}
+		key := linuxExt4TestKey{packagePath: event.Package, test: event.Test}
 		if event.Action == "pass" {
 			if _, ok := required[key]; ok {
 				passed[key] = true
@@ -171,24 +171,24 @@ func runIssue22Matrix(t *testing.T, ext4Temp string, scenarios []issue22MatrixSc
 					event.Package, event.Test, runtime.GOOS)
 			}
 		}
-		if event.Test == "TestIssue22LinuxExt4CorrectnessLoop" && event.Action == "output" &&
+		if event.Test == "TestLinuxExt4CorrectnessLoop" && event.Action == "output" &&
 			strings.Contains(event.Output, "scenario=") {
 			attestations = append(attestations, strings.TrimSpace(event.Output))
 		}
 	}
 	for key, scenario := range required {
 		if !passed[key] {
-			t.Fatalf("issue #22 required scenario did not pass: category=%q package=%q test=%q",
+			t.Fatalf("Linux/ext4 acceptance required scenario did not pass: category=%q package=%q test=%q",
 				scenario.category, key.packagePath, key.test)
 		}
 	}
-	assertIssue22Attestations(t, attestations, output)
+	assertLinuxExt4Attestations(t, attestations, output)
 	for _, attestation := range attestations {
 		t.Log(attestation)
 	}
 }
 
-func assertIssue22Attestations(t *testing.T, attestations []string, output []byte) {
+func assertLinuxExt4Attestations(t *testing.T, attestations []string, output []byte) {
 	t.Helper()
 	requiredConvergence := map[string]bool{
 		"publisher import":                    false,
@@ -201,66 +201,66 @@ func assertIssue22Attestations(t *testing.T, attestations []string, output []byt
 	}
 	isolationSeen := false
 	for _, attestation := range attestations {
-		name, ok := issue22AttestationScenario(attestation)
+		name, ok := linuxExt4AttestationScenario(attestation)
 		if !ok {
-			t.Fatalf("issue #22 malformed attestation %q\n%s", attestation, output)
+			t.Fatalf("Linux/ext4 acceptance malformed attestation %q\n%s", attestation, output)
 		}
 		if name == "two-user isolation" {
 			if isolationSeen {
-				t.Fatalf("issue #22 duplicate isolation attestation %q", attestation)
+				t.Fatalf("Linux/ext4 acceptance duplicate isolation attestation %q", attestation)
 			}
 			for _, field := range []string{"platform=linux", "filesystem=ext4", "other_head=null", "isolation=uniform-not-found"} {
 				if !strings.Contains(attestation, field) {
-					t.Fatalf("issue #22 isolation attestation missing %q: %q", field, attestation)
+					t.Fatalf("Linux/ext4 acceptance isolation attestation missing %q: %q", field, attestation)
 				}
 			}
-			ownerHead, ok := issue22AttestationField(attestation, "owner_head")
+			ownerHead, ok := linuxExt4AttestationField(attestation, "owner_head")
 			if !ok || !object.ValidID(ownerHead) {
-				t.Fatalf("issue #22 isolation attestation has invalid owner Head: %q", attestation)
+				t.Fatalf("Linux/ext4 acceptance isolation attestation has invalid owner Head: %q", attestation)
 			}
 			isolationSeen = true
 			continue
 		}
 		seen, required := requiredConvergence[name]
 		if !required || seen {
-			t.Fatalf("issue #22 unexpected or duplicate attestation %q", attestation)
+			t.Fatalf("Linux/ext4 acceptance unexpected or duplicate attestation %q", attestation)
 		}
 		for _, field := range []string{"platform=linux", "filesystem=ext4"} {
 			if !strings.Contains(attestation, field) {
-				t.Fatalf("issue #22 convergence attestation missing %q: %q", field, attestation)
+				t.Fatalf("Linux/ext4 acceptance convergence attestation missing %q: %q", field, attestation)
 			}
 		}
-		head, headOK := issue22AttestationField(attestation, "Head")
-		base, baseOK := issue22AttestationField(attestation, "SyncBase")
-		snapshot, snapshotOK := issue22AttestationField(attestation, "snapshot")
+		head, headOK := linuxExt4AttestationField(attestation, "Head")
+		base, baseOK := linuxExt4AttestationField(attestation, "SyncBase")
+		snapshot, snapshotOK := linuxExt4AttestationField(attestation, "snapshot")
 		if !headOK || !baseOK || !snapshotOK || !object.ValidID(head) || !object.ValidID(base) ||
 			!object.ValidID(snapshot) || head != base {
-			t.Fatalf("issue #22 convergence attestation has invalid or divergent IDs: %q", attestation)
+			t.Fatalf("Linux/ext4 acceptance convergence attestation has invalid or divergent IDs: %q", attestation)
 		}
 		for _, field := range []string{"reachable_objects", "confirmed_inputs"} {
-			value, ok := issue22AttestationField(attestation, field)
+			value, ok := linuxExt4AttestationField(attestation, field)
 			count, err := strconv.Atoi(value)
 			if !ok || err != nil || count < 1 {
-				t.Fatalf("issue #22 convergence attestation has invalid %s: %q", field, attestation)
+				t.Fatalf("Linux/ext4 acceptance convergence attestation has invalid %s: %q", field, attestation)
 			}
 		}
-		internalPaths, ok := issue22AttestationField(attestation, "internal_paths")
+		internalPaths, ok := linuxExt4AttestationField(attestation, "internal_paths")
 		if !ok || internalPaths != "0" {
-			t.Fatalf("issue #22 convergence attestation has registered internal paths: %q", attestation)
+			t.Fatalf("Linux/ext4 acceptance convergence attestation has registered internal paths: %q", attestation)
 		}
 		requiredConvergence[name] = true
 	}
 	for name, seen := range requiredConvergence {
 		if !seen {
-			t.Fatalf("issue #22 correctness oracle emitted no attestation for %q\n%s", name, output)
+			t.Fatalf("Linux/ext4 acceptance correctness oracle emitted no attestation for %q\n%s", name, output)
 		}
 	}
 	if !isolationSeen {
-		t.Fatalf("issue #22 correctness oracle emitted no isolation attestation\n%s", output)
+		t.Fatalf("Linux/ext4 acceptance correctness oracle emitted no isolation attestation\n%s", output)
 	}
 }
 
-func issue22AttestationScenario(attestation string) (string, bool) {
+func linuxExt4AttestationScenario(attestation string) (string, bool) {
 	const marker = "scenario=\""
 	start := strings.Index(attestation, marker)
 	if start < 0 {
@@ -274,7 +274,7 @@ func issue22AttestationScenario(attestation string) (string, bool) {
 	return attestation[start : start+end], true
 }
 
-func issue22AttestationField(attestation, name string) (string, bool) {
+func linuxExt4AttestationField(attestation, name string) (string, bool) {
 	marker := " " + name + "="
 	start := strings.Index(attestation, marker)
 	if start < 0 {
@@ -289,67 +289,67 @@ func issue22AttestationField(attestation, name string) (string, bool) {
 	return value, value != ""
 }
 
-func TestIssue22LinuxExt4CorrectnessLoop(t *testing.T) {
+func TestLinuxExt4CorrectnessLoop(t *testing.T) {
 	if os.Getenv("FILECLOUD_RUN_1A") != "1" {
 		t.Skip("set FILECLOUD_RUN_1A=1 to run the Linux/ext4 correctness loop")
 	}
 	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
-	publisherDir, publisherTree := newIssue22ClientPaths(t)
-	subscriberDir, subscriberTree := newIssue22ClientPaths(t)
+	publisherDir, publisherTree := newLinuxExt4ClientPaths(t)
+	subscriberDir, subscriberTree := newLinuxExt4ClientPaths(t)
 
-	confirmed := []issue22ConfirmedInput{
+	confirmed := []linuxExt4ConfirmedInput{
 		{name: "base", data: []byte("confirmed base")},
 	}
 	if err := os.WriteFile(filepath.Join(publisherTree, "shared.txt"), confirmed[0].data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	bindPublisher := append(bindArgs(publisherDir, environment.server.URL, testClientLibraryID, publisherTree, testClientDeviceID), "--import-local")
-	if err := runIssue22CLI(t, bindPublisher, environment.token+"\n"); err != nil {
+	if err := runLinuxExt4CLI(t, bindPublisher, environment.token+"\n"); err != nil {
 		t.Fatalf("import publisher: %v", err)
 	}
-	assertIssue22Converged(t, "publisher import", environment, publisherDir, publisherTree, confirmed)
+	assertLinuxExt4Converged(t, "publisher import", environment, publisherDir, publisherTree, confirmed)
 
-	if err := runIssue22CLI(t, bindArgs(subscriberDir, environment.server.URL, testClientLibraryID, subscriberTree, testOtherDeviceID), environment.token+"\n"); err != nil {
+	if err := runLinuxExt4CLI(t, bindArgs(subscriberDir, environment.server.URL, testClientLibraryID, subscriberTree, testOtherDeviceID), environment.token+"\n"); err != nil {
 		t.Fatalf("bind subscriber: %v", err)
 	}
-	assertIssue22Converged(t, "subscriber checkout", environment, subscriberDir, subscriberTree, confirmed)
+	assertLinuxExt4Converged(t, "subscriber checkout", environment, subscriberDir, subscriberTree, confirmed)
 
-	remoteOnly := issue22ConfirmedInput{name: "remote independent change", data: []byte("confirmed remote independent")}
-	localOnly := issue22ConfirmedInput{name: "local independent change", data: []byte("confirmed local independent")}
+	remoteOnly := linuxExt4ConfirmedInput{name: "remote independent change", data: []byte("confirmed remote independent")}
+	localOnly := linuxExt4ConfirmedInput{name: "local independent change", data: []byte("confirmed local independent")}
 	confirmed = append(confirmed, remoteOnly, localOnly)
 	if err := os.WriteFile(filepath.Join(publisherTree, "remote.txt"), remoteOnly.data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runIssue22CLI(t, []string{"library", "sync", "--client-dir", publisherDir, "--worktree", publisherTree}, ""); err != nil {
+	if err := runLinuxExt4CLI(t, []string{"library", "sync", "--client-dir", publisherDir, "--worktree", publisherTree}, ""); err != nil {
 		t.Fatalf("publish remote independent change: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(subscriberTree, "local.txt"), localOnly.data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runIssue22CLI(t, []string{"library", "sync", "--client-dir", subscriberDir, "--worktree", subscriberTree}, ""); err != nil {
+	if err := runLinuxExt4CLI(t, []string{"library", "sync", "--client-dir", subscriberDir, "--worktree", subscriberTree}, ""); err != nil {
 		t.Fatalf("merge independent changes: %v", err)
 	}
-	assertIssue22Converged(t, "independent merge subscriber", environment, subscriberDir, subscriberTree, confirmed)
-	if err := runIssue22CLI(t, []string{"library", "sync", "--client-dir", publisherDir, "--worktree", publisherTree}, ""); err != nil {
+	assertLinuxExt4Converged(t, "independent merge subscriber", environment, subscriberDir, subscriberTree, confirmed)
+	if err := runLinuxExt4CLI(t, []string{"library", "sync", "--client-dir", publisherDir, "--worktree", publisherTree}, ""); err != nil {
 		t.Fatalf("download independent merge: %v", err)
 	}
-	assertIssue22SameConvergence(t, "independent merge", environment,
-		issue22Client{clientDir: publisherDir, worktree: publisherTree},
-		issue22Client{clientDir: subscriberDir, worktree: subscriberTree}, confirmed)
+	assertLinuxExt4SameConvergence(t, "independent merge", environment,
+		linuxExt4Client{clientDir: publisherDir, worktree: publisherTree},
+		linuxExt4Client{clientDir: subscriberDir, worktree: subscriberTree}, confirmed)
 
-	remoteConflict := issue22ConfirmedInput{name: "remote conflicting change", data: []byte("confirmed remote conflict")}
-	localConflict := issue22ConfirmedInput{name: "local conflicting change", data: []byte("confirmed local conflict")}
+	remoteConflict := linuxExt4ConfirmedInput{name: "remote conflicting change", data: []byte("confirmed remote conflict")}
+	localConflict := linuxExt4ConfirmedInput{name: "local conflicting change", data: []byte("confirmed local conflict")}
 	confirmed = append(confirmed, remoteConflict, localConflict)
 	if err := os.WriteFile(filepath.Join(publisherTree, "shared.txt"), remoteConflict.data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runIssue22CLI(t, []string{"library", "sync", "--client-dir", publisherDir, "--worktree", publisherTree}, ""); err != nil {
+	if err := runLinuxExt4CLI(t, []string{"library", "sync", "--client-dir", publisherDir, "--worktree", publisherTree}, ""); err != nil {
 		t.Fatalf("publish remote conflict: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(subscriberTree, "shared.txt"), localConflict.data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runIssue22CLI(t, []string{"library", "sync", "--client-dir", subscriberDir, "--worktree", subscriberTree}, ""); err != nil {
+	if err := runLinuxExt4CLI(t, []string{"library", "sync", "--client-dir", subscriberDir, "--worktree", subscriberTree}, ""); err != nil {
 		t.Fatalf("preserve conflicting changes: %v", err)
 	}
 	if data, err := os.ReadFile(filepath.Join(subscriberTree, "shared.txt")); err != nil || !bytes.Equal(data, remoteConflict.data) {
@@ -362,44 +362,44 @@ func TestIssue22LinuxExt4CorrectnessLoop(t *testing.T) {
 	if data, err := os.ReadFile(matches[0]); err != nil || !bytes.Equal(data, localConflict.data) {
 		t.Fatalf("local conflict copy = %q, %v", data, err)
 	}
-	if err := runIssue22CLI(t, []string{"library", "sync", "--client-dir", publisherDir, "--worktree", publisherTree}, ""); err != nil {
+	if err := runLinuxExt4CLI(t, []string{"library", "sync", "--client-dir", publisherDir, "--worktree", publisherTree}, ""); err != nil {
 		t.Fatalf("download conflict result: %v", err)
 	}
-	assertIssue22SameConvergence(t, "conflict preservation", environment,
-		issue22Client{clientDir: publisherDir, worktree: publisherTree},
-		issue22Client{clientDir: subscriberDir, worktree: subscriberTree}, confirmed)
+	assertLinuxExt4SameConvergence(t, "conflict preservation", environment,
+		linuxExt4Client{clientDir: publisherDir, worktree: publisherTree},
+		linuxExt4Client{clientDir: subscriberDir, worktree: subscriberTree}, confirmed)
 
-	assertIssue22OwnerIsolation(t, environment)
+	assertLinuxExt4OwnerIsolation(t, environment)
 }
 
-type issue22ConfirmedInput struct {
+type linuxExt4ConfirmedInput struct {
 	name string
 	data []byte
 }
 
-type issue22Client struct {
+type linuxExt4Client struct {
 	clientDir string
 	worktree  string
 }
 
-type issue22Reachability struct {
+type linuxExt4Reachability struct {
 	objects int
 	files   map[string][]byte
 }
 
-func runIssue22CLI(t *testing.T, args []string, stdin string) error {
+func runLinuxExt4CLI(t *testing.T, args []string, stdin string) error {
 	t.Helper()
 	return run(t.Context(), args, bytes.NewBufferString(stdin), io.Discard, io.Discard)
 }
 
-func newIssue22ClientPaths(t *testing.T) (string, string) {
+func newLinuxExt4ClientPaths(t *testing.T) (string, string) {
 	t.Helper()
 	clientDir := filepath.Join(t.TempDir(), "client")
-	root := os.Getenv("FILECLOUD_ISSUE22_EXT4_ROOT")
+	root := os.Getenv("FILECLOUD_LINUX_EXT4_ROOT")
 	if root == "" {
 		root = "."
 	}
-	worktree, err := os.MkdirTemp(root, ".issue22-worktree-")
+	worktree, err := os.MkdirTemp(root, ".linux-ext4-worktree-")
 	if err != nil {
 		t.Fatalf("create ext4 worktree: %v", err)
 	}
@@ -413,18 +413,18 @@ func newIssue22ClientPaths(t *testing.T) (string, string) {
 			t.Errorf("remove ext4 worktree: %v", err)
 		}
 	})
-	requireIssue22Ext4(t, canonical)
+	requireLinuxExt4(t, canonical)
 	return clientDir, canonical
 }
 
-func requireIssue22Ext4(t *testing.T, worktree string) {
+func requireLinuxExt4(t *testing.T, worktree string) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
-		t.Fatalf("issue #22 requires Linux/ext4, got %s", runtime.GOOS)
+		t.Fatalf("Linux/ext4 acceptance requires Linux/ext4, got %s", runtime.GOOS)
 	}
 	root, err := openWorktreeRoot(worktree, requireExt4)
 	if err != nil {
-		t.Fatalf("issue #22 requires an ext-family worktree: %v", err)
+		t.Fatalf("Linux/ext4 acceptance requires an ext-family worktree: %v", err)
 	}
 	defer func() {
 		if err := root.Close(); err != nil {
@@ -442,19 +442,19 @@ func requireIssue22Ext4(t *testing.T, worktree string) {
 	t.Logf("platform=%s filesystem=%s magic=0x%x worktree=%s", runtime.GOOS, filesystem, uint64(info.Type), worktree)
 }
 
-func assertIssue22SameConvergence(t *testing.T, scenario string, environment libraryCLIEnvironment,
-	first, second issue22Client, confirmed []issue22ConfirmedInput,
+func assertLinuxExt4SameConvergence(t *testing.T, scenario string, environment libraryCLIEnvironment,
+	first, second linuxExt4Client, confirmed []linuxExt4ConfirmedInput,
 ) {
 	t.Helper()
-	firstBinding := assertIssue22Converged(t, scenario+" first client", environment, first.clientDir, first.worktree, confirmed)
-	secondBinding := assertIssue22Converged(t, scenario+" second client", environment, second.clientDir, second.worktree, confirmed)
+	firstBinding := assertLinuxExt4Converged(t, scenario+" first client", environment, first.clientDir, first.worktree, confirmed)
+	secondBinding := assertLinuxExt4Converged(t, scenario+" second client", environment, second.clientDir, second.worktree, confirmed)
 	if firstBinding.SyncBase != secondBinding.SyncBase || firstBinding.SyncBaseRoot != secondBinding.SyncBaseRoot {
 		t.Fatalf("%s clients differ: first=%+v second=%+v", scenario, firstBinding, secondBinding)
 	}
 }
 
-func assertIssue22Converged(t *testing.T, scenario string, environment libraryCLIEnvironment,
-	clientDir, worktree string, confirmed []issue22ConfirmedInput,
+func assertLinuxExt4Converged(t *testing.T, scenario string, environment libraryCLIEnvironment,
+	clientDir, worktree string, confirmed []linuxExt4ConfirmedInput,
 ) clientBinding {
 	t.Helper()
 	binding := assertTestConverged(t, environment, clientDir, worktree)
@@ -482,7 +482,7 @@ func assertIssue22Converged(t *testing.T, scenario string, environment libraryCL
 	}
 	assertNoSyncInternalPaths(t, worktree)
 
-	reachable := inspectIssue22Reachability(t, environment, binding.SyncBase)
+	reachable := inspectLinuxExt4Reachability(t, environment, binding.SyncBase)
 	for _, input := range confirmed {
 		preserved := false
 		for _, data := range reachable.files {
@@ -500,7 +500,7 @@ func assertIssue22Converged(t *testing.T, scenario string, environment libraryCL
 	return binding
 }
 
-func inspectIssue22Reachability(t *testing.T, environment libraryCLIEnvironment, head string) issue22Reachability {
+func inspectLinuxExt4Reachability(t *testing.T, environment libraryCLIEnvironment, head string) linuxExt4Reachability {
 	t.Helper()
 	base := mustServerURL(t, environment.server.URL)
 	token := []byte(environment.token)
@@ -604,10 +604,10 @@ func inspectIssue22Reachability(t *testing.T, environment libraryCLIEnvironment,
 		visitDirectory(commit.Root)
 		pending = append(pending, commit.Parents...)
 	}
-	return issue22Reachability{objects: len(objects), files: files}
+	return linuxExt4Reachability{objects: len(objects), files: files}
 }
 
-func assertIssue22OwnerIsolation(t *testing.T, environment libraryCLIEnvironment) {
+func assertLinuxExt4OwnerIsolation(t *testing.T, environment libraryCLIEnvironment) {
 	t.Helper()
 	const (
 		otherUserID  = "22222222-3333-4444-8555-666666666666"
@@ -619,7 +619,7 @@ func assertIssue22OwnerIsolation(t *testing.T, environment libraryCLIEnvironment
 		t.Fatalf("create isolated user: %v", err)
 	}
 	otherToken := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32))
-	if err := environment.store.CreateSession(t.Context(), otherUserID, sha256.Sum256([]byte(otherToken)), "issue22", now, now.Add(time.Hour)); err != nil {
+	if err := environment.store.CreateSession(t.Context(), otherUserID, sha256.Sum256([]byte(otherToken)), "linux-ext4-acceptance", now, now.Add(time.Hour)); err != nil {
 		t.Fatalf("create isolated session: %v", err)
 	}
 	base := mustServerURL(t, environment.server.URL)
@@ -629,9 +629,9 @@ func assertIssue22OwnerIsolation(t *testing.T, environment libraryCLIEnvironment
 	}
 
 	for _, path := range []string{"", "/head", "/objects/commits/" + *ownerHead.CommitID} {
-		foreignStatus, foreignBody := issue22RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID).String()+path,
+		foreignStatus, foreignBody := linuxExt4RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID).String()+path,
 			http.MethodGet, otherToken, nil)
-		missingStatus, missingBody := issue22RawRequest(t, base.JoinPath("v1/libraries", missingID).String()+path,
+		missingStatus, missingBody := linuxExt4RawRequest(t, base.JoinPath("v1/libraries", missingID).String()+path,
 			http.MethodGet, otherToken, nil)
 		if foreignStatus != http.StatusNotFound || missingStatus != http.StatusNotFound || !bytes.Equal(foreignBody, missingBody) {
 			t.Fatalf("owner isolation path %q differs: foreign=%d/%q missing=%d/%q", path, foreignStatus, foreignBody, missingStatus, missingBody)
@@ -639,7 +639,7 @@ func assertIssue22OwnerIsolation(t *testing.T, environment libraryCLIEnvironment
 	}
 
 	createBody := []byte(`{"Name":"Bob isolated"}`)
-	status, _ := issue22RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID).String(), http.MethodPut, otherToken, createBody)
+	status, _ := linuxExt4RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID).String(), http.MethodPut, otherToken, createBody)
 	if status != http.StatusCreated {
 		t.Fatalf("same LibraryId in isolated owner namespace returned %d", status)
 	}
@@ -648,7 +648,7 @@ func assertIssue22OwnerIsolation(t *testing.T, environment libraryCLIEnvironment
 		t.Fatalf("isolated owner Head=%+v err=%v", otherHead, err)
 	}
 	for _, id := range []string{*ownerHead.CommitID, missingObjID} {
-		status, _ := issue22RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID, "objects", "commits", id).String(),
+		status, _ := linuxExt4RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID, "objects", "commits", id).String(),
 			http.MethodGet, otherToken, nil)
 		if status != http.StatusNotFound {
 			t.Fatalf("isolated object %s returned %d", id, status)
@@ -659,12 +659,12 @@ func assertIssue22OwnerIsolation(t *testing.T, environment libraryCLIEnvironment
 	if err := putBlock(t.Context(), base, testClientLibraryID, []byte(otherToken), otherBlockID, otherBlock); err != nil {
 		t.Fatalf("upload other owner block: %v", err)
 	}
-	status, _ = issue22RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID, "blocks", otherBlockID).String(),
+	status, _ = linuxExt4RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID, "blocks", otherBlockID).String(),
 		http.MethodGet, otherToken, nil)
 	if status != http.StatusOK {
 		t.Fatalf("other owner block GET returned %d", status)
 	}
-	status, _ = issue22RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID, "blocks", otherBlockID).String(),
+	status, _ = linuxExt4RawRequest(t, base.JoinPath("v1/libraries", testClientLibraryID, "blocks", otherBlockID).String(),
 		http.MethodGet, environment.token, nil)
 	if status != http.StatusNotFound {
 		t.Fatalf("original owner saw other owner's block: status=%d", status)
@@ -677,7 +677,7 @@ func assertIssue22OwnerIsolation(t *testing.T, environment libraryCLIEnvironment
 		"two-user isolation", runtime.GOOS, *ownerHead.CommitID)
 }
 
-func issue22RawRequest(t *testing.T, target, method, token string, body []byte) (int, []byte) {
+func linuxExt4RawRequest(t *testing.T, target, method, token string, body []byte) (int, []byte) {
 	t.Helper()
 	request, err := authenticatedRequest(t.Context(), method, target, []byte(token), body)
 	if err != nil {

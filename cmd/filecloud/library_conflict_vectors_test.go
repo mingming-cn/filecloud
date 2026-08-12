@@ -11,7 +11,7 @@ import (
 	"github.com/mingming-cn/filecloud/internal/object"
 )
 
-func TestIssue19AttestedNormalConflictVectors(t *testing.T) {
+func TestConflictCopyNameAttestedNormalVectors(t *testing.T) {
 	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID, CreatedAt: "2025-02-03T04:05:06Z"}
 	want := map[int]string{
 		1:   "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 (Filecloud conflict aaaaaaaa 20250203T040506Z).txt",
@@ -54,7 +54,7 @@ func TestIssue19AttestedNormalConflictVectors(t *testing.T) {
 	}
 }
 
-func TestIssue19LongExtensionOrdinalOneFixedVector(t *testing.T) {
+func TestConflictCopyNameLongExtensionOrdinalOneFixedVector(t *testing.T) {
 	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID, CreatedAt: "2025-02-03T04:05:06Z"}
 	const wantName = "x (Filecloud conflict aaaaaaaa 20250203T040506Z).aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	name, err := _conflictCopyName("x."+strings.Repeat("a", 190), "", seed, nil)
@@ -77,7 +77,7 @@ func TestIssue19LongExtensionOrdinalOneFixedVector(t *testing.T) {
 	}
 }
 
-func TestIssue19ReservedAndTrailingConflictNameBoundaries(t *testing.T) {
+func TestConflictCopyNameReservedAndTrailingBoundaries(t *testing.T) {
 	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID, CreatedAt: "2025-02-03T04:05:06Z"}
 	for _, leaf := range []string{strings.Repeat("n", 241), "CON", "name. ", "name."} {
 		name, err := _conflictCopyName(leaf, "", seed, nil)
@@ -90,7 +90,7 @@ func TestIssue19ReservedAndTrailingConflictNameBoundaries(t *testing.T) {
 	}
 }
 
-func TestIssue19FallbackSourceInsideConcurrentlyMergedRoot(t *testing.T) {
+func TestConflictFallbackSourceInsideConcurrentlyMergedRoot(t *testing.T) {
 	emptyData, emptyID, err := canonicalEmptyDirectory()
 	if err != nil {
 		t.Fatal(err)
@@ -125,7 +125,7 @@ func TestIssue19FallbackSourceInsideConcurrentlyMergedRoot(t *testing.T) {
 	}
 }
 
-func TestIssue19AttestedFallbackVectors(t *testing.T) {
+func TestConflictFallbackAttestedVectors(t *testing.T) {
 	const wantRoot = `{"Entries":[{"Id":"2ed3d5b84f7db1c1f72cf7a317f1c19de73f404e8c25d0c482f2809503355bf6","ModifiedAt":"2026-01-01T00:00:00Z","Name":"FILECLOUD CONFLICTS","Type":"Directory"},{"Id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ModifiedAt":"2026-01-01T00:00:00Z","Name":"Filecloud Conflicts 2","Type":"File"},{"Id":"d60f61b25d6fb7b6cbda4eebc9bd9fe6b624b6d3262ac0757b218a320ab04637","ModifiedAt":"2026-01-03T00:00:00Z","Name":"Filecloud Conflicts 3","Type":"Directory"}],"Type":"Directory","Version":1}`
 	const wantRootID = "0fc3d50e72b21f7a8b36e74b27590452da9c49a4f46068bc50ecf0753c748cd0"
 	const wantFallback = `{"Entries":[{"Id":"3333333333333333333333333333333333333333333333333333333333333333","ModifiedAt":"2026-01-03T00:00:00Z","Name":"111111111111-界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 (Filecloud conflict 1)","Type":"File"},{"Id":"2222222222222222222222222222222222222222222222222222222222222222","ModifiedAt":"2026-01-02T00:00:00Z","Name":"111111111111-界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 (Filecloud conflict 2)","Type":"File"}],"Type":"Directory","Version":1}`

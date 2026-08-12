@@ -1598,7 +1598,7 @@ func TestConflictPromotionCodecAndTargetValidation(t *testing.T) {
 	}
 }
 
-func TestConflictCopyNameIssue19Boundaries(t *testing.T) {
+func TestConflictCopyNameBoundaries(t *testing.T) {
 	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID,
 		CreatedAt: "2025-02-03T04:05:06Z"}
 	for name, value := range map[string][2]string{
@@ -6844,7 +6844,7 @@ func TestPublicSyncFallbackLeafOrdinalExhaustionBeforePublication(t *testing.T) 
 	}
 }
 
-func TestIssue19MissingPromotionAuthorityCacheMatrix(t *testing.T) {
+func TestConflictPromotionMissingAuthorityCacheMatrix(t *testing.T) {
 	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
 	if err := os.WriteFile(filepath.Join(publisherTree, "base"), []byte("remote"), 0o600); err != nil {
 		t.Fatal(err)
@@ -6946,7 +6946,7 @@ func TestIssue19MissingPromotionAuthorityCacheMatrix(t *testing.T) {
 	assertTestConverged(t, environment, subscriberDir, subscriberTree)
 }
 
-func TestIssue19AuthoritativeReplayRejectsEqualContentCrossSourceSwap(t *testing.T) {
+func TestAuthoritativePromotionReplayRejectsEqualContentCrossSourceSwap(t *testing.T) {
 	_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
 	for _, root := range []string{publisherTree, subscriberTree} {
 		for _, name := range []string{"first", "second"} {

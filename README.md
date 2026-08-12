@@ -24,6 +24,6 @@ Linux/ext4 1A 验收门禁必须在本地 ext4 checkout 中显式运行：
 
 ```bash
 FILECLOUD_RUN_1A=1 go test ./cmd/filecloud \
-  -run '^TestIssue22LinuxExt4AcceptanceMatrix$' \
+  -run '^TestLinuxExt4AcceptanceMatrix$' \
   -count=1 -timeout=30m -v
 ```
