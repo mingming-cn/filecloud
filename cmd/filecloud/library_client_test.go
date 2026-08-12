@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -64,6 +65,48 @@ func TestCheckRemoteObjectsRejectsInvalidResponses(t *testing.T) {
 	}
 }
 
+func TestLibraryClientIgnoresOptionalResponseFields(t *testing.T) {
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		response := httptest.NewRecorder()
+		environment.handler.ServeHTTP(response, r)
+		for name, values := range response.Header() {
+			for _, value := range values {
+				w.Header().Add(name, value)
+			}
+		}
+		data := response.Body.Bytes()
+		if response.Code == http.StatusOK && strings.HasSuffix(r.URL.Path, "/head") {
+			var envelope map[string]any
+			if err := json.Unmarshal(data, &envelope); err != nil {
+				t.Errorf("decode Head fixture: %v", err)
+				return
+			}
+			envelope["OptionalFutureField"] = true
+			head, ok := envelope["Head"].(map[string]any)
+			if !ok {
+				t.Errorf("Head fixture shape = %#v", envelope["Head"])
+				return
+			}
+			head["OptionalFutureField"] = "ignored"
+			var err error
+			data, err = json.Marshal(envelope)
+			if err != nil {
+				t.Errorf("encode Head fixture: %v", err)
+				return
+			}
+		}
+		w.WriteHeader(response.Code)
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	head, err := getRemoteHead(t.Context(), mustServerURL(t, server.URL), testClientLibraryID, []byte(environment.token))
+	if err != nil || head.CommitID != nil || head.ETag != `"head-version-0"` {
+		t.Fatalf("Head with optional fields = %+v, %v", head, err)
+	}
+}
+
 func TestCheckRemoteObjectsBatchesAt1000(t *testing.T) {
 	var batchSizes []int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,6 +128,123 @@ func TestCheckRemoteObjectsBatchesAt1000(t *testing.T) {
 	missing, err := checkRemoteObjects(t.Context(), options, references)
 	if err != nil || len(missing) != 0 || len(batchSizes) != 2 || batchSizes[0] != 1000 || batchSizes[1] != 1 {
 		t.Fatalf("object check batches=%v missing=%v err=%v", batchSizes, missing, err)
+	}
+}
+
+func TestUpdateRemoteHeadRetriesExplicitTransientResponses(t *testing.T) {
+	commitID := strings.Repeat("a", 64)
+	attempts := atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read attempt %d: %v", attempt, err)
+			return
+		}
+		var request struct {
+			CommitID string `json:"CommitId"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil || request.CommitID != commitID ||
+			r.Header.Get("If-Match") != `"head-version-0"` {
+			t.Errorf("attempt %d request=%q If-Match=%q err=%v", attempt, body, r.Header.Get("If-Match"), err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch attempt {
+		case 1:
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"RetCode":4000,"Message":"head validation busy"}`)
+		case 2:
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"RetCode":5001,"Message":"head validation unavailable"}`)
+		default:
+			response, err := json.Marshal(struct {
+				RetCode int
+				Message string
+				Head    remoteHead
+			}{RetCode: 0, Message: "success", Head: remoteHead{CommitID: &commitID, ETag: `"head-version-1"`}})
+			if err != nil {
+				t.Errorf("marshal success response: %v", err)
+				return
+			}
+			_, _ = w.Write(response)
+		}
+	}))
+	defer server.Close()
+
+	head, conflict, err := updateRemoteHead(t.Context(), mustServerURL(t, server.URL), testClientLibraryID,
+		[]byte("token"), `"head-version-0"`, commitID)
+	if err != nil || conflict || attempts.Load() != 3 || head.CommitID == nil || *head.CommitID != commitID || head.ETag != `"head-version-1"` {
+		t.Fatalf("update Head = %+v conflict=%v attempts=%d err=%v", head, conflict, attempts.Load(), err)
+	}
+}
+
+func TestDoClientRequestReturnsTransportErrorWithNoResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		connection, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack response: %v", err)
+			return
+		}
+		_ = connection.Close()
+	}))
+	defer server.Close()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, data, etag, err := doClientRequest(request)
+	if err == nil || status != 0 || data != nil || etag != "" {
+		t.Fatalf("transport failure = status=%d data=%q etag=%q err=%v", status, data, etag, err)
+	}
+}
+
+func TestUpdateRemoteHeadDoesNotRetryUnknownNetworkResult(t *testing.T) {
+	attempts := atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		connection, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack Head response: %v", err)
+			return
+		}
+		_ = connection.Close()
+	}))
+	defer server.Close()
+
+	_, _, err := updateRemoteHead(t.Context(), mustServerURL(t, server.URL), testClientLibraryID,
+		[]byte("token"), `"head-version-0"`, strings.Repeat("a", 64))
+	if err == nil || attempts.Load() != 1 {
+		t.Fatalf("unknown Head result attempts=%d err=%v", attempts.Load(), err)
+	}
+}
+
+func TestTransientRetryDelayAndCancellation(t *testing.T) {
+	now := time.Date(2026, 8, 12, 1, 2, 3, 0, time.UTC)
+	for _, test := range []struct {
+		name       string
+		retryAfter string
+		want       time.Duration
+	}{
+		{name: "seconds", retryAfter: "2", want: 2 * time.Second},
+		{name: "date", retryAfter: now.Add(3 * time.Second).Format(http.TimeFormat), want: 3 * time.Second},
+		{name: "past date", retryAfter: now.Add(-time.Second).Format(http.TimeFormat), want: 0},
+		{name: "bounded date", retryAfter: now.Add(time.Hour).Format(http.TimeFormat), want: 30 * time.Second},
+		{name: "invalid default", retryAfter: "invalid", want: time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := transientRetryDelay(test.retryAfter, now); got != test.want {
+				t.Fatalf("transientRetryDelay(%q)=%s want=%s", test.retryAfter, got, test.want)
+			}
+		})
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := waitTransientRetry(ctx, "30", now); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled retry wait error=%v", err)
 	}
 }
 
@@ -167,13 +327,7 @@ func TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly(t *testing.T) {
 func TestLibraryBindConcurrentInitializationAdoptsWinner(t *testing.T) {
 	var arrivals atomic.Int32
 	release := make(chan struct{})
-	environment := newLibraryCLIEnvironment(t, libraryapi.Config{BeforeHeadUpdate: func() error {
-		if arrivals.Add(1) == 2 {
-			close(release)
-		}
-		<-release
-		return nil
-	}})
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
 	allowTestFilesystem(t)
 
 	type result struct {
@@ -182,19 +336,40 @@ func TestLibraryBindConcurrentInitializationAdoptsWinner(t *testing.T) {
 		err       error
 	}
 	results := make(chan result, 2)
+	var wait sync.WaitGroup
 	for _, deviceID := range []string{testClientDeviceID, testOtherDeviceID} {
 		clientDir := filepath.Join(t.TempDir(), "client")
 		worktree := filepath.Join(t.TempDir(), "worktree")
 		if err := os.Mkdir(worktree, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		go func(clientDir, worktree, deviceID string) {
-			err := runTest(t.Context(), bindArgs(clientDir, environment.server.URL, testClientLibraryID, worktree, deviceID),
-				strings.NewReader(environment.token+"\n"), io.Discard, io.Discard)
-			results <- result{clientDir: clientDir, worktree: worktree, err: err}
-		}(clientDir, worktree, deviceID)
+		wait.Go(func() {
+			item := result{clientDir: clientDir, worktree: worktree}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					item.err = fmt.Errorf("concurrent bind panic: %v", recovered)
+				}
+				results <- item
+			}()
+			item.err = runLibraryWithConfig(t.Context(), bindArgs(clientDir, environment.server.URL, testClientLibraryID, worktree, deviceID)[1:],
+				strings.NewReader(environment.token+"\n"), io.Discard, io.Discard, libraryClientConfig{
+					checkFilesystem: func(*os.File) error { return nil },
+					beforeHeadCAS: func() error {
+						if arrivals.Add(1) == 2 {
+							close(release)
+						}
+						select {
+						case <-release:
+							return nil
+						case <-t.Context().Done():
+							return t.Context().Err()
+						}
+					},
+				})
+		})
 	}
 	first, second := <-results, <-results
+	wait.Wait()
 	for _, item := range []result{first, second} {
 		if item.err != nil {
 			t.Fatalf("concurrent bind: %v", item.err)
@@ -985,6 +1160,42 @@ func TestLockClientDirRetriesAllDurabilitySteps(t *testing.T) {
 	defer lock.Close()
 	if fileSyncs != 2 || clientDirSyncs != 2 {
 		t.Fatalf("retry durability calls: file=%d clientDir=%d, want 2 each", fileSyncs, clientDirSyncs)
+	}
+}
+
+func TestMountedFilesystemIdentifiesExactHeldMount(t *testing.T) {
+	mountinfo := strings.Join([]string{
+		"24 1 8:1 / / rw,relatime - ext3 /dev/root rw",
+		"25 24 8:1 /project /workspace rw,relatime - ext4 /dev/root rw",
+		`26 25 8:2 / /workspace/nested\040mount rw,relatime - tmpfs tmpfs rw`,
+	}, "\n")
+	for _, test := range []struct {
+		name       string
+		path       string
+		major      uint32
+		minor      uint32
+		filesystem string
+		wantErr    bool
+	}{
+		{name: "exact ext4 bind mount", path: "/workspace/project", major: 8, minor: 1, filesystem: "ext4"},
+		{name: "root ext3", path: "/other", major: 8, minor: 1, filesystem: "ext3"},
+		{name: "escaped nested mount", path: "/workspace/nested mount/file", major: 8, minor: 2, filesystem: "tmpfs"},
+		{name: "held device must match", path: "/workspace/project", major: 8, minor: 2, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			filesystem, err := mountedFilesystem(strings.NewReader(mountinfo), test.path, test.major, test.minor)
+			if (err != nil) != test.wantErr || filesystem != test.filesystem {
+				t.Fatalf("mountedFilesystem(%q, %d:%d) = %q, %v", test.path, test.major, test.minor, filesystem, err)
+			}
+		})
+	}
+}
+
+func TestMountinfoPathRejectsInvalidEscapes(t *testing.T) {
+	for _, value := range []string{`/truncated\04`, `/invalid\041escape`, `/non-octal\xyz`} {
+		if result, err := unescapeMountinfoPath(value); err == nil {
+			t.Fatalf("unescapeMountinfoPath(%q)=%q, want error", value, result)
+		}
 	}
 }
 

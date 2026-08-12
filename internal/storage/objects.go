@@ -19,6 +19,17 @@ type objectPublication struct {
 	refs int
 }
 
+const (
+	_objectBeforeTemporaryWrite = "before_temporary_write"
+	_objectAfterTemporaryWrite  = "after_temporary_write"
+	_objectBeforeTemporarySync  = "before_temporary_sync"
+	_objectAfterTemporarySync   = "after_temporary_sync"
+	_objectBeforeInstall        = "before_install"
+	_objectAfterInstall         = "after_install"
+	_objectBeforeParentSync     = "before_parent_sync"
+	_objectAfterParentSync      = "after_parent_sync"
+)
+
 var (
 	// ErrObjectNotFound reports no object in the owner-isolated library.
 	ErrObjectNotFound = errors.New("object not found")
@@ -101,6 +112,9 @@ func (s *Store) putObject(ctx context.Context, ownerUserID, libraryID, kind, obj
 		}
 	}()
 
+	if err := s.runObjectPublicationFault(_objectBeforeTemporaryWrite); err != nil {
+		return false, err
+	}
 	hash := sha256.New()
 	limited := source
 	if expectedSize >= 0 {
@@ -109,6 +123,9 @@ func (s *Store) putObject(ctx context.Context, ownerUserID, libraryID, kind, obj
 	written, err := io.Copy(io.MultiWriter(temporary, hash), limited)
 	if err != nil {
 		return false, fmt.Errorf("write temporary object: %w", err)
+	}
+	if err := s.runObjectPublicationFault(_objectAfterTemporaryWrite); err != nil {
+		return false, err
 	}
 	if expectedSize >= 0 && written != expectedSize {
 		return false, io.ErrUnexpectedEOF
@@ -129,14 +146,23 @@ func (s *Store) putObject(ctx context.Context, ownerUserID, libraryID, kind, obj
 			retErr = errors.Join(retErr, releaseBudget())
 		}
 	}()
+	if err := s.runObjectPublicationFault(_objectBeforeTemporarySync); err != nil {
+		return false, err
+	}
 	if err := temporary.Sync(); err != nil {
 		return false, fmt.Errorf("sync temporary object: %w", err)
+	}
+	if err := s.runObjectPublicationFault(_objectAfterTemporarySync); err != nil {
+		return false, err
 	}
 	if err := temporary.Close(); err != nil {
 		return false, fmt.Errorf("close temporary object: %w", err)
 	}
 	temporary = nil
 	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := s.runObjectPublicationFault(_objectBeforeInstall); err != nil {
 		return false, err
 	}
 	if err := os.Link(temporaryName, destination); err != nil {
@@ -156,10 +182,29 @@ func (s *Store) putObject(ctx context.Context, ownerUserID, libraryID, kind, obj
 		return false, nil
 	}
 	published = true
+	if err := s.runObjectPublicationFault(_objectAfterInstall); err != nil {
+		return false, err
+	}
+	if err := s.runObjectPublicationFault(_objectBeforeParentSync); err != nil {
+		return false, err
+	}
 	if err := s.syncObjectDirectory(parent); err != nil {
 		return false, fmt.Errorf("sync published object directory: %w", err)
 	}
+	if err := s.runObjectPublicationFault(_objectAfterParentSync); err != nil {
+		return false, err
+	}
 	return true, nil
+}
+
+func (s *Store) runObjectPublicationFault(point string) error {
+	if s.objectPublicationFault == nil {
+		return nil
+	}
+	if err := s.objectPublicationFault(point); err != nil {
+		return fmt.Errorf("object publication %s: %w", point, err)
+	}
+	return nil
 }
 
 // GetObject opens an object only within its owner-isolated library.

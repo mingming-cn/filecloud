@@ -88,15 +88,16 @@ func metadataMigrations() []migration {
 
 // Store is an open metadata database protected by the data-directory lock.
 type Store struct {
-	db                  *sql.DB
-	objectsDir          string
-	lock                *dataLock
-	objectLocksMu       sync.Mutex
-	objectLocks         map[string]*objectPublication
-	objectLockQueued    func(string)
-	syncObjectDirectory func(string) error
-	uploadMu            sync.Mutex
-	upload              uploadState
+	db                     *sql.DB
+	objectsDir             string
+	lock                   *dataLock
+	objectLocksMu          sync.Mutex
+	objectLocks            map[string]*objectPublication
+	objectLockQueued       func(string)
+	objectPublicationFault func(string) error
+	syncObjectDirectory    func(string) error
+	uploadMu               sync.Mutex
+	upload                 uploadState
 }
 
 // Init creates a usable data directory and applies all metadata migrations.

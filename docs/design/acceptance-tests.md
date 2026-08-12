@@ -128,6 +128,20 @@ SQLite WAL 与 `synchronous=FULL` 的同步发生在 COMMIT 内部；SQLite 不�
 
 NFS、SMB、FAT/exFAT 和网络映射盘必须拒绝绑定，除非后续 ADR 和相同级别测试明确支持。
 
+## 1A 可执行门禁
+
+1A 必须在 Linux 主机的本地 ext4 checkout 中显式运行，普通 `go test ./...` 中跳过重型矩阵不构成 1A 通过：
+
+```bash
+FILECLOUD_RUN_1A=1 go test ./cmd/filecloud \
+  -run '^TestIssue22LinuxExt4AcceptanceMatrix$' \
+  -count=1 -timeout=30m -v
+```
+
+门禁在仓库所在挂载创建专用 `TMPDIR`，通过 held worktree fd、`statfs` 和 `/proc/self/mountinfo` 的设备号及最深挂载点共同确认 fstype 精确为 `ext4`；无法确认、ext2、ext3 或其他文件系统直接失败。随后在该根下执行完整 `go test -json ./...`，任何测试失败或非子进程 helper 的 skip 都使门禁失败；关键场景清单还必须逐项产生 pass，因此测试被删除、重命名或环境不满足时不能空匹配通过。correctness worktree、对象发布和 Head 更新的 crash data dir 均来自同一个已验证 ext4 根。
+
+`TestIssue22LinuxExt4CorrectnessLoop` 为每个预期稳定场景记录并机器校验平台、文件系统、Head、Sync Base、工作目录快照、完整 Head parent 历史的可达对象数、确认输入数和内部路径数；Head 与 Sync Base 必须是相同的规范 CommitId，工作目录快照必须是该 Commit 解引用后的规范 DirectoryId，确认输入与可达对象计数必须为正，内部路径数必须为零。checkout、对象发布和 Head 更新故障矩阵使用真实子进程 `SIGKILL` 覆盖已文档化持久边界并重开存储验证旧 Head；它们证明 Linux 进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
+
 ## 1C 运维命令
 
 ### GC

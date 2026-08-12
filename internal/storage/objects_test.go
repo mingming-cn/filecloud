@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -313,6 +316,81 @@ func TestObjectStoreRetriesLeafSyncAfterPublishFailure(t *testing.T) {
 	}
 }
 
+func TestObjectStorePublicationCrashMatrixPreservesOldHead(t *testing.T) {
+	for _, point := range []string{
+		_objectBeforeTemporaryWrite, _objectAfterTemporaryWrite,
+		_objectBeforeTemporarySync, _objectAfterTemporarySync,
+		_objectBeforeInstall, _objectAfterInstall,
+		_objectBeforeParentSync, _objectAfterParentSync,
+	} {
+		t.Run(point, func(t *testing.T) {
+			dataDir, oldCommitID, oldRootID := newObjectPublicationCrashStore(t)
+			command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestObjectStorePublicationCrashHelper$")
+			command.Env = append(os.Environ(),
+				"FILECLOUD_OBJECT_CRASH_DATA_DIR="+dataDir,
+				"FILECLOUD_OBJECT_CRASH_POINT="+point,
+			)
+			assertObjectPublicationSIGKILL(t, command.Run())
+
+			store, err := OpenForServe(t.Context(), dataDir)
+			if err != nil {
+				t.Fatalf("reopen after %s: %v", point, err)
+			}
+			defer closeObjectStore(t, store)
+			library, err := store.GetLibrary(t.Context(), _objectCrashOwnerID, _objectCrashLibraryID)
+			if err != nil || library.HeadCommitID == nil || *library.HeadCommitID != oldCommitID || library.HeadVersion != 1 {
+				t.Fatalf("Head after %s = %+v, %v", point, library, err)
+			}
+			assertStoredHeadGraph(t, store, oldCommitID, oldRootID)
+
+			data := []byte(_objectCrashNewBlock)
+			created, err := store.PutObject(t.Context(), _objectCrashOwnerID, _objectCrashLibraryID,
+				"blocks", object.ID(data), bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("replay after %s: %v", point, err)
+			}
+			wantCreated := point != _objectAfterInstall && point != _objectBeforeParentSync && point != _objectAfterParentSync
+			if created != wantCreated {
+				t.Fatalf("replay after %s created=%v want=%v", point, created, wantCreated)
+			}
+			reader, size, err := store.GetObject(t.Context(), _objectCrashOwnerID, _objectCrashLibraryID, "blocks", object.ID(data))
+			if err != nil {
+				t.Fatalf("read replayed object after %s: %v", point, err)
+			}
+			got, readErr := io.ReadAll(reader)
+			closeErr := reader.Close()
+			if readErr != nil || closeErr != nil || size != int64(len(data)) || !bytes.Equal(got, data) {
+				t.Fatalf("replayed object after %s = %q/%d read=%v close=%v", point, got, size, readErr, closeErr)
+			}
+		})
+	}
+}
+
+func TestObjectStorePublicationCrashHelper(t *testing.T) {
+	dataDir := os.Getenv("FILECLOUD_OBJECT_CRASH_DATA_DIR")
+	point := os.Getenv("FILECLOUD_OBJECT_CRASH_POINT")
+	if dataDir == "" || point == "" {
+		t.Skip("object publication crash subprocess helper")
+	}
+	store, err := OpenForServe(t.Context(), dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.objectPublicationFault = func(actual string) error {
+		if actual == point {
+			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		}
+		return nil
+	}
+	data := []byte(_objectCrashNewBlock)
+	if _, err := store.PutObject(t.Context(), _objectCrashOwnerID, _objectCrashLibraryID,
+		"blocks", object.ID(data), bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("object publication did not reach crash point %q", point)
+}
+
 func TestObjectStoreDurablyCreatesEachDirectoryLevel(t *testing.T) {
 	store := newObjectStore(t)
 	defer closeObjectStore(t, store)
@@ -355,6 +433,131 @@ func TestObjectStoreRejectsEscapingScopeIDs(t *testing.T) {
 		if _, err := store.PutObject(t.Context(), scope.owner, scope.library, "blocks", id, bytes.NewReader([]byte("escape"))); err == nil {
 			t.Fatalf("PutObject(%q, %q) succeeded", scope.owner, scope.library)
 		}
+	}
+}
+
+const (
+	_objectCrashOwnerID   = "12345678-9abc-4def-8123-456789abcdef"
+	_objectCrashLibraryID = "01234567-89ab-4def-8123-456789abcdef"
+	_objectCrashNewBlock  = "new object after old Head"
+)
+
+func newObjectPublicationCrashStore(t *testing.T) (string, string, string) {
+	t.Helper()
+	root := os.Getenv("FILECLOUD_ISSUE22_EXT4_ROOT")
+	if root == "" {
+		root = "."
+	}
+	dataDir, err := os.MkdirTemp(root, ".issue22-object-store-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir, err = filepath.Abs(dataDir)
+	if err != nil {
+		os.RemoveAll(dataDir)
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Errorf("remove crash store: %v", err)
+		}
+	})
+	if err := Init(t.Context(), dataDir); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenForServe(t.Context(), dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateUser(t.Context(), User{ID: _objectCrashOwnerID, Username: "owner", PasswordHash: "hash"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	createObjectLibrary(t, store, _objectCrashOwnerID, _objectCrashLibraryID, "crash")
+	blockData := []byte("content reachable from old Head")
+	blockID := object.ID(blockData)
+	fileInput := fmt.Sprintf(`{"Blocks":["%s"],"Size":"%d","Type":"File","Version":1}`, blockID, len(blockData))
+	fileData, fileID, err := object.Canonicalize("files", []byte(fileInput))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootInput := fmt.Sprintf(`{"Entries":[{"Id":"%s","ModifiedAt":"2026-08-09T00:00:00Z","Name":"confirmed.txt","Type":"File"}],"Type":"Directory","Version":1}`, fileID)
+	rootData, rootID, err := object.Canonicalize("directories", []byte(rootInput))
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitInput := fmt.Sprintf(`{"AuthorUserId":"%s","CreatedAt":"2026-08-09T00:00:00Z","DeviceId":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","Message":"sync","Parents":[],"Root":"%s","Type":"Commit","Version":1}`,
+		_objectCrashOwnerID, rootID)
+	commitData, commitID, err := object.Canonicalize("commits", []byte(commitInput))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for kind, values := range map[string]map[string][]byte{
+		"blocks":      {blockID: blockData},
+		"files":       {fileID: fileData},
+		"directories": {rootID: rootData},
+		"commits":     {commitID: commitData},
+	} {
+		for id, data := range values {
+			if _, err := store.PutObject(t.Context(), _objectCrashOwnerID, _objectCrashLibraryID, kind, id, bytes.NewReader(data)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := store.UpdateLibraryHead(t.Context(), _objectCrashOwnerID, _objectCrashLibraryID, nil, 0, commitID, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return dataDir, commitID, rootID
+}
+
+func assertStoredHeadGraph(t *testing.T, store *Store, commitID, rootID string) {
+	t.Helper()
+	commitData := readStoredObject(t, store, "commits", commitID)
+	commit, err := object.VerifyCommit(commitData, commitID)
+	if err != nil || commit.Root != rootID {
+		t.Fatalf("verify old Head commit %s: commit=%+v err=%v", commitID, commit, err)
+	}
+	directoryData := readStoredObject(t, store, "directories", rootID)
+	directory, err := object.VerifyDirectory(directoryData, rootID)
+	if err != nil || len(directory.Entries) != 1 || directory.Entries[0].Type != "File" {
+		t.Fatalf("verify old Head directory %s: directory=%+v err=%v", rootID, directory, err)
+	}
+	fileData := readStoredObject(t, store, "files", directory.Entries[0].ID)
+	file, err := object.VerifyFile(fileData, directory.Entries[0].ID)
+	if err != nil || len(file.Blocks) != 1 {
+		t.Fatalf("verify old Head file %s: file=%+v err=%v", directory.Entries[0].ID, file, err)
+	}
+	block := readStoredObject(t, store, "blocks", file.Blocks[0])
+	if object.ID(block) != file.Blocks[0] || int64(len(block)) != file.Size {
+		t.Fatalf("verify old Head block %s: size=%d want=%d", file.Blocks[0], len(block), file.Size)
+	}
+}
+
+func readStoredObject(t *testing.T, store *Store, kind, id string) []byte {
+	t.Helper()
+	reader, _, err := store.GetObject(t.Context(), _objectCrashOwnerID, _objectCrashLibraryID, kind, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read stored %s/%s: read=%v close=%v", kind, id, readErr, closeErr)
+	}
+	return data
+}
+
+func assertObjectPublicationSIGKILL(t *testing.T, err error) {
+	t.Helper()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("object publication process was not killed: %v", err)
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
+		t.Fatalf("object publication process status=%v err=%v", status, err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -17,17 +18,22 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/mingming-cn/filecloud/internal/object"
+	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
 
 const (
-	_clientDatabaseName = "client.db"
-	_ext4Magic          = 0xef53
+	_clientDatabaseName         = "client.db"
+	_ext4Magic                  = 0xef53
+	_headUpdateAttempts         = 3
+	_defaultTransientRetryDelay = time.Second
+	_maximumTransientRetryDelay = 30 * time.Second
 )
 
 type libraryClientConfig struct {
@@ -2543,24 +2549,59 @@ func updateRemoteHead(ctx context.Context, base *url.URL, libraryID string, toke
 	if err != nil {
 		return remoteHead{}, false, err
 	}
-	request, err := authenticatedRequest(ctx, http.MethodPut, base.JoinPath("v1/libraries", libraryID, "head").String(), token, body)
-	if err != nil {
-		return remoteHead{}, false, err
+	target := base.JoinPath("v1/libraries", libraryID, "head").String()
+	for attempt := 0; attempt < _headUpdateAttempts; attempt++ {
+		request, err := authenticatedRequest(ctx, http.MethodPut, target, token, body)
+		if err != nil {
+			return remoteHead{}, false, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("If-Match", etag)
+		status, data, headers, err := doClientRequestWithHeaders(request)
+		if err != nil {
+			return remoteHead{}, false, fmt.Errorf("publish library Head: %w", err)
+		}
+		if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+			if attempt+1 == _headUpdateAttempts {
+				return remoteHead{}, false, fmt.Errorf("publish library Head failed after %d attempts: server returned %s",
+					_headUpdateAttempts, http.StatusText(status))
+			}
+			if err := waitTransientRetry(ctx, headers.Get("Retry-After"), time.Now()); err != nil {
+				return remoteHead{}, false, fmt.Errorf("wait to retry library Head: %w", err)
+			}
+			continue
+		}
+		if status != http.StatusOK && status != http.StatusPreconditionFailed {
+			return remoteHead{}, false, fmt.Errorf("publish library Head failed: server returned %s", http.StatusText(status))
+		}
+		var envelope struct{ Head remoteHead }
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			return remoteHead{}, false, fmt.Errorf("decode published library Head: %w", err)
+		}
+		return envelope.Head, status == http.StatusPreconditionFailed, nil
 	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("If-Match", etag)
-	status, data, _, err := doClientRequest(request)
-	if err != nil {
-		return remoteHead{}, false, fmt.Errorf("publish library Head: %w", err)
+	return remoteHead{}, false, errors.New("publish library Head exhausted retry attempts")
+}
+
+func waitTransientRetry(ctx context.Context, retryAfter string, now time.Time) error {
+	timer := time.NewTimer(transientRetryDelay(retryAfter, now))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	if status != http.StatusOK && status != http.StatusPreconditionFailed {
-		return remoteHead{}, false, fmt.Errorf("publish library Head failed: server returned %s", http.StatusText(status))
+}
+
+func transientRetryDelay(retryAfter string, now time.Time) time.Duration {
+	delay := _defaultTransientRetryDelay
+	if seconds, err := strconv.ParseUint(strings.TrimSpace(retryAfter), 10, 31); err == nil {
+		delay = time.Duration(seconds) * time.Second
+	} else if retryAt, err := http.ParseTime(retryAfter); err == nil {
+		delay = max(time.Duration(0), retryAt.Sub(now))
 	}
-	var envelope struct{ Head remoteHead }
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return remoteHead{}, false, fmt.Errorf("decode published library Head: %w", err)
-	}
-	return envelope.Head, status == http.StatusPreconditionFailed, nil
+	return min(delay, _maximumTransientRetryDelay)
 }
 
 func getRemoteCommit(ctx context.Context, base *url.URL, libraryID string, token []byte, commitID string) (object.Commit, error) {
@@ -2603,16 +2644,21 @@ func authenticatedRequest(ctx context.Context, method, target string, token, bod
 }
 
 func doClientRequest(request *http.Request) (int, []byte, string, error) {
+	status, data, headers, err := doClientRequestWithHeaders(request)
+	return status, data, headers.Get("ETag"), err
+}
+
+func doClientRequestWithHeaders(request *http.Request) (int, []byte, http.Header, error) {
 	response, err := noRedirectClient().Do(request)
 	if err != nil {
-		return 0, nil, "", err
+		return 0, nil, nil, err
 	}
 	data, readErr := io.ReadAll(io.LimitReader(response.Body, 33<<20))
 	closeErr := response.Body.Close()
 	if readErr != nil || closeErr != nil {
-		return 0, nil, "", errors.Join(readErr, closeErr)
+		return 0, nil, nil, errors.Join(readErr, closeErr)
 	}
-	return response.StatusCode, data, response.Header.Get("ETag"), nil
+	return response.StatusCode, data, response.Header.Clone(), nil
 }
 
 func newFlagSet(name string, output io.Writer) *flag.FlagSet {
@@ -2629,7 +2675,101 @@ func requireExt4(directory *os.File) error {
 	if uint64(info.Type) != _ext4Magic {
 		return fmt.Errorf("unsupported worktree filesystem type 0x%x; Linux ext4 is required", uint64(info.Type))
 	}
+	filesystem, err := mountedFilesystemForDirectory(directory)
+	if err != nil {
+		return fmt.Errorf("identify worktree filesystem: %w", err)
+	}
+	if filesystem != "ext4" {
+		return fmt.Errorf("unsupported worktree filesystem %s; Linux ext4 is required", filesystem)
+	}
 	return nil
+}
+
+func mountedFilesystemForDirectory(directory *os.File) (filesystem string, retErr error) {
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(int(directory.Fd()), &stat); err != nil {
+		return "", fmt.Errorf("inspect worktree device: %w", err)
+	}
+	mountinfo, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return "", fmt.Errorf("open mountinfo: %w", err)
+	}
+	defer func() {
+		retErr = errors.Join(retErr, mountinfo.Close())
+	}()
+	return mountedFilesystem(mountinfo, directory.Name(), unix.Major(uint64(stat.Dev)), unix.Minor(uint64(stat.Dev)))
+}
+
+func mountedFilesystem(source io.Reader, path string, major, minor uint32) (string, error) {
+	longestMount := ""
+	filesystem := ""
+	scanner := bufio.NewScanner(source)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 7 {
+			continue
+		}
+		deviceMajor, deviceMinor, ok := strings.Cut(fields[2], ":")
+		if !ok {
+			continue
+		}
+		entryMajor, majorErr := strconv.ParseUint(deviceMajor, 10, 32)
+		entryMinor, minorErr := strconv.ParseUint(deviceMinor, 10, 32)
+		if majorErr != nil || minorErr != nil || uint32(entryMajor) != major || uint32(entryMinor) != minor {
+			continue
+		}
+		separator := -1
+		for index := 6; index < len(fields); index++ {
+			if fields[index] == "-" {
+				separator = index
+				break
+			}
+		}
+		if separator < 0 || separator+1 >= len(fields) {
+			continue
+		}
+		mount, err := unescapeMountinfoPath(fields[4])
+		if err != nil {
+			return "", err
+		}
+		if path != mount && !strings.HasPrefix(path, strings.TrimSuffix(mount, "/")+"/") {
+			continue
+		}
+		if len(mount) > len(longestMount) {
+			longestMount = mount
+			filesystem = fields[separator+1]
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read mountinfo: %w", err)
+	}
+	if filesystem == "" {
+		return "", errors.New("worktree mount is absent from mountinfo")
+	}
+	return filesystem, nil
+}
+
+func unescapeMountinfoPath(value string) (string, error) {
+	var result strings.Builder
+	result.Grow(len(value))
+	for index := 0; index < len(value); index++ {
+		if value[index] != '\\' {
+			result.WriteByte(value[index])
+			continue
+		}
+		if index+3 >= len(value) {
+			return "", errors.New("mountinfo path has a truncated escape")
+		}
+		escape := value[index+1 : index+4]
+		if escape != "040" && escape != "011" && escape != "012" && escape != "134" {
+			return "", errors.New("mountinfo path has an invalid escape")
+		}
+		escaped, _ := strconv.ParseUint(escape, 8, 8)
+		result.WriteByte(byte(escaped))
+		index += 3
+	}
+	return result.String(), nil
 }
 
 func openWorktree(path string, checkFilesystem func(*os.File) error, allowNonEmpty bool) (*openedWorktree, error) {

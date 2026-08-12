@@ -1,6 +1,6 @@
 # filecloud
 
-面向多设备的内容寻址文件同步系统。当前处于阶段 0 评审期：协议与架构正在通过状态机和文件系统验证收敛，业务代码尚未开始。
+面向多设备的内容寻址文件同步系统。当前已实现单节点服务端和 Linux/ext4 CLI 的 1A 正确性闭环；macOS/APFS、Windows/NTFS 与 1C 运维能力仍按第一阶段计划推进。
 
 ## 文档
 
@@ -11,3 +11,19 @@
 - [第一阶段实施计划](./docs/design/phase-1-plan.md)
 - [第一阶段验收规范](./docs/design/acceptance-tests.md)
 - [架构决策](./docs/adr/)
+
+## 验证
+
+普通回归测试：
+
+```bash
+go test ./...
+```
+
+Linux/ext4 1A 验收门禁必须在本地 ext4 checkout 中显式运行：
+
+```bash
+FILECLOUD_RUN_1A=1 go test ./cmd/filecloud \
+  -run '^TestIssue22LinuxExt4AcceptanceMatrix$' \
+  -count=1 -timeout=30m -v
+```

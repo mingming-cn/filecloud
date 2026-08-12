@@ -2,6 +2,7 @@ package library
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,8 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -645,29 +648,155 @@ func TestUpdateHeadCapsMissingObjectResponse(t *testing.T) {
 func TestHeadUpdateFaultPointsPreserveReadableInvariant(t *testing.T) {
 	for _, point := range []string{"before", "after"} {
 		t.Run(point, func(t *testing.T) {
-			baseHandler, store, now := newTestHandler(t)
-			defer closeStore(t, store)
-			createHeadLibrary(t, baseHandler)
-			root := putMetadata(t, store, "directories", `{"Entries":[],"Type":"Directory","Version":1}`)
-			commitID := putCommit(t, store, _ownerID, nil, root)
-			config := Config{Now: func() time.Time { return now }, PageTokenKey: bytes.Repeat([]byte{8}, 32)}
-			fault := func() error { return errors.New("injected head update failure") }
-			if point == "before" {
-				config.BeforeHeadUpdate = fault
-			} else {
-				config.AfterHeadUpdate = fault
-			}
-			handler, err := NewHandler(store, log.New(io.Discard, "", 0), config)
+			dataDir, oldCommit, candidate := newHeadCrashFixture(t)
+			command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestHeadUpdateCrashHelper$")
+			command.Env = append(os.Environ(),
+				"FILECLOUD_HEAD_CRASH_DATA_DIR="+dataDir,
+				"FILECLOUD_HEAD_CRASH_POINT="+point,
+				"FILECLOUD_HEAD_CRASH_CANDIDATE="+candidate,
+			)
+			assertHeadProcessSIGKILL(t, command.Run())
+
+			store, err := storage.OpenForServe(t.Context(), dataDir)
 			if err != nil {
-				t.Fatalf("NewHandler: %v", err)
+				t.Fatalf("reopen Head store after %s: %v", point, err)
 			}
-			publishHead(t, handler, commitID, `"head-version-0"`, 500, 5000)
+			defer closeStore(t, store)
+			handler := newHeadTestHandler(t, store, time.Now(), Config{})
 			if point == "before" {
-				assertCurrentHead(t, baseHandler, "", `"head-version-0"`)
-			} else {
-				assertCurrentHead(t, baseHandler, commitID, `"head-version-1"`)
+				assertCurrentHead(t, handler, oldCommit, `"head-version-1"`)
+				assertHeadGraphReadable(t, store, oldCommit)
+				return
 			}
+			assertCurrentHead(t, handler, candidate, `"head-version-2"`)
+			assertHeadGraphReadable(t, store, candidate)
+			assertHeadGraphReadable(t, store, oldCommit)
 		})
+	}
+}
+
+func TestHeadUpdateCrashHelper(t *testing.T) {
+	dataDir := os.Getenv("FILECLOUD_HEAD_CRASH_DATA_DIR")
+	point := os.Getenv("FILECLOUD_HEAD_CRASH_POINT")
+	candidate := os.Getenv("FILECLOUD_HEAD_CRASH_CANDIDATE")
+	if dataDir == "" || point == "" || candidate == "" {
+		t.Skip("Head update crash subprocess helper")
+	}
+	store, err := storage.OpenForServe(t.Context(), dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	kill := func() error {
+		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		return nil
+	}
+	config := Config{}
+	if point == "before" {
+		config.BeforeHeadUpdate = kill
+	} else {
+		config.AfterHeadUpdate = kill
+	}
+	handler := newHeadTestHandler(t, store, time.Now(), config)
+	publishHead(t, handler, candidate, `"head-version-1"`, http.StatusOK, 0)
+	t.Fatalf("Head update did not reach crash point %q", point)
+}
+
+func newHeadCrashFixture(t *testing.T) (string, string, string) {
+	t.Helper()
+	root := os.Getenv("FILECLOUD_ISSUE22_EXT4_ROOT")
+	if root == "" {
+		root = t.TempDir()
+	}
+	dataDir, err := os.MkdirTemp(root, ".issue22-head-store-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Errorf("remove Head crash store: %v", err)
+		}
+	})
+	if err := storage.Init(t.Context(), dataDir); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.OpenForServe(t.Context(), dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := store.CreateUser(t.Context(), storage.User{ID: _ownerID, Username: "alice", PasswordHash: "hash"}, now); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(_ownerToken))
+	if err := store.CreateSession(t.Context(), _ownerID, digest, "crash", now, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	handler := newHeadTestHandler(t, store, now, Config{})
+	createHeadLibrary(t, handler)
+	block := []byte("old Head confirmed content")
+	blockID := object.ID(block)
+	if _, err := store.PutObject(t.Context(), _ownerID, _headLibraryID, "blocks", blockID, bytes.NewReader(block)); err != nil {
+		t.Fatal(err)
+	}
+	file := putMetadata(t, store, "files", fmt.Sprintf(`{"Blocks":["%s"],"Size":"%d","Type":"File","Version":1}`, blockID, len(block)))
+	oldRoot := putMetadata(t, store, "directories", fmt.Sprintf(`{"Entries":[{"Id":"%s","ModifiedAt":"2026-08-09T00:00:00Z","Name":"old.txt","Type":"File"}],"Type":"Directory","Version":1}`, file))
+	oldCommit := putCommit(t, store, _ownerID, nil, oldRoot)
+	publishHead(t, handler, oldCommit, `"head-version-0"`, http.StatusOK, 0)
+	candidateRoot := putMetadata(t, store, "directories", fmt.Sprintf(`{"Entries":[{"Id":"%s","ModifiedAt":"2026-08-09T00:00:00Z","Name":"renamed.txt","Type":"File"}],"Type":"Directory","Version":1}`, file))
+	candidate := putCommit(t, store, _ownerID, []string{oldCommit}, candidateRoot)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return dataDir, oldCommit, candidate
+}
+
+func assertHeadGraphReadable(t *testing.T, store *storage.Store, commitID string) {
+	t.Helper()
+	commitData := readHeadObject(t, store, "commits", commitID)
+	commit, err := object.VerifyCommit(commitData, commitID)
+	if err != nil {
+		t.Fatalf("verify Head commit %s: %v", commitID, err)
+	}
+	directoryData := readHeadObject(t, store, "directories", commit.Root)
+	directory, err := object.VerifyDirectory(directoryData, commit.Root)
+	if err != nil || len(directory.Entries) != 1 {
+		t.Fatalf("verify Head directory %s: %+v, %v", commit.Root, directory, err)
+	}
+	fileData := readHeadObject(t, store, "files", directory.Entries[0].ID)
+	file, err := object.VerifyFile(fileData, directory.Entries[0].ID)
+	if err != nil || len(file.Blocks) != 1 {
+		t.Fatalf("verify Head file %s: %+v, %v", directory.Entries[0].ID, file, err)
+	}
+	block := readHeadObject(t, store, "blocks", file.Blocks[0])
+	if object.ID(block) != file.Blocks[0] || int64(len(block)) != file.Size {
+		t.Fatalf("verify Head block %s size=%d want=%d", file.Blocks[0], len(block), file.Size)
+	}
+}
+
+func readHeadObject(t *testing.T, store *storage.Store, kind, id string) []byte {
+	t.Helper()
+	reader, _, err := store.GetObject(t.Context(), _ownerID, _headLibraryID, kind, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read Head object %s/%s: read=%v close=%v", kind, id, readErr, closeErr)
+	}
+	return data
+}
+
+func assertHeadProcessSIGKILL(t *testing.T, err error) {
+	t.Helper()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("Head process was not killed: %v", err)
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
+		t.Fatalf("Head process status=%v err=%v", status, err)
 	}
 }
 

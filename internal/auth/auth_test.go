@@ -22,6 +22,65 @@ func testParams() Params {
 	return Params{Memory: 64, Iterations: 1, Parallelism: 1, SaltLength: 8, KeyLength: 16}
 }
 
+func TestSessionRawHTTPHeadersAndEmptyLogout(t *testing.T) {
+	handler, store, _ := newTestHandler(t, nil, nil)
+	defer closeTestStore(t, store)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	loginBody := `{"Username":"alice","Password":"correct password","DeviceName":"raw-http"}`
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/v1/sessions", strings.NewReader(loginBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var login struct {
+		RetCode int
+		Message string
+		Session struct{ AccessToken string }
+	}
+	decodeErr := json.NewDecoder(response.Body).Decode(&login)
+	closeErr := response.Body.Close()
+	if decodeErr != nil || closeErr != nil || response.StatusCode != http.StatusOK ||
+		response.Header.Get("Cache-Control") != "no-store" || login.RetCode != 0 || login.Message != "success" || login.Session.AccessToken == "" {
+		t.Fatalf("raw login = status=%d headers=%v retcode=%d message=%q token_present=%v decode=%v close=%v",
+			response.StatusCode, response.Header, login.RetCode, login.Message, login.Session.AccessToken != "", decodeErr, closeErr)
+	}
+
+	logout, err := http.NewRequestWithContext(t.Context(), http.MethodDelete, server.URL+"/v1/sessions/current", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logout.Header.Set("Authorization", "Bearer "+login.Session.AccessToken)
+	response, err = server.Client().Do(logout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(response.Body)
+	closeErr = response.Body.Close()
+	if readErr != nil || closeErr != nil || response.StatusCode != http.StatusNoContent || len(data) != 0 {
+		t.Fatalf("raw logout = status=%d body=%q read=%v close=%v", response.StatusCode, data, readErr, closeErr)
+	}
+
+	response, err = server.Client().Do(logout.Clone(t.Context()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var failure struct {
+		RetCode int
+		Message string
+	}
+	if err := json.NewDecoder(response.Body).Decode(&failure); err != nil || response.StatusCode != http.StatusUnauthorized ||
+		response.Header.Get("WWW-Authenticate") != "Bearer" || failure.RetCode != 1001 || failure.Message == "" {
+		t.Fatalf("raw revoked token = status=%d headers=%v body=%+v err=%v", response.StatusCode, response.Header, failure, err)
+	}
+}
+
 func TestCreateAndDeleteSession(t *testing.T) {
 	handler, store, now := newTestHandler(t, nil, nil)
 	defer closeTestStore(t, store)
