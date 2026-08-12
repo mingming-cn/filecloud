@@ -70,7 +70,11 @@ func TestSessionRawHTTPHeadersAndEmptyLogout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Errorf("close revoked-token response: %v", err)
+		}
+	}()
 	var failure struct {
 		RetCode int
 		Message string

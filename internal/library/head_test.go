@@ -13,11 +13,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/mingming-cn/filecloud/internal/acceptance"
 	"github.com/mingming-cn/filecloud/internal/object"
 	"github.com/mingming-cn/filecloud/internal/storage"
 )
@@ -663,14 +665,16 @@ func TestHeadUpdateFaultPointsPreserveReadableInvariant(t *testing.T) {
 			}
 			defer closeStore(t, store)
 			handler := newHeadTestHandler(t, store, time.Now(), Config{})
+			currentHead := candidate
 			if point == "before" {
+				currentHead = oldCommit
 				assertCurrentHead(t, handler, oldCommit, `"head-version-1"`)
-				assertHeadGraphReadable(t, store, oldCommit)
-				return
+			} else {
+				assertCurrentHead(t, handler, candidate, `"head-version-2"`)
+				assertHeadGraphReadable(t, store, candidate)
 			}
-			assertCurrentHead(t, handler, candidate, `"head-version-2"`)
-			assertHeadGraphReadable(t, store, candidate)
-			assertHeadGraphReadable(t, store, oldCommit)
+			reachableObjects := assertHeadGraphReadable(t, store, oldCommit)
+			emitHeadCrashAttestation(t, point, oldCommit, currentHead, reachableObjects)
 		})
 	}
 }
@@ -686,10 +690,9 @@ func TestHeadUpdateCrashHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer closeStore(t, store)
 	kill := func() error {
-		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
-		return nil
+		return syscall.Kill(os.Getpid(), syscall.SIGKILL)
 	}
 	config := Config{}
 	if point == "before" {
@@ -751,7 +754,7 @@ func newHeadCrashFixture(t *testing.T) (string, string, string) {
 	return dataDir, oldCommit, candidate
 }
 
-func assertHeadGraphReadable(t *testing.T, store *storage.Store, commitID string) {
+func assertHeadGraphReadable(t *testing.T, store *storage.Store, commitID string) int {
 	t.Helper()
 	commitData := readHeadObject(t, store, "commits", commitID)
 	commit, err := object.VerifyCommit(commitData, commitID)
@@ -772,6 +775,23 @@ func assertHeadGraphReadable(t *testing.T, store *storage.Store, commitID string
 	if object.ID(block) != file.Blocks[0] || int64(len(block)) != file.Size {
 		t.Fatalf("verify Head block %s size=%d want=%d", file.Blocks[0], len(block), file.Size)
 	}
+	return 4
+}
+
+func emitHeadCrashAttestation(t *testing.T, point, oldHead, currentHead string, reachableObjects int) {
+	t.Helper()
+	if os.Getenv("FILECLOUD_RUN_1A") != "1" {
+		return
+	}
+	line, err := acceptance.Encode(acceptance.Attestation{
+		Kind: "server-readability", Scenario: "Head update " + point, Platform: runtime.GOOS,
+		Filesystem: "ext4", ReachableObjects: reachableObjects, FailurePoint: point,
+		OldHead: oldHead, CurrentHead: currentHead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(line)
 }
 
 func readHeadObject(t *testing.T, store *storage.Store, kind, id string) []byte {

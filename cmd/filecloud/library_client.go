@@ -2765,7 +2765,10 @@ func unescapeMountinfoPath(value string) (string, error) {
 		if escape != "040" && escape != "011" && escape != "012" && escape != "134" {
 			return "", errors.New("mountinfo path has an invalid escape")
 		}
-		escaped, _ := strconv.ParseUint(escape, 8, 8)
+		escaped, err := strconv.ParseUint(escape, 8, 8)
+		if err != nil {
+			return "", fmt.Errorf("parse mountinfo path escape: %w", err)
+		}
 		result.WriteByte(byte(escaped))
 		index += 3
 	}
@@ -2950,6 +2953,8 @@ func openClientDB(path string, readOnly bool) (*sql.DB, error) {
 	query.Add("_pragma", "foreign_keys(ON)")
 	if readOnly {
 		query.Set("mode", "ro")
+	} else {
+		query.Set("_txlock", "immediate")
 	}
 	u.RawQuery = query.Encode()
 	db, err := sql.Open("sqlite", u.String())

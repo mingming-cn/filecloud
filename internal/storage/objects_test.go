@@ -11,12 +11,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/mingming-cn/filecloud/internal/acceptance"
 	"github.com/mingming-cn/filecloud/internal/object"
 )
 
@@ -341,7 +343,8 @@ func TestObjectStorePublicationCrashMatrixPreservesOldHead(t *testing.T) {
 			if err != nil || library.HeadCommitID == nil || *library.HeadCommitID != oldCommitID || library.HeadVersion != 1 {
 				t.Fatalf("Head after %s = %+v, %v", point, library, err)
 			}
-			assertStoredHeadGraph(t, store, oldCommitID, oldRootID)
+			reachableObjects := assertStoredHeadGraph(t, store, oldCommitID, oldRootID)
+			emitObjectPublicationAttestation(t, point, oldCommitID, *library.HeadCommitID, reachableObjects)
 
 			data := []byte(_objectCrashNewBlock)
 			created, err := store.PutObject(t.Context(), _objectCrashOwnerID, _objectCrashLibraryID,
@@ -376,10 +379,10 @@ func TestObjectStorePublicationCrashHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer closeObjectStore(t, store)
 	store.objectPublicationFault = func(actual string) error {
 		if actual == point {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return syscall.Kill(os.Getpid(), syscall.SIGKILL)
 		}
 		return nil
 	}
@@ -454,8 +457,7 @@ func newObjectPublicationCrashStore(t *testing.T) (string, string, string) {
 	}
 	dataDir, err = filepath.Abs(dataDir)
 	if err != nil {
-		os.RemoveAll(dataDir)
-		t.Fatal(err)
+		t.Fatal(errors.Join(err, os.RemoveAll(dataDir)))
 	}
 	t.Cleanup(func() {
 		if err := os.RemoveAll(dataDir); err != nil {
@@ -512,7 +514,7 @@ func newObjectPublicationCrashStore(t *testing.T) (string, string, string) {
 	return dataDir, commitID, rootID
 }
 
-func assertStoredHeadGraph(t *testing.T, store *Store, commitID, rootID string) {
+func assertStoredHeadGraph(t *testing.T, store *Store, commitID, rootID string) int {
 	t.Helper()
 	commitData := readStoredObject(t, store, "commits", commitID)
 	commit, err := object.VerifyCommit(commitData, commitID)
@@ -533,6 +535,23 @@ func assertStoredHeadGraph(t *testing.T, store *Store, commitID, rootID string) 
 	if object.ID(block) != file.Blocks[0] || int64(len(block)) != file.Size {
 		t.Fatalf("verify old Head block %s: size=%d want=%d", file.Blocks[0], len(block), file.Size)
 	}
+	return 4
+}
+
+func emitObjectPublicationAttestation(t *testing.T, point, oldHead, currentHead string, reachableObjects int) {
+	t.Helper()
+	if os.Getenv("FILECLOUD_RUN_1A") != "1" {
+		return
+	}
+	line, err := acceptance.Encode(acceptance.Attestation{
+		Kind: "server-readability", Scenario: "object publication " + point, Platform: runtime.GOOS,
+		Filesystem: "ext4", ReachableObjects: reachableObjects, FailurePoint: point,
+		OldHead: oldHead, CurrentHead: currentHead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(line)
 }
 
 func readStoredObject(t *testing.T, store *Store, kind, id string) []byte {

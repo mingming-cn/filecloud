@@ -6,18 +6,21 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/mingming-cn/filecloud/internal/acceptance"
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/object"
 	"github.com/mingming-cn/filecloud/internal/storage"
@@ -36,8 +39,7 @@ func TestLinuxExt4AcceptanceMatrix(t *testing.T) {
 	}
 	ext4Temp, err = filepath.Abs(ext4Temp)
 	if err != nil {
-		os.RemoveAll(ext4Temp)
-		t.Fatal(err)
+		t.Fatal(errors.Join(err, os.RemoveAll(ext4Temp)))
 	}
 	t.Cleanup(func() {
 		if err := os.RemoveAll(ext4Temp); err != nil {
@@ -53,12 +55,22 @@ func TestLinuxExt4AcceptanceMatrix(t *testing.T) {
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindImportsLocalSnapshotAndSyncNoOps"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindChecksOutRemoteHeadWithoutMutation"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindCheckoutRejectsBothNonEmptyWithoutMutation"},
+		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindRejectsUnsupportedOrNonEmptyAndBindingConflicts"},
+		{category: "sync convergence", packagePath: "./cmd/filecloud", test: "TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject"},
+		{category: "sync convergence", packagePath: "./cmd/filecloud", test: "TestLibrarySyncMtimeOnlyChangesConvergeWithoutCommitLoop"},
+		{category: "sync convergence", packagePath: "./cmd/filecloud", test: "TestLibrarySyncContinuousTrivialMergeCompetition"},
+		{category: "sync convergence", packagePath: "./cmd/filecloud", test: "TestLibrarySyncContinuousDivergentHeadConflictsReuseCapturedSeed"},
+		{category: "sync convergence", packagePath: "./cmd/filecloud", test: "TestLibrarySyncRecursiveMergeResolvesLostCASResponse"},
+		{category: "sync convergence", packagePath: "./cmd/filecloud", test: "TestLibrarySyncRecoversPublishedCandidateBeforeDiscardingMutatedWorktree"},
+		{category: "sync convergence", packagePath: "./cmd/filecloud", test: "TestLibrarySyncPendingPublicationTransitionsToSuccessor"},
 		{category: "scan races", packagePath: "./cmd/filecloud", test: "TestScanRegularFileRetriesConcurrentRewrite"},
 		{category: "scan races", packagePath: "./cmd/filecloud", test: "TestScanDirectoryEnumerationChangeFailsRound"},
 		{category: "scan races", packagePath: "./cmd/filecloud", test: "TestScanFinalValidationCatchesEarlierFileChange"},
 		{category: "scan races", packagePath: "./cmd/filecloud", test: "TestSyncUnstableScanDoesNotPublishOrChangeClientState"},
 		{category: "checkout fault injection", packagePath: "./cmd/filecloud", test: "TestFSActionSubprocessCrashMatrix"},
+		{category: "checkout fault injection", packagePath: "./cmd/filecloud", test: "TestPublicBindSubprocessCrashMatrix"},
 		{category: "checkout fault injection", packagePath: "./cmd/filecloud", test: "TestPublicInitialCheckoutBaseCommitCrashMatrix"},
+		{category: "checkout fault injection", packagePath: "./cmd/filecloud", test: "TestPublicSyncSubprocessCrashMatrix"},
 		{category: "checkout fault injection", packagePath: "./cmd/filecloud", test: "TestPublicSyncTransactionCrashMatrix"},
 		{category: "checkout fault injection", packagePath: "./cmd/filecloud", test: "TestFSActionRemoveIntentPreservesOldFDModification"},
 		{category: "checkout fault injection", packagePath: "./cmd/filecloud", test: "TestLibrarySyncConflictPromotionPreservesOpenFileIdentity"},
@@ -111,6 +123,183 @@ type linuxExt4TestKey struct {
 	test        string
 }
 
+const _linuxExt4AttestationPrefix = acceptance.Prefix
+
+type linuxExt4Attestation = acceptance.Attestation
+
+func TestLinuxExt4AttestationValidation(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	root := strings.Repeat("b", 64)
+	digest := strings.Repeat("c", 64)
+	valid := linuxExt4Attestation{
+		Kind: "convergence", Scenario: "stable", Platform: "linux", Filesystem: "ext4",
+		Head: id, SyncBase: id, HeadRoot: root, BaseRoot: root, Snapshot: root, ReachableObjects: 3,
+		ConfirmedInputDigests: []string{digest}, PreservedInputDigests: []string{digest},
+	}
+	for _, test := range []struct {
+		name         string
+		attestations []linuxExt4Attestation
+		required     map[string]string
+		wantErr      bool
+	}{
+		{name: "valid convergence", attestations: []linuxExt4Attestation{valid}, required: map[string]string{"stable": "convergence"}},
+		{name: "duplicate content is set semantics", attestations: []linuxExt4Attestation{func() linuxExt4Attestation {
+			value := valid
+			value.ConfirmedInputDigests = []string{digest, digest}
+			value.PreservedInputDigests = []string{digest}
+			return value
+		}()}, required: map[string]string{"stable": "convergence"}},
+		{name: "valid empty convergence", attestations: []linuxExt4Attestation{{Kind: "convergence", Scenario: "empty", Platform: "linux", Filesystem: "ext4", Head: id, SyncBase: id, HeadRoot: root, BaseRoot: root, Snapshot: root, ReachableObjects: 2}}, required: map[string]string{"empty": "convergence"}},
+		{name: "unknown scenario", attestations: []linuxExt4Attestation{valid}, required: map[string]string{"other": "convergence"}, wantErr: true},
+		{name: "duplicate scenario", attestations: []linuxExt4Attestation{valid, valid}, required: map[string]string{"stable": "convergence"}, wantErr: true},
+		{name: "snapshot drift", attestations: []linuxExt4Attestation{func() linuxExt4Attestation { value := valid; value.Snapshot = digest; return value }()}, required: map[string]string{"stable": "convergence"}, wantErr: true},
+		{name: "missing preserved input", attestations: []linuxExt4Attestation{func() linuxExt4Attestation { value := valid; value.PreservedInputDigests = nil; return value }()}, required: map[string]string{"stable": "convergence"}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateLinuxExt4Attestations(test.attestations, test.required)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateLinuxExt4Attestations() error=%v wantErr=%v", err, test.wantErr)
+			}
+		})
+	}
+
+	if _, found, err := decodeLinuxExt4Attestation("noise"); found || err != nil {
+		t.Fatalf("decode noise = found=%v err=%v", found, err)
+	}
+	line := _linuxExt4AttestationPrefix + `{"kind":"convergence","scenario":"stable","platform":"linux","filesystem":"ext4","unknown":true}`
+	if _, found, err := decodeLinuxExt4Attestation(line); !found || err == nil {
+		t.Fatalf("decode unknown field = found=%v err=%v", found, err)
+	}
+	collector := newLinuxExt4AttestationCollector()
+	encoded, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line = "test.go:1: " + _linuxExt4AttestationPrefix + string(encoded) + "\n"
+	middle := len(line) / 2
+	if values, err := collector.add("TestStable", line[:middle]); err != nil || len(values) != 0 {
+		t.Fatalf("first attestation chunk values=%v err=%v", values, err)
+	}
+	if values, err := collector.add("TestStable", line[middle:]); err != nil || len(values) != 1 || values[0].Scenario != valid.Scenario {
+		t.Fatalf("second attestation chunk values=%v err=%v", values, err)
+	}
+	if err := collector.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func decodeLinuxExt4Attestation(line string) (linuxExt4Attestation, bool, error) {
+	line = strings.TrimSpace(line)
+	index := strings.Index(line, _linuxExt4AttestationPrefix)
+	if index < 0 {
+		return linuxExt4Attestation{}, false, nil
+	}
+	payload := line[index+len(_linuxExt4AttestationPrefix):]
+	decoder := json.NewDecoder(strings.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var result linuxExt4Attestation
+	if err := decoder.Decode(&result); err != nil {
+		return linuxExt4Attestation{}, true, fmt.Errorf("decode Linux/ext4 attestation: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return linuxExt4Attestation{}, true, errors.New("Linux/ext4 attestation has trailing data")
+	}
+	return result, true, nil
+}
+
+func validateLinuxExt4Attestations(attestations []linuxExt4Attestation, required map[string]string) error {
+	seen := make(map[string]bool, len(required))
+	for _, attestation := range attestations {
+		kind, ok := required[attestation.Scenario]
+		if !ok || kind != attestation.Kind {
+			return fmt.Errorf("unexpected Linux/ext4 attestation kind=%q scenario=%q", attestation.Kind, attestation.Scenario)
+		}
+		if seen[attestation.Scenario] {
+			return fmt.Errorf("duplicate Linux/ext4 attestation scenario=%q", attestation.Scenario)
+		}
+		seen[attestation.Scenario] = true
+		if attestation.Platform != "linux" || attestation.Filesystem != "ext4" {
+			return fmt.Errorf("invalid Linux/ext4 attestation platform=%q filesystem=%q", attestation.Platform, attestation.Filesystem)
+		}
+		if attestation.UnregisteredInternalPaths != 0 || attestation.ResidualJournalRows != 0 {
+			return fmt.Errorf("Linux/ext4 attestation %q has internal paths or journal rows", attestation.Scenario)
+		}
+		switch attestation.Kind {
+		case "convergence":
+			if !object.ValidID(attestation.Head) || !object.ValidID(attestation.SyncBase) ||
+				!object.ValidID(attestation.HeadRoot) || !object.ValidID(attestation.BaseRoot) ||
+				!object.ValidID(attestation.Snapshot) || attestation.Head != attestation.SyncBase ||
+				attestation.HeadRoot != attestation.BaseRoot || attestation.HeadRoot != attestation.Snapshot ||
+				attestation.ReachableObjects < 2 {
+				return fmt.Errorf("Linux/ext4 convergence attestation %q has divergent or invalid state", attestation.Scenario)
+			}
+			confirmed := uniqueSortedDigests(attestation.ConfirmedInputDigests)
+			preserved := uniqueSortedDigests(attestation.PreservedInputDigests)
+			if !slices.Equal(confirmed, preserved) ||
+				slices.ContainsFunc(confirmed, func(id string) bool { return !object.ValidID(id) }) ||
+				slices.ContainsFunc(preserved, func(id string) bool { return !object.ValidID(id) }) {
+				return fmt.Errorf("Linux/ext4 convergence attestation %q did not preserve every confirmed input", attestation.Scenario)
+			}
+		case "isolation":
+			if !object.ValidID(attestation.OwnerHead) || attestation.OtherHead != nil || attestation.Isolation != "uniform-not-found" {
+				return fmt.Errorf("Linux/ext4 isolation attestation %q is invalid", attestation.Scenario)
+			}
+		case "server-readability":
+			if attestation.FailurePoint == "" || !object.ValidID(attestation.OldHead) ||
+				!object.ValidID(attestation.CurrentHead) || attestation.ReachableObjects < 2 {
+				return fmt.Errorf("Linux/ext4 server-readability attestation %q is invalid", attestation.Scenario)
+			}
+		default:
+			return fmt.Errorf("unsupported Linux/ext4 attestation kind=%q", attestation.Kind)
+		}
+	}
+	for scenario := range required {
+		if !seen[scenario] {
+			return fmt.Errorf("missing Linux/ext4 attestation scenario=%q", scenario)
+		}
+	}
+	return nil
+}
+
+type linuxExt4AttestationCollector struct {
+	pending map[string]*strings.Builder
+}
+
+func newLinuxExt4AttestationCollector() *linuxExt4AttestationCollector {
+	return &linuxExt4AttestationCollector{pending: make(map[string]*strings.Builder)}
+}
+
+func (c *linuxExt4AttestationCollector) add(test, output string) ([]linuxExt4Attestation, error) {
+	builder := c.pending[test]
+	if builder == nil {
+		if !strings.Contains(output, _linuxExt4AttestationPrefix) {
+			return nil, nil
+		}
+		builder = &strings.Builder{}
+		c.pending[test] = builder
+	}
+	builder.WriteString(output)
+	if !strings.HasSuffix(output, "\n") {
+		return nil, nil
+	}
+	delete(c.pending, test)
+	attestation, found, err := decodeLinuxExt4Attestation(builder.String())
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errors.New("completed Linux/ext4 attestation has no marker")
+	}
+	return []linuxExt4Attestation{attestation}, nil
+}
+
+func (c *linuxExt4AttestationCollector) close() error {
+	if len(c.pending) != 0 {
+		return fmt.Errorf("Linux/ext4 acceptance has %d incomplete attestations", len(c.pending))
+	}
+	return nil
+}
+
 func runLinuxExt4Matrix(t *testing.T, ext4Temp string, scenarios []linuxExt4MatrixScenario) {
 	t.Helper()
 	command := exec.CommandContext(t.Context(), "go", "test", "-json", "./...", "-count=1", "-timeout=10m")
@@ -144,7 +333,8 @@ func runLinuxExt4Matrix(t *testing.T, ext4Temp string, scenarios []linuxExt4Matr
 		"TestFSActionCrashHelper":                        true,
 		"TestLinuxExt4AcceptanceMatrix":                  true,
 	}
-	var attestations []string
+	var attestations []linuxExt4Attestation
+	collector := newLinuxExt4AttestationCollector()
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	for {
 		var event linuxExt4TestEvent
@@ -171,10 +361,16 @@ func runLinuxExt4Matrix(t *testing.T, ext4Temp string, scenarios []linuxExt4Matr
 					event.Package, event.Test, runtime.GOOS)
 			}
 		}
-		if event.Test == "TestLinuxExt4CorrectnessLoop" && event.Action == "output" &&
-			strings.Contains(event.Output, "scenario=") {
-			attestations = append(attestations, strings.TrimSpace(event.Output))
+		if event.Action == "output" {
+			values, err := collector.add(event.Test, event.Output)
+			if err != nil {
+				t.Fatalf("Linux/ext4 acceptance malformed attestation: %v\n%s", err, output)
+			}
+			attestations = append(attestations, values...)
 		}
+	}
+	if err := collector.close(); err != nil {
+		t.Fatalf("Linux/ext4 acceptance attestations: %v\n%s", err, output)
 	}
 	for key, scenario := range required {
 		if !passed[key] {
@@ -182,111 +378,93 @@ func runLinuxExt4Matrix(t *testing.T, ext4Temp string, scenarios []linuxExt4Matr
 				scenario.category, key.packagePath, key.test)
 		}
 	}
-	assertLinuxExt4Attestations(t, attestations, output)
+	if err := validateLinuxExt4Attestations(attestations, requiredLinuxExt4Attestations()); err != nil {
+		t.Fatalf("Linux/ext4 acceptance attestations: %v\n%s", err, output)
+	}
 	for _, attestation := range attestations {
-		t.Log(attestation)
+		line, err := acceptance.Encode(attestation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Log(line)
 	}
 }
 
-func assertLinuxExt4Attestations(t *testing.T, attestations []string, output []byte) {
-	t.Helper()
-	requiredConvergence := map[string]bool{
-		"publisher import":                    false,
-		"subscriber checkout":                 false,
-		"independent merge subscriber":        false,
-		"independent merge first client":      false,
-		"independent merge second client":     false,
-		"conflict preservation first client":  false,
-		"conflict preservation second client": false,
-	}
-	isolationSeen := false
-	for _, attestation := range attestations {
-		name, ok := linuxExt4AttestationScenario(attestation)
-		if !ok {
-			t.Fatalf("Linux/ext4 acceptance malformed attestation %q\n%s", attestation, output)
-		}
-		if name == "two-user isolation" {
-			if isolationSeen {
-				t.Fatalf("Linux/ext4 acceptance duplicate isolation attestation %q", attestation)
-			}
-			for _, field := range []string{"platform=linux", "filesystem=ext4", "other_head=null", "isolation=uniform-not-found"} {
-				if !strings.Contains(attestation, field) {
-					t.Fatalf("Linux/ext4 acceptance isolation attestation missing %q: %q", field, attestation)
-				}
-			}
-			ownerHead, ok := linuxExt4AttestationField(attestation, "owner_head")
-			if !ok || !object.ValidID(ownerHead) {
-				t.Fatalf("Linux/ext4 acceptance isolation attestation has invalid owner Head: %q", attestation)
-			}
-			isolationSeen = true
-			continue
-		}
-		seen, required := requiredConvergence[name]
-		if !required || seen {
-			t.Fatalf("Linux/ext4 acceptance unexpected or duplicate attestation %q", attestation)
-		}
-		for _, field := range []string{"platform=linux", "filesystem=ext4"} {
-			if !strings.Contains(attestation, field) {
-				t.Fatalf("Linux/ext4 acceptance convergence attestation missing %q: %q", field, attestation)
-			}
-		}
-		head, headOK := linuxExt4AttestationField(attestation, "Head")
-		base, baseOK := linuxExt4AttestationField(attestation, "SyncBase")
-		snapshot, snapshotOK := linuxExt4AttestationField(attestation, "snapshot")
-		if !headOK || !baseOK || !snapshotOK || !object.ValidID(head) || !object.ValidID(base) ||
-			!object.ValidID(snapshot) || head != base {
-			t.Fatalf("Linux/ext4 acceptance convergence attestation has invalid or divergent IDs: %q", attestation)
-		}
-		for _, field := range []string{"reachable_objects", "confirmed_inputs"} {
-			value, ok := linuxExt4AttestationField(attestation, field)
-			count, err := strconv.Atoi(value)
-			if !ok || err != nil || count < 1 {
-				t.Fatalf("Linux/ext4 acceptance convergence attestation has invalid %s: %q", field, attestation)
-			}
-		}
-		internalPaths, ok := linuxExt4AttestationField(attestation, "internal_paths")
-		if !ok || internalPaths != "0" {
-			t.Fatalf("Linux/ext4 acceptance convergence attestation has registered internal paths: %q", attestation)
-		}
-		requiredConvergence[name] = true
-	}
-	for name, seen := range requiredConvergence {
-		if !seen {
-			t.Fatalf("Linux/ext4 acceptance correctness oracle emitted no attestation for %q\n%s", name, output)
-		}
-	}
-	if !isolationSeen {
-		t.Fatalf("Linux/ext4 acceptance correctness oracle emitted no isolation attestation\n%s", output)
-	}
+func uniqueSortedDigests(values []string) []string {
+	result := slices.Clone(values)
+	slices.Sort(result)
+	return slices.Compact(result)
 }
 
-func linuxExt4AttestationScenario(attestation string) (string, bool) {
-	const marker = "scenario=\""
-	start := strings.Index(attestation, marker)
-	if start < 0 {
-		return "", false
+func requiredLinuxExt4Attestations() map[string]string {
+	result := map[string]string{
+		"publisher import":                             "convergence",
+		"subscriber checkout":                          "convergence",
+		"independent merge subscriber":                 "convergence",
+		"independent merge first client":               "convergence",
+		"independent merge second client":              "convergence",
+		"conflict preservation first client":           "convergence",
+		"conflict preservation second client":          "convergence",
+		"two-user isolation":                           "isolation",
+		"double-empty binding":                         "convergence",
+		"first local import":                           "convergence",
+		"first remote checkout":                        "convergence",
+		"concurrent initialization first client":       "convergence",
+		"concurrent initialization second client":      "convergence",
+		"binding conflict original client":             "convergence",
+		"binding conflict remote checkout":             "convergence",
+		"mtime single-sided":                           "convergence",
+		"mtime two-sided first client":                 "convergence",
+		"mtime two-sided second client":                "convergence",
+		"continuous trivial Head competition":          "convergence",
+		"continuous divergent Head competition":        "convergence",
+		"recursive lost CAS response":                  "convergence",
+		"lost CAS preserves post-publication changes":  "convergence",
+		"pending publication became Head ancestor":     "convergence",
+		"protected deletion confirmed":                 "convergence",
+		"confirmed deletion resumes upload failure":    "convergence",
+		"100 MiB upload resumed":                       "convergence",
+		"checkout resumes truncated download":          "convergence",
+		"checkout rejects wrong digest then resumes":   "convergence",
+		"checkout resumes disk failure":                "convergence",
+		"initial checkout crash before":                "convergence",
+		"initial checkout crash after":                 "convergence",
+		"sync transaction crash before_base_commit":    "convergence",
+		"sync transaction crash after_base_commit":     "convergence",
+		"sync transaction crash before_cleanup_commit": "convergence",
+		"sync transaction crash after_cleanup_commit":  "convergence",
+		"Head update before":                           "server-readability",
+		"Head update after":                            "server-readability",
 	}
-	start += len(marker)
-	end := strings.IndexByte(attestation[start:], '"')
-	if end < 0 {
-		return "", false
+	for _, scenario := range []string{
+		"local delete remote modify file", "local modify remote delete file",
+		"local delete remote modify directory", "local modify remote delete directory",
+		"local file remote directory", "local directory remote file", "both delete", "identical change",
+		"rename is delete plus add",
+	} {
+		result["structural "+scenario] = "convergence"
 	}
-	return attestation[start : start+end], true
-}
-
-func linuxExt4AttestationField(attestation, name string) (string, bool) {
-	marker := " " + name + "="
-	start := strings.Index(attestation, marker)
-	if start < 0 {
-		return "", false
+	for _, point := range []string{
+		"before_temporary_write", "after_temporary_write", "before_temporary_sync", "after_temporary_sync",
+		"before_install", "after_install", "before_parent_sync", "after_parent_sync",
+	} {
+		result["object publication "+point] = "server-readability"
 	}
-	start += len(marker)
-	end := strings.IndexByte(attestation[start:], ' ')
-	if end < 0 {
-		end = len(attestation) - start
+	for _, category := range []struct{ op, kind string }{
+		{fsOpCreateFile, "File"}, {fsOpCreateDirectory, "Directory"},
+		{fsOpMtime, "File"}, {fsOpMtime, "Directory"},
+		{fsOpRename, "File"}, {fsOpRename, "Directory"},
+	} {
+		for _, point := range []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"} {
+			result[linuxExt4BindCrashScenario(category.op, category.kind, point)] = "convergence"
+		}
 	}
-	value := attestation[start : start+end]
-	return value, value != ""
+	for _, name := range []string{"capture-file", "capture-directory", "post-base-file", "post-base-directory"} {
+		for _, point := range []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"} {
+			result[linuxExt4SyncCrashScenario(name, point)] = "convergence"
+		}
+	}
+	return result
 }
 
 func TestLinuxExt4CorrectnessLoop(t *testing.T) {
@@ -373,8 +551,33 @@ func TestLinuxExt4CorrectnessLoop(t *testing.T) {
 }
 
 type linuxExt4ConfirmedInput struct {
-	name string
-	data []byte
+	name   string
+	data   []byte
+	digest string
+}
+
+func (i linuxExt4ConfirmedInput) contentDigest() string {
+	if i.digest != "" {
+		return i.digest
+	}
+	return object.ID(i.data)
+}
+
+func linuxExt4ConfirmedInputs(values ...string) []linuxExt4ConfirmedInput {
+	result := make([]linuxExt4ConfirmedInput, 0, len(values))
+	for index, value := range values {
+		result = append(result, linuxExt4ConfirmedInput{name: fmt.Sprintf("input-%d", index+1), data: []byte(value)})
+	}
+	return result
+}
+
+func linuxExt4ConfirmedFiles(files map[string][]byte) []linuxExt4ConfirmedInput {
+	names := slices.Sorted(maps.Keys(files))
+	result := make([]linuxExt4ConfirmedInput, 0, len(names))
+	for _, name := range names {
+		result = append(result, linuxExt4ConfirmedInput{name: name, data: files[name]})
+	}
+	return result
 }
 
 type linuxExt4Client struct {
@@ -384,7 +587,7 @@ type linuxExt4Client struct {
 
 type linuxExt4Reachability struct {
 	objects int
-	files   map[string][]byte
+	files   map[string]string
 }
 
 func runLinuxExt4CLI(t *testing.T, args []string, stdin string) error {
@@ -405,8 +608,7 @@ func newLinuxExt4ClientPaths(t *testing.T) (string, string) {
 	}
 	canonical, err := filepath.Abs(worktree)
 	if err != nil {
-		os.RemoveAll(worktree)
-		t.Fatalf("canonicalize ext4 worktree: %v", err)
+		t.Fatalf("canonicalize ext4 worktree: %v", errors.Join(err, os.RemoveAll(worktree)))
 	}
 	t.Cleanup(func() {
 		if err := os.RemoveAll(canonical); err != nil {
@@ -457,12 +659,18 @@ func assertLinuxExt4Converged(t *testing.T, scenario string, environment library
 	clientDir, worktree string, confirmed []linuxExt4ConfirmedInput,
 ) clientBinding {
 	t.Helper()
+	if os.Getenv("FILECLOUD_RUN_1A") == "1" {
+		requireLinuxExt4(t, worktree)
+	}
 	binding := assertTestConverged(t, environment, clientDir, worktree)
+	residualRows := 0
 	for _, table := range []string{
 		"bind_intents", "pending_publications", "pending_checkouts", "checkout_paths", "sync_recoveries",
 		"sync_recovery_promotions", "fs_actions",
 	} {
-		if count := countClientRows(t, clientDir, table, worktree); count != 0 {
+		count := countClientRows(t, clientDir, table, worktree)
+		residualRows += count
+		if count != 0 {
 			t.Fatalf("%s has %d residual %s rows", scenario, count, table)
 		}
 	}
@@ -482,22 +690,61 @@ func assertLinuxExt4Converged(t *testing.T, scenario string, environment library
 	}
 	assertNoSyncInternalPaths(t, worktree)
 
-	reachable := inspectLinuxExt4Reachability(t, environment, binding.SyncBase)
-	for _, input := range confirmed {
-		preserved := false
-		for _, data := range reachable.files {
-			if bytes.Equal(data, input.data) {
-				preserved = true
-				break
-			}
-		}
-		if !preserved {
-			t.Fatalf("%s lost confirmed input %q", scenario, input.name)
-		}
+	base := mustServerURL(t, environment.server.URL)
+	head, err := getRemoteHead(t.Context(), base, testClientLibraryID, []byte(environment.token))
+	if err != nil || head.CommitID == nil {
+		t.Fatalf("%s read Head: head=%+v err=%v", scenario, head, err)
 	}
-	t.Logf("scenario=%q platform=%s filesystem=ext4 Head=%s SyncBase=%s snapshot=%s reachable_objects=%d confirmed_inputs=%d internal_paths=0",
-		scenario, runtime.GOOS, binding.SyncBase, binding.SyncBase, binding.SyncBaseRoot, reachable.objects, len(confirmed))
+	commit, err := getRemoteCommit(t.Context(), base, testClientLibraryID, []byte(environment.token), *head.CommitID)
+	if err != nil {
+		t.Fatalf("%s read Head Commit: %v", scenario, err)
+	}
+	root, err := openWorktreeRoot(worktree, func(*os.File) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, scanErr := scanWorktree(root)
+	closeErr := root.Close()
+	if scanErr != nil || closeErr != nil {
+		t.Fatalf("%s rescan: scan=%v close=%v", scenario, scanErr, closeErr)
+	}
+	reachable := inspectLinuxExt4Reachability(t, environment, *head.CommitID)
+	preserved := make(map[string]bool, len(reachable.files))
+	for _, digest := range reachable.files {
+		preserved[digest] = true
+	}
+	confirmedSet := make(map[string]bool, len(confirmed))
+	preservedSet := make(map[string]bool, len(confirmed))
+	for _, input := range confirmed {
+		digest := input.contentDigest()
+		confirmedSet[digest] = true
+		if preserved[digest] {
+			preservedSet[digest] = true
+			continue
+		}
+		t.Fatalf("%s lost confirmed input %q", scenario, input.name)
+	}
+	confirmedDigests := slices.Sorted(maps.Keys(confirmedSet))
+	preservedDigests := slices.Sorted(maps.Keys(preservedSet))
+	emitLinuxExt4Attestation(t, linuxExt4Attestation{
+		Kind: "convergence", Scenario: scenario, Platform: runtime.GOOS, Filesystem: "ext4",
+		Head: *head.CommitID, SyncBase: binding.SyncBase, HeadRoot: commit.Root, BaseRoot: binding.SyncBaseRoot,
+		Snapshot: snapshot.root, ReachableObjects: reachable.objects, ConfirmedInputDigests: confirmedDigests,
+		PreservedInputDigests: preservedDigests, ResidualJournalRows: residualRows,
+	})
 	return binding
+}
+
+func emitLinuxExt4Attestation(t *testing.T, attestation linuxExt4Attestation) {
+	t.Helper()
+	if os.Getenv("FILECLOUD_RUN_1A") != "1" {
+		return
+	}
+	line, err := acceptance.Encode(attestation)
+	if err != nil {
+		t.Fatalf("encode Linux/ext4 attestation: %v", err)
+	}
+	t.Log(line)
 }
 
 func inspectLinuxExt4Reachability(t *testing.T, environment libraryCLIEnvironment, head string) linuxExt4Reachability {
@@ -505,7 +752,8 @@ func inspectLinuxExt4Reachability(t *testing.T, environment libraryCLIEnvironmen
 	base := mustServerURL(t, environment.server.URL)
 	token := []byte(environment.token)
 	objects := make(map[string][]byte)
-	files := make(map[string][]byte)
+	visited := make(map[string]bool)
+	files := make(map[string]string)
 	var visitDirectory func(string)
 	var visitFile func(string)
 
@@ -538,7 +786,10 @@ func inspectLinuxExt4Reachability(t *testing.T, environment libraryCLIEnvironmen
 		if got := response.Header.Get("Cache-Control"); got != "private, immutable" {
 			t.Fatalf("GET reachable %s/%s Cache-Control=%q", kind, id, got)
 		}
-		objects[key] = data
+		visited[key] = true
+		if kind != "blocks" {
+			objects[key] = data
+		}
 		return data
 	}
 
@@ -551,7 +802,8 @@ func inspectLinuxExt4Reachability(t *testing.T, environment libraryCLIEnvironmen
 		if err != nil {
 			t.Fatalf("verify reachable file %s: %v", id, err)
 		}
-		content := make([]byte, 0, file.Size)
+		hash := sha256.New()
+		var size int64
 		for index, blockID := range file.Blocks {
 			block := fetch("blocks", blockID)
 			if object.ID(block) != blockID || len(block) == 0 || len(block) > object.MaxBlockSize {
@@ -560,12 +812,15 @@ func inspectLinuxExt4Reachability(t *testing.T, environment libraryCLIEnvironmen
 			if index < len(file.Blocks)-1 && len(block) != object.MaxBlockSize {
 				t.Fatalf("reachable non-tail block %s has size %d", blockID, len(block))
 			}
-			content = append(content, block...)
+			if _, err := hash.Write(block); err != nil {
+				t.Fatal(err)
+			}
+			size += int64(len(block))
 		}
-		if int64(len(content)) != file.Size {
-			t.Fatalf("reachable file %s size=%d want=%d", id, len(content), file.Size)
+		if size != file.Size {
+			t.Fatalf("reachable file %s size=%d want=%d", id, size, file.Size)
 		}
-		files[id] = content
+		files[id] = fmt.Sprintf("%x", hash.Sum(nil))
 	}
 	visitDirectory = func(id string) {
 		key := "directories\x00" + id
@@ -593,7 +848,7 @@ func inspectLinuxExt4Reachability(t *testing.T, environment libraryCLIEnvironmen
 	for len(pending) > 0 {
 		commitID := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
-		if _, ok := objects["commits\x00"+commitID]; ok {
+		if visited["commits\x00"+commitID] {
 			continue
 		}
 		data := fetch("commits", commitID)
@@ -604,7 +859,7 @@ func inspectLinuxExt4Reachability(t *testing.T, environment libraryCLIEnvironmen
 		visitDirectory(commit.Root)
 		pending = append(pending, commit.Parents...)
 	}
-	return linuxExt4Reachability{objects: len(objects), files: files}
+	return linuxExt4Reachability{objects: len(visited), files: files}
 }
 
 func assertLinuxExt4OwnerIsolation(t *testing.T, environment libraryCLIEnvironment) {
@@ -673,8 +928,10 @@ func assertLinuxExt4OwnerIsolation(t *testing.T, environment libraryCLIEnvironme
 	if err != nil || currentOwner.CommitID == nil || *currentOwner.CommitID != *ownerHead.CommitID {
 		t.Fatalf("other owner changed original Head: before=%+v after=%+v err=%v", ownerHead, currentOwner, err)
 	}
-	t.Logf("scenario=%q platform=%s filesystem=ext4 owner_head=%s other_head=null isolation=uniform-not-found",
-		"two-user isolation", runtime.GOOS, *ownerHead.CommitID)
+	emitLinuxExt4Attestation(t, linuxExt4Attestation{
+		Kind: "isolation", Scenario: "two-user isolation", Platform: runtime.GOOS, Filesystem: "ext4",
+		OwnerHead: *ownerHead.CommitID, Isolation: "uniform-not-found",
+	})
 }
 
 func linuxExt4RawRequest(t *testing.T, target, method, token string, body []byte) (int, []byte) {

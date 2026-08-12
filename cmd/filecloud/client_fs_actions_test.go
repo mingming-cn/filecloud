@@ -1696,7 +1696,7 @@ func assertInitialCheckoutCrashState(t *testing.T, clientDir, worktree, target, 
 func TestPublicInitialCheckoutBaseCommitCrashMatrix(t *testing.T) {
 	for _, point := range []string{"before", "after"} {
 		t.Run(point, func(t *testing.T) {
-			environment, target, targetRoot, _ := importedRemoteCheckout(t)
+			environment, target, targetRoot, files := importedRemoteCheckout(t)
 			clientDir, worktree := newClientPaths(t)
 			command := exec.Command(os.Args[0], "-test.run=^TestPublicInitialCheckoutBaseCommitCrashHelper$")
 			command.Env = append(os.Environ(), "FILECLOUD_INITIAL_COMMIT_HELPER=1", "FILECLOUD_INITIAL_COMMIT_POINT="+point,
@@ -1712,6 +1712,8 @@ func TestPublicInitialCheckoutBaseCommitCrashMatrix(t *testing.T) {
 			if binding.SyncBase != target || binding.SyncBaseRoot != targetRoot {
 				t.Fatalf("restart Base=%+v target=%s root=%s", binding, target, targetRoot)
 			}
+			assertLinuxExt4Converged(t, "initial checkout crash "+point, environment, clientDir, worktree,
+				linuxExt4ConfirmedFiles(files))
 		})
 	}
 }
@@ -1737,6 +1739,10 @@ func TestPublicInitialCheckoutBaseCommitCrashHelper(t *testing.T) {
 	os.Exit(98)
 }
 
+func linuxExt4BindCrashScenario(op, kind, point string) string {
+	return "bind checkout fs crash " + op + " " + kind + " " + point
+}
+
 func TestPublicBindSubprocessCrashMatrix(t *testing.T) {
 	categories := []struct{ op, kind string }{
 		{fsOpCreateFile, "File"}, {fsOpCreateDirectory, "Directory"},
@@ -1748,7 +1754,7 @@ func TestPublicBindSubprocessCrashMatrix(t *testing.T) {
 		for _, point := range points {
 			test := struct{ op, kind, point string }{category.op, category.kind, point}
 			t.Run(test.op+"/"+test.kind+"/"+test.point, func(t *testing.T) {
-				environment, target, targetRoot, _ := importedRemoteCheckout(t)
+				environment, target, targetRoot, files := importedRemoteCheckout(t)
 				clientDir, worktree := newClientPaths(t)
 				command := exec.Command(os.Args[0], "-test.run=^TestPublicFSActionCrashHelper$")
 				command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_CRASH_HELPER=1", "FILECLOUD_PUBLIC_CRASH_CLIENT="+clientDir,
@@ -1764,6 +1770,8 @@ func TestPublicBindSubprocessCrashMatrix(t *testing.T) {
 				if binding.SyncBase != target || binding.SyncBaseRoot != targetRoot {
 					t.Fatalf("restart Base=%+v target=%s root=%s", binding, target, targetRoot)
 				}
+				assertLinuxExt4Converged(t, linuxExt4BindCrashScenario(test.op, test.kind, test.point),
+					environment, clientDir, worktree, linuxExt4ConfirmedFiles(files))
 			})
 		}
 	}
@@ -2375,6 +2383,10 @@ func TestPublicSyncCreateRecoveryCollisionChain(t *testing.T) {
 	}
 }
 
+func linuxExt4SyncCrashScenario(name, point string) string {
+	return "sync checkout fs crash " + name + " " + point
+}
+
 func TestPublicSyncSubprocessCrashMatrix(t *testing.T) {
 	categories := []struct{ name, phase, op, kind string }{
 		{"capture-file", fsPhasePreBase, fsOpRename, "File"},
@@ -2426,6 +2438,12 @@ func TestPublicSyncSubprocessCrashMatrix(t *testing.T) {
 					}
 				}
 				assertNoSyncInternalPaths(t, subscriberTree)
+				confirmed := linuxExt4ConfirmedInputs("base")
+				if test.kind == "File" {
+					confirmed = linuxExt4ConfirmedInputs("base", "remote")
+				}
+				assertLinuxExt4Converged(t, linuxExt4SyncCrashScenario(test.name, test.point),
+					environment, subscriberDir, subscriberTree, confirmed)
 			})
 		}
 	}
@@ -2722,6 +2740,8 @@ func TestPublicSyncTransactionCrashMatrix(t *testing.T) {
 				t.Fatalf("public transaction restart: %v", err)
 			}
 			assertPublicCheckoutConverged(t, environment, subscriberDir, subscriberTree)
+			assertLinuxExt4Converged(t, "sync transaction crash "+point, environment, subscriberDir, subscriberTree,
+				linuxExt4ConfirmedInputs("base", "remote"))
 			for _, table := range []string{"fs_actions", "pending_checkouts", "checkout_paths"} {
 				if count := countClientRows(t, subscriberDir, table, subscriberTree); count != 0 {
 					t.Fatalf("%s rows=%d", table, count)

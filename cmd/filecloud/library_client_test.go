@@ -97,7 +97,9 @@ func TestLibraryClientIgnoresOptionalResponseFields(t *testing.T) {
 			}
 		}
 		w.WriteHeader(response.Code)
-		_, _ = w.Write(data)
+		if _, err := w.Write(data); err != nil {
+			t.Errorf("write Head fixture: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -117,7 +119,9 @@ func TestCheckRemoteObjectsBatchesAt1000(t *testing.T) {
 		}
 		batchSizes = append(batchSizes, len(request.Objects))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"RetCode":0,"Message":"success","MissingObjects":[],"OptionalFutureField":true}`)
+		if _, err := io.WriteString(w, `{"RetCode":0,"Message":"success","MissingObjects":[],"OptionalFutureField":true}`); err != nil {
+			t.Errorf("write object checks response: %v", err)
+		}
 	}))
 	defer server.Close()
 	references := make([]clientObjectReference, 1001)
@@ -154,11 +158,15 @@ func TestUpdateRemoteHeadRetriesExplicitTransientResponses(t *testing.T) {
 		case 1:
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = io.WriteString(w, `{"RetCode":4000,"Message":"head validation busy"}`)
+			if _, err := io.WriteString(w, `{"RetCode":4000,"Message":"head validation busy"}`); err != nil {
+				t.Errorf("write busy response: %v", err)
+			}
 		case 2:
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = io.WriteString(w, `{"RetCode":5001,"Message":"head validation unavailable"}`)
+			if _, err := io.WriteString(w, `{"RetCode":5001,"Message":"head validation unavailable"}`); err != nil {
+				t.Errorf("write unavailable response: %v", err)
+			}
 		default:
 			response, err := json.Marshal(struct {
 				RetCode int
@@ -169,7 +177,9 @@ func TestUpdateRemoteHeadRetriesExplicitTransientResponses(t *testing.T) {
 				t.Errorf("marshal success response: %v", err)
 				return
 			}
-			_, _ = w.Write(response)
+			if _, err := w.Write(response); err != nil {
+				t.Errorf("write success response: %v", err)
+			}
 		}
 	}))
 	defer server.Close()
@@ -188,7 +198,9 @@ func TestDoClientRequestReturnsTransportErrorWithNoResponse(t *testing.T) {
 			t.Errorf("hijack response: %v", err)
 			return
 		}
-		_ = connection.Close()
+		if err := connection.Close(); err != nil {
+			t.Errorf("close hijacked response: %v", err)
+		}
 	}))
 	defer server.Close()
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
@@ -210,7 +222,9 @@ func TestUpdateRemoteHeadDoesNotRetryUnknownNetworkResult(t *testing.T) {
 			t.Errorf("hijack Head response: %v", err)
 			return
 		}
-		_ = connection.Close()
+		if err := connection.Close(); err != nil {
+			t.Errorf("close hijacked Head response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -305,6 +319,7 @@ func TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly(t *testing.T) {
 	if !strings.Contains(output.String(), "already bound") {
 		t.Fatalf("idempotent output = %q", output.String())
 	}
+	assertLinuxExt4Converged(t, "double-empty binding", environment, clientDir, worktree, nil)
 
 	before := *head.CommitID
 	if err := runTest(t.Context(), []string{"library", "unbind", "--client-dir", clientDir, "--worktree", worktree},
@@ -385,6 +400,8 @@ func TestLibraryBindConcurrentInitializationAdoptsWinner(t *testing.T) {
 	if err != nil || len(commit.Parents) != 0 {
 		t.Fatalf("winner is not an initial commit: %+v err=%v", commit, err)
 	}
+	assertLinuxExt4Converged(t, "concurrent initialization first client", environment, first.clientDir, first.worktree, nil)
+	assertLinuxExt4Converged(t, "concurrent initialization second client", environment, second.clientDir, second.worktree, nil)
 }
 
 func TestLibraryBindRejectsUnsupportedOrNonEmptyAndBindingConflicts(t *testing.T) {
@@ -451,6 +468,8 @@ func TestLibraryBindRejectsUnsupportedOrNonEmptyAndBindingConflicts(t *testing.T
 	if binding := readTestBinding(t, freshClient, otherWorktree); binding.SyncBase == "" {
 		t.Fatal("remote checkout did not establish Sync Base")
 	}
+	assertLinuxExt4Converged(t, "binding conflict original client", environment, clientDir, worktree, nil)
+	assertLinuxExt4Converged(t, "binding conflict remote checkout", environment, freshClient, otherWorktree, nil)
 }
 
 func TestLibraryBindRevalidatesBeforeHeadCASAndUnbindCancelsIntent(t *testing.T) {
@@ -788,6 +807,60 @@ func TestLibraryBindRejectsTamperedPendingIntentBeforePublication(t *testing.T) 
 				t.Fatalf("tampered intent changed Head: head=%+v err=%v", head, err)
 			}
 		})
+	}
+}
+
+func TestWritableClientTransactionsReserveWriteLockAtBegin(t *testing.T) {
+	clientDir := t.TempDir()
+	firstDB, err := initializeClientDB(t.Context(), clientDir, syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstDB.Close()
+	secondDB, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondDB.Close()
+
+	first, err := firstDB.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		tx  *sql.Tx
+		err error
+	}
+	started := make(chan struct{})
+	finished := make(chan result, 1)
+	go func() {
+		close(started)
+		tx, err := secondDB.BeginTx(t.Context(), nil)
+		finished <- result{tx: tx, err: err}
+	}()
+	<-started
+	select {
+	case got := <-finished:
+		if got.tx != nil {
+			_ = got.tx.Rollback()
+		}
+		_ = first.Rollback()
+		t.Fatalf("second writable transaction did not wait: %v", got.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := first.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-finished:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if err := got.tx.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second writable transaction did not start after release")
 	}
 }
 

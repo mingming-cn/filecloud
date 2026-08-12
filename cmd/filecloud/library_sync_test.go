@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -591,6 +592,17 @@ func TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject(t *testing.T)
 		}
 		return matches
 	}
+	confirmedByScenario := map[string][]string{
+		"local delete remote modify file":      {"base", "remote"},
+		"local modify remote delete file":      {"base", "local"},
+		"local delete remote modify directory": {"base", "remote", "remote nested"},
+		"local modify remote delete directory": {"base", "local", "local nested"},
+		"local file remote directory":          {"base", "remote", "local"},
+		"local directory remote file":          {"base", "remote", "local"},
+		"both delete":                          {"base"},
+		"identical change":                     {"base", "same"},
+		"rename is delete plus add":            {"rename", "remote"},
+	}
 	for _, test := range []struct {
 		name         string
 		base         func(*testing.T, string)
@@ -765,7 +777,8 @@ func TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject(t *testing.T)
 			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
 				t.Fatal(err)
 			}
-			after := assertTestConverged(t, environment, subscriberDir, subscriberTree)
+			after := assertLinuxExt4Converged(t, "structural "+test.name, environment, subscriberDir, subscriberTree,
+				linuxExt4ConfirmedInputs(confirmedByScenario[test.name]...))
 			if commits.Load() != 0 || before.SyncBase != after.SyncBase {
 				t.Fatalf("repeat sync commits=%d before=%s after=%s", commits.Load(), before.SyncBase, after.SyncBase)
 			}
@@ -1108,6 +1121,62 @@ func TestLibrarySyncProtectedReplacementStoresBeforeUpload(t *testing.T) {
 		[]byte(environment.token))
 	if headErr != nil || head.CommitID == nil || *head.CommitID != next.ExpectedHead {
 		t.Fatalf("replacement Head=%+v err=%v", head, headErr)
+	}
+}
+
+func TestLibrarySyncMtimeOnlyChangesConvergeWithoutCommitLoop(t *testing.T) {
+	environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, commits := newSyncPair(t)
+	publisherPath := filepath.Join(publisherTree, "base")
+	subscriberPath := filepath.Join(subscriberTree, "base")
+	first := time.Date(2026, 8, 9, 12, 0, 1, 0, time.UTC)
+	if err := os.Chtimes(publisherPath, first, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(subscriberPath); err != nil || !info.ModTime().Equal(first) {
+		t.Fatalf("single-sided mtime info=%v err=%v want=%v", info, err, first)
+	}
+	assertLinuxExt4Converged(t, "mtime single-sided", environment, subscriberDir, subscriberTree,
+		linuxExt4ConfirmedInputs("base"))
+
+	publisherTime := first.Add(time.Second)
+	subscriberTime := first.Add(2 * time.Second)
+	if err := os.Chtimes(publisherPath, publisherTime, publisherTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(subscriberPath, subscriberTime, subscriberTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{publisherPath, subscriberPath} {
+		if info, err := os.Stat(path); err != nil || !info.ModTime().Equal(subscriberTime) {
+			t.Fatalf("two-sided mtime path=%q info=%v err=%v want=%v", path, info, err, subscriberTime)
+		}
+	}
+	assertLinuxExt4Converged(t, "mtime two-sided first client", environment, publisherDir, publisherTree,
+		linuxExt4ConfirmedInputs("base"))
+	before := assertLinuxExt4Converged(t, "mtime two-sided second client", environment, subscriberDir, subscriberTree,
+		linuxExt4ConfirmedInputs("base"))
+	commits.Store(0)
+	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
+		t.Fatal(err)
+	}
+	after := assertTestConverged(t, environment, subscriberDir, subscriberTree)
+	if commits.Load() != 0 || before.SyncBase != after.SyncBase {
+		t.Fatalf("mtime no-op commits=%d before=%s after=%s", commits.Load(), before.SyncBase, after.SyncBase)
 	}
 }
 
@@ -4340,7 +4409,8 @@ func TestLibrarySyncProtectedDeletionConfirmation(t *testing.T) {
 	if err := confirmTestDeletion(t, clientDir, worktree, prefix, libraryClientConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	binding := assertTestConverged(t, environment, clientDir, worktree)
+	binding := assertLinuxExt4Converged(t, "protected deletion confirmed", environment, clientDir, worktree,
+		linuxExt4ConfirmedInputs(deletedContent, "kept"))
 	if binding.SyncBase != pending.CandidateCommit {
 		t.Fatalf("confirmation rebuilt candidate: got=%s want=%s", binding.SyncBase, pending.CandidateCommit)
 	}
@@ -4465,7 +4535,8 @@ func TestLibrarySyncConfirmedDeletionResumesUploadFailure(t *testing.T) {
 	if err := syncTestWorktree(t, clientDir, worktree); err != nil {
 		t.Fatal(err)
 	}
-	if binding := assertTestConverged(t, environment, clientDir, worktree); binding.SyncBase != candidate {
+	if binding := assertLinuxExt4Converged(t, "confirmed deletion resumes upload failure", environment, clientDir, worktree,
+		linuxExt4ConfirmedInputs("delete")); binding.SyncBase != candidate {
 		t.Fatalf("resumed candidate=%s want=%s", binding.SyncBase, candidate)
 	}
 }
@@ -4599,7 +4670,8 @@ func TestLibrarySyncContinuousTrivialMergeCompetition(t *testing.T) {
 		}
 		previous = replacement
 	}
-	assertTestConverged(t, state.environment, state.clientDir, state.worktree)
+	assertLinuxExt4Converged(t, "continuous trivial Head competition", state.environment, state.clientDir, state.worktree,
+		linuxExt4ConfirmedInputs("data", "local"))
 }
 
 func TestLibrarySyncContinuousDivergentHeadConflictsReuseCapturedSeed(t *testing.T) {
@@ -4656,7 +4728,8 @@ func TestLibrarySyncContinuousDivergentHeadConflictsReuseCapturedSeed(t *testing
 	if remoteErr != nil || localErr != nil || string(remote) != "remote-2" || string(local) != "local" {
 		t.Fatalf("remote=%q/%v local=%q/%v", remote, remoteErr, local, localErr)
 	}
-	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+	assertLinuxExt4Converged(t, "continuous divergent Head competition", environment, subscriberDir, subscriberTree,
+		linuxExt4ConfirmedInputs("base", "remote-0", "remote-1", "remote-2", "local"))
 }
 
 func TestLibrarySyncResumesAfterPendingMergeReplacement(t *testing.T) {
@@ -4923,7 +4996,14 @@ func TestLibrarySyncInterrupted100MiBUploadSendsOnlyMissingBlocks(t *testing.T) 
 	if len(expected) != 25 {
 		t.Fatalf("distinct block count=%d, want 25", len(expected))
 	}
-	assertTestConverged(t, environment, clientDir, worktree)
+	hash := sha256.New()
+	for index := range 25 {
+		if _, err := hash.Write(bytes.Repeat([]byte{byte(index)}, object.MaxBlockSize)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertLinuxExt4Converged(t, "100 MiB upload resumed", environment, clientDir, worktree,
+		[]linuxExt4ConfirmedInput{{name: "large.bin", digest: fmt.Sprintf("%x", hash.Sum(nil))}})
 }
 
 func TestLibrarySyncRecursiveMergeResolvesLostCASResponse(t *testing.T) {
@@ -4962,7 +5042,8 @@ func TestLibrarySyncRecursiveMergeResolvesLostCASResponse(t *testing.T) {
 	if updates.Load() != 4 {
 		t.Fatalf("Head updates=%d", updates.Load())
 	}
-	assertTestConverged(t, environment, subscriberDir, subscriberTree)
+	assertLinuxExt4Converged(t, "recursive lost CAS response", environment, subscriberDir, subscriberTree,
+		linuxExt4ConfirmedInputs("base", "local", "remote"))
 	for name, want := range map[string]string{"local": "local", "remote": "remote"} {
 		if data, err := os.ReadFile(filepath.Join(subscriberTree, name)); err != nil || string(data) != want {
 			t.Fatalf("merged %s=%q err=%v", name, data, err)
@@ -5058,7 +5139,8 @@ func TestLibrarySyncRecoversPublishedCandidateBeforeDiscardingMutatedWorktree(t 
 	if err := syncTestWorktree(t, clientDir, worktree); err != nil {
 		t.Fatal(err)
 	}
-	if binding := assertTestConverged(t, environment, clientDir, worktree); binding.SyncBase == pending.CandidateCommit {
+	if binding := assertLinuxExt4Converged(t, "lost CAS preserves post-publication changes", environment, clientDir, worktree,
+		linuxExt4ConfirmedInputs("base", "candidate", "local mutation", "preserved")); binding.SyncBase == pending.CandidateCommit {
 		t.Fatal("next sync did not publish the preserved local changes as a successor")
 	}
 }
@@ -6183,6 +6265,8 @@ func TestLibrarySyncPendingPublicationTransitionsToSuccessor(t *testing.T) {
 	if binding.SyncBase != successor || binding.SyncBaseRoot != candidateCommit.Root {
 		t.Fatalf("successor binding=%+v", binding)
 	}
+	assertLinuxExt4Converged(t, "pending publication became Head ancestor", environment, clientDir, worktree,
+		linuxExt4ConfirmedInputs("base", "local"))
 }
 
 func TestLibrarySyncUnbindRollsBackPartialApplyFromEmptyBase(t *testing.T) {
