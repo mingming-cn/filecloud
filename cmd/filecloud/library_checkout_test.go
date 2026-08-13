@@ -80,7 +80,7 @@ func TestLibraryBindChecksOutRemoteHeadWithoutMutation(t *testing.T) {
 	if paths != 5 || pending != 0 {
 		t.Fatalf("path index count=%d pending=%d", paths, pending)
 	}
-	assertLinuxExt4Converged(t, "first remote checkout", environment, clientDir, worktree, linuxExt4ConfirmedFiles(files))
+	assertPlatformConverged(t, "first remote checkout", environment, clientDir, worktree, platformConfirmedFiles(files))
 }
 
 func TestLibraryBindCheckoutFetchesOnlyTargetCommitWithLongPublishedHistory(t *testing.T) {
@@ -189,8 +189,8 @@ func TestLibraryBindCheckoutDownloadAndDiskFailuresRetryFixedTarget(t *testing.T
 		if binding := readTestBinding(t, clientDir, worktree); binding.SyncBase != target {
 			t.Fatalf("retry target drifted: %+v target=%s", binding, target)
 		}
-		assertLinuxExt4Converged(t, "checkout resumes truncated download", environment, clientDir, worktree,
-			linuxExt4ConfirmedFiles(files))
+		assertPlatformConverged(t, "checkout resumes truncated download", environment, clientDir, worktree,
+			platformConfirmedFiles(files))
 	})
 
 	t.Run("wrong digest", func(t *testing.T) {
@@ -233,8 +233,8 @@ func TestLibraryBindCheckoutDownloadAndDiskFailuresRetryFixedTarget(t *testing.T
 		if blockGets.Load() < 2 {
 			t.Fatalf("wrong-digest block was cached: GET count=%d", blockGets.Load())
 		}
-		assertLinuxExt4Converged(t, "checkout rejects wrong digest then resumes", environment, clientDir, worktree,
-			linuxExt4ConfirmedFiles(files))
+		assertPlatformConverged(t, "checkout rejects wrong digest then resumes", environment, clientDir, worktree,
+			platformConfirmedFiles(files))
 	})
 
 	t.Run("disk", func(t *testing.T) {
@@ -258,8 +258,8 @@ func TestLibraryBindCheckoutDownloadAndDiskFailuresRetryFixedTarget(t *testing.T
 		if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
 			t.Fatalf("retry disk checkout: %v", err)
 		}
-		assertLinuxExt4Converged(t, "checkout resumes disk failure", environment, clientDir, worktree,
-			linuxExt4ConfirmedFiles(files))
+		assertPlatformConverged(t, "checkout resumes disk failure", environment, clientDir, worktree,
+			platformConfirmedFiles(files))
 	})
 }
 

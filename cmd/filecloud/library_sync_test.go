@@ -26,6 +26,7 @@ import (
 
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/object"
+	"golang.org/x/sys/unix"
 	"golang.org/x/text/cases"
 )
 
@@ -777,8 +778,8 @@ func TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject(t *testing.T)
 			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
 				t.Fatal(err)
 			}
-			after := assertLinuxExt4Converged(t, "structural "+test.name, environment, subscriberDir, subscriberTree,
-				linuxExt4ConfirmedInputs(confirmedByScenario[test.name]...))
+			after := assertPlatformConverged(t, "structural "+test.name, environment, subscriberDir, subscriberTree,
+				platformConfirmedInputs(confirmedByScenario[test.name]...))
 			if commits.Load() != 0 || before.SyncBase != after.SyncBase {
 				t.Fatalf("repeat sync commits=%d before=%s after=%s", commits.Load(), before.SyncBase, after.SyncBase)
 			}
@@ -1141,8 +1142,8 @@ func TestLibrarySyncMtimeOnlyChangesConvergeWithoutCommitLoop(t *testing.T) {
 	if info, err := os.Stat(subscriberPath); err != nil || !info.ModTime().Equal(first) {
 		t.Fatalf("single-sided mtime info=%v err=%v want=%v", info, err, first)
 	}
-	assertLinuxExt4Converged(t, "mtime single-sided", environment, subscriberDir, subscriberTree,
-		linuxExt4ConfirmedInputs("base"))
+	assertPlatformConverged(t, "mtime single-sided", environment, subscriberDir, subscriberTree,
+		platformConfirmedInputs("base"))
 
 	publisherTime := first.Add(time.Second)
 	subscriberTime := first.Add(2 * time.Second)
@@ -1166,10 +1167,10 @@ func TestLibrarySyncMtimeOnlyChangesConvergeWithoutCommitLoop(t *testing.T) {
 			t.Fatalf("two-sided mtime path=%q info=%v err=%v want=%v", path, info, err, subscriberTime)
 		}
 	}
-	assertLinuxExt4Converged(t, "mtime two-sided first client", environment, publisherDir, publisherTree,
-		linuxExt4ConfirmedInputs("base"))
-	before := assertLinuxExt4Converged(t, "mtime two-sided second client", environment, subscriberDir, subscriberTree,
-		linuxExt4ConfirmedInputs("base"))
+	assertPlatformConverged(t, "mtime two-sided first client", environment, publisherDir, publisherTree,
+		platformConfirmedInputs("base"))
+	before := assertPlatformConverged(t, "mtime two-sided second client", environment, subscriberDir, subscriberTree,
+		platformConfirmedInputs("base"))
 	commits.Store(0)
 	if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
 		t.Fatal(err)
@@ -4409,8 +4410,8 @@ func TestLibrarySyncProtectedDeletionConfirmation(t *testing.T) {
 	if err := confirmTestDeletion(t, clientDir, worktree, prefix, libraryClientConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	binding := assertLinuxExt4Converged(t, "protected deletion confirmed", environment, clientDir, worktree,
-		linuxExt4ConfirmedInputs(deletedContent, "kept"))
+	binding := assertPlatformConverged(t, "protected deletion confirmed", environment, clientDir, worktree,
+		platformConfirmedInputs(deletedContent, "kept"))
 	if binding.SyncBase != pending.CandidateCommit {
 		t.Fatalf("confirmation rebuilt candidate: got=%s want=%s", binding.SyncBase, pending.CandidateCommit)
 	}
@@ -4535,8 +4536,8 @@ func TestLibrarySyncConfirmedDeletionResumesUploadFailure(t *testing.T) {
 	if err := syncTestWorktree(t, clientDir, worktree); err != nil {
 		t.Fatal(err)
 	}
-	if binding := assertLinuxExt4Converged(t, "confirmed deletion resumes upload failure", environment, clientDir, worktree,
-		linuxExt4ConfirmedInputs("delete")); binding.SyncBase != candidate {
+	if binding := assertPlatformConverged(t, "confirmed deletion resumes upload failure", environment, clientDir, worktree,
+		platformConfirmedInputs("delete")); binding.SyncBase != candidate {
 		t.Fatalf("resumed candidate=%s want=%s", binding.SyncBase, candidate)
 	}
 }
@@ -4670,8 +4671,8 @@ func TestLibrarySyncContinuousTrivialMergeCompetition(t *testing.T) {
 		}
 		previous = replacement
 	}
-	assertLinuxExt4Converged(t, "continuous trivial Head competition", state.environment, state.clientDir, state.worktree,
-		linuxExt4ConfirmedInputs("data", "local"))
+	assertPlatformConverged(t, "continuous trivial Head competition", state.environment, state.clientDir, state.worktree,
+		platformConfirmedInputs("data", "local"))
 }
 
 func TestLibrarySyncContinuousDivergentHeadConflictsReuseCapturedSeed(t *testing.T) {
@@ -4728,8 +4729,8 @@ func TestLibrarySyncContinuousDivergentHeadConflictsReuseCapturedSeed(t *testing
 	if remoteErr != nil || localErr != nil || string(remote) != "remote-2" || string(local) != "local" {
 		t.Fatalf("remote=%q/%v local=%q/%v", remote, remoteErr, local, localErr)
 	}
-	assertLinuxExt4Converged(t, "continuous divergent Head competition", environment, subscriberDir, subscriberTree,
-		linuxExt4ConfirmedInputs("base", "remote-0", "remote-1", "remote-2", "local"))
+	assertPlatformConverged(t, "continuous divergent Head competition", environment, subscriberDir, subscriberTree,
+		platformConfirmedInputs("base", "remote-0", "remote-1", "remote-2", "local"))
 }
 
 func TestLibrarySyncResumesAfterPendingMergeReplacement(t *testing.T) {
@@ -5002,8 +5003,8 @@ func TestLibrarySyncInterrupted100MiBUploadSendsOnlyMissingBlocks(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	assertLinuxExt4Converged(t, "100 MiB upload resumed", environment, clientDir, worktree,
-		[]linuxExt4ConfirmedInput{{name: "large.bin", digest: fmt.Sprintf("%x", hash.Sum(nil))}})
+	assertPlatformConverged(t, "100 MiB upload resumed", environment, clientDir, worktree,
+		[]platformConfirmedInput{{name: "large.bin", digest: fmt.Sprintf("%x", hash.Sum(nil))}})
 }
 
 func TestLibrarySyncRecursiveMergeResolvesLostCASResponse(t *testing.T) {
@@ -5042,8 +5043,8 @@ func TestLibrarySyncRecursiveMergeResolvesLostCASResponse(t *testing.T) {
 	if updates.Load() != 4 {
 		t.Fatalf("Head updates=%d", updates.Load())
 	}
-	assertLinuxExt4Converged(t, "recursive lost CAS response", environment, subscriberDir, subscriberTree,
-		linuxExt4ConfirmedInputs("base", "local", "remote"))
+	assertPlatformConverged(t, "recursive lost CAS response", environment, subscriberDir, subscriberTree,
+		platformConfirmedInputs("base", "local", "remote"))
 	for name, want := range map[string]string{"local": "local", "remote": "remote"} {
 		if data, err := os.ReadFile(filepath.Join(subscriberTree, name)); err != nil || string(data) != want {
 			t.Fatalf("merged %s=%q err=%v", name, data, err)
@@ -5139,8 +5140,8 @@ func TestLibrarySyncRecoversPublishedCandidateBeforeDiscardingMutatedWorktree(t 
 	if err := syncTestWorktree(t, clientDir, worktree); err != nil {
 		t.Fatal(err)
 	}
-	if binding := assertLinuxExt4Converged(t, "lost CAS preserves post-publication changes", environment, clientDir, worktree,
-		linuxExt4ConfirmedInputs("base", "candidate", "local mutation", "preserved")); binding.SyncBase == pending.CandidateCommit {
+	if binding := assertPlatformConverged(t, "lost CAS preserves post-publication changes", environment, clientDir, worktree,
+		platformConfirmedInputs("base", "candidate", "local mutation", "preserved")); binding.SyncBase == pending.CandidateCommit {
 		t.Fatal("next sync did not publish the preserved local changes as a successor")
 	}
 }
@@ -5305,11 +5306,11 @@ func TestRestoreRollbackRootMtimeRejectsStaleActionEvidence(t *testing.T) {
 			if err := bindFSJournalRoot(t.Context(), db, worktree, root); err != nil {
 				t.Fatal(err)
 			}
-			var stat syscall.Stat_t
-			if err := syscall.Fstat(int(root.directory.Fd()), &stat); err != nil {
+			var stat unix.Stat_t
+			if err := unix.Fstat(int(root.directory.Fd()), &stat); err != nil {
 				t.Fatal(err)
 			}
-			mtimeNS := time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec).UnixNano()
+			mtimeNS := filesystemMtimeNS(time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec))
 			if err := savePendingCheckout(t.Context(), db, pendingCheckout{ServerURL: "http://localhost", LibraryID: "library",
 				Worktree: worktree, UserID: "user", DeviceID: "device", TargetCommit: "commit", ApplyState: "rolling_back",
 				ConflictPromotions: _emptyConflictPromotions, RollbackRootMtimeNS: mtimeNS, RollbackRootMtimeValid: true}); err != nil {
@@ -5397,11 +5398,11 @@ func TestRestoreRollbackRootMtimeRejectsWrongRootBeforeStateOrFSChanges(t *testi
 				if err := bindFSJournalRoot(t.Context(), db, worktree, root); err != nil {
 					t.Fatal(err)
 				}
-				var stat syscall.Stat_t
-				if err := syscall.Fstat(int(root.directory.Fd()), &stat); err != nil {
+				var stat unix.Stat_t
+				if err := unix.Fstat(int(root.directory.Fd()), &stat); err != nil {
 					t.Fatal(err)
 				}
-				mtimeNS := time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec).UnixNano()
+				mtimeNS := filesystemMtimeNS(time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec))
 				if err := savePendingCheckout(t.Context(), db, pendingCheckout{ServerURL: "http://localhost", LibraryID: "library",
 					Worktree: worktree, UserID: "user", DeviceID: "device", TargetCommit: "commit", ApplyState: "rolling_back",
 					ConflictPromotions: _emptyConflictPromotions, RollbackRootMtimeNS: mtimeNS, RollbackRootMtimeValid: true}); err != nil {
@@ -6265,8 +6266,8 @@ func TestLibrarySyncPendingPublicationTransitionsToSuccessor(t *testing.T) {
 	if binding.SyncBase != successor || binding.SyncBaseRoot != candidateCommit.Root {
 		t.Fatalf("successor binding=%+v", binding)
 	}
-	assertLinuxExt4Converged(t, "pending publication became Head ancestor", environment, clientDir, worktree,
-		linuxExt4ConfirmedInputs("base", "local"))
+	assertPlatformConverged(t, "pending publication became Head ancestor", environment, clientDir, worktree,
+		platformConfirmedInputs("base", "local"))
 }
 
 func TestLibrarySyncUnbindRollsBackPartialApplyFromEmptyBase(t *testing.T) {

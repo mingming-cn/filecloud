@@ -213,7 +213,7 @@ stateDiagram-v2
 3. 把该步骤标为 `Completed`。重启根据路径组合幂等完成或回滚，不能依赖动作恰好执行一次。create 的 kernel 动作与 identity UPDATE 之间存在不可消除窗口；若重启看到 identity 为零但精确内部 leaf 已存在，禁止收养、打开写入或删除该 inode。实现必须在同一事务中持久化 follow-up rollback rename Intent、原 action 的 `rolled_back` outcome 和 pending `rolling_back`，再 no-replace 移到普通可见 recovery leaf并同步父目录。若可见名已存在（任意类型），不得触碰任一 inode；当前 rollback action 以 `collision` 完成并在同一事务持久化带 ` 2`、` 3` 等有界后缀的 successor Intent，直到找到可用 leaf。
 4. 全部路径完成后，单事务更新路径索引和 Sync Base，再标记 checkout 完成；只有这一步后才能清理内部名称。unbind 可清理 rolled-back journal，但不得删除上述可见 recovery 内容。
 
-替换前先按 journal 把当前目标原子改为恢复名，再重新计算捕获 FileId。若不同于本轮扫描值，恢复 inode 直接改名为最终可见冲突路径，远端内容再安装到原路径；Unix 上仍持有旧 fd 的进程会继续写入这个可见冲突 inode，不需要猜测“何时稳定”。若捕获内容未变，恢复名保留到 Sync Base 事务提交后再清理；此后通过旧 fd 的延迟写不在第一阶段强保证内，必须由验收测试记录平台行为。Windows 因占用无法 rename 时整轮失败并保留原文件；不允许退化为 copy-and-replace。当前 1A 实现仅支持 Linux/ext4，Windows/NTFS 属于未来平台工作，不声明支持。
+替换前先按 journal 把当前目标原子改为恢复名，再重新计算捕获 FileId。若不同于本轮扫描值，恢复 inode 直接改名为最终可见冲突路径，远端内容再安装到原路径；Unix 上仍持有旧 fd 的进程会继续写入这个可见冲突 inode，不需要猜测“何时稳定”。若捕获内容未变，恢复名保留到 Sync Base 事务提交后再清理；此后通过旧 fd 的延迟写不在第一阶段强保证内：Linux/ext4 与 macOS/APFS 都会让旧 fd 继续引用旧 inode，活动路径保持 checkout 后的新 inode；旧 inode 无目录项时，最后一个 fd 关闭后延迟写可能消失。用户必须避免同步期间持续写入工作目录。Windows 因占用无法 rename 时整轮失败并保留原文件；不允许退化为 copy-and-replace。当前实现接受经平台检查的本地 Linux/ext4 和 macOS/APFS；APFS 支持声明仍要求目标主机显式通过 1B 门禁。Windows/NTFS 属于未来平台工作，不声明支持。
 
 所有远端路径持久化成功且冲突内容已物化后，更新 Sync Base，保留冲突路径为本地未发布变化并立即开始下一轮发布。
 
@@ -242,7 +242,7 @@ mtime 规则：只有一侧路径状态改变时采用该侧；双方 FileId 或
 
 同目录出现大小写折叠或规范名称碰撞仍作为结构边界失败。若原父路径连完整冲突 marker 都无法容纳，递归阶段只收集请求并先完成正常根合并；第二阶段按 source 规范路径字节排序，把 Local 完整对象插入根冲突目录。根目录依次尝试 exact NFC `Filecloud Conflicts`、`Filecloud Conflicts 2` 至 `9999`：exact Directory 可复用并保留原项，exact 非 Directory 或只有 case-fold alias 时跳到下一项。fallback leaf 为 `<NamingSeedCommitId前12位>-<truncated-original-NFC-leaf> (Filecloud conflict <n>)>`，`n` 从 1 起始且始终显式存在，不保留特殊扩展名语义。每次分配更新 exact/case-fold occupancy；目录请求保留完整子树并做 lineage prefix remap。fallback 根 entry mtime 取旧 entry 与全部插入 Local mtime 的最大值。任一 root/leaf ordinal 或预算耗尽都在 pending、PUT、CAS 前失败。
 
-协议 mtime 唯一形式是 UTC 整秒 `2006-01-02T15:04:05Z`；格式化先转 UTC 并 truncate 到秒，解析只接受 exact round-trip。扫描始终完整哈希内容，因此同一整秒内的文件系统亚秒差异不改变 DirectoryId/CommitId，而保留 mtime 的字节变化仍改变 FileId。rollback root 的原始纳秒是实际文件系统恢复证据，不进入协议 mtime helper。
+协议 mtime 唯一形式是 UTC 整秒 `2006-01-02T15:04:05Z`；格式化先转 UTC 并 truncate 到秒，解析只接受 exact round-trip。扫描始终完整哈希内容，因此同一整秒内的文件系统亚秒差异不改变 DirectoryId/CommitId，而保留 mtime 的字节变化仍改变 FileId。rollback root 的原始时间是实际文件系统恢复证据，不进入协议 mtime helper；Linux 保留纳秒，Darwin 的 fd `futimes` 边界规范到微秒。
 
 合并 Candidate checkout 时，捕获的本地冲突文件从内部 recovery 直接以 journaled no-replace rename 提升到 Candidate 的固定冲突路径，保留 inode 和旧文件描述符身份。promotion 后再次变化的同一 inode 被提升到下一个确定后缀，固定 Candidate 路径从不可变对象恢复；Sync Base 只推进到固定 Candidate，并明确要求下一轮同步发布 late 可见副本。跨父 rename 的源父身份记录在 `fs_actions`；目标父属于固定 Candidate 时取同一 checkout 的耐久 `checkout_paths`，运行时切换到根 fallback 时则在 promotion action 中以严格规范编码固定目标父身份。缺失的 fallback 根由绑定到 promotion root 的可见 `create_directory` journal 动作创建；exact Directory 可复用，exact 非 Directory 或 case-fold alias 只推进 ordinal，不收养或覆盖。两侧父目录均在 Completed 前同步。结构目录冲突复用相同的逐文件 promotion；进程崩溃测试覆盖 root create、Intent、跨父 rename、父目录同步和 Completed 的耐久阶段，仅声明 Linux 进程崩溃恢复，不声明断电或 APFS/NTFS 语义。
 
@@ -261,7 +261,7 @@ JCS 本身不做 Unicode normalization，因此名称必须先按 Unicode 15.1 N
 
 ## 支持的文件系统
 
-1A 只支持本地 ext4；1B 通过 spike 后增加 APFS 和 NTFS。绑定前检查文件系统类型和所需原子能力；无法确认时拒绝，不静默降级。NFS、SMB、FAT/exFAT、网络映射盘及跨文件系统工作目录第一阶段不支持。
+1A 只支持本地 ext4；1B 已增加 macOS/APFS 平台实现与验收门禁，APFS 支持声明以目标主机实际通过门禁为准，NTFS 尚未实现。Linux 绑定通过 held fd、`statfs` 和 `/proc/self/mountinfo` 精确确认本地 ext4；Darwin 绑定通过 held fd 的 `fstatfs` 要求 `Fstypename=apfs`、`MNT_LOCAL`，并通过 `fgetattrlist(ATTR_VOL_CAPABILITIES)` 要求 `VOL_CAP_INT_RENAME_EXCL` 与 `VOL_CAP_INT_FLOCK` 同时 valid/supported。无法确认时拒绝，不静默降级。NFS、SMB、FAT/exFAT、网络映射盘及跨文件系统工作目录第一阶段不支持。
 
 平台 spike 必须验证 no-follow/reparse point、文件身份、原子 no-replace、同目录 rename、父目录持久化、跨进程锁和占用文件行为。文档中的 `fsync` 表示目标平台可提供的最强持久化原语；若平台无法兑现相同崩溃语义，必须在验收矩阵中明确较弱边界。
 

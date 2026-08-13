@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package main
 
@@ -20,7 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mingming-cn/filecloud/internal/acceptance"
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
+	"github.com/mingming-cn/filecloud/internal/object"
 	"golang.org/x/sys/unix"
 )
 
@@ -923,9 +925,9 @@ func TestFSActionRejectsSymlinkParentAndCrossMount(t *testing.T) {
 	if _, err := openFSActionParent(root, "link", 0, 0); err == nil {
 		t.Fatal("symlink action parent was accepted")
 	}
-	old := fsActionOpenat2
-	fsActionOpenat2 = func(int, string, *unix.OpenHow) (int, error) { return -1, syscall.EXDEV }
-	t.Cleanup(func() { fsActionOpenat2 = old })
+	old := _openActionParent
+	_openActionParent = func(*openedWorktree, string) (int, error) { return -1, syscall.EXDEV }
+	t.Cleanup(func() { _openActionParent = old })
 	if _, err := openFSActionParent(root, "real", 0, 0); !errors.Is(err, syscall.EXDEV) {
 		t.Fatalf("cross-mount error=%v", err)
 	}
@@ -1245,7 +1247,7 @@ func TestFSActionRenameRecovery(t *testing.T) {
 	if err := insertFSActionIntent(ctx, db, action); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Renameat2(int(root.directory.Fd()), "source", int(root.directory.Fd()), "target", unix.RENAME_NOREPLACE); err != nil {
+	if err := renameNoReplace(int(root.directory.Fd()), "source", int(root.directory.Fd()), "target"); err != nil {
 		t.Fatal(err)
 	}
 	if err := recoverFSActions(ctx, db, rootPath, root, nil); err != nil {
@@ -1437,7 +1439,7 @@ func captureExactTree(t *testing.T, root string) map[string]exactPathState {
 		}
 		state := exactPathState{info: info}
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			state.nlink = stat.Nlink
+			state.nlink = uint64(stat.Nlink)
 		}
 		if info.Mode().IsRegular() {
 			state.data, err = os.ReadFile(path)
@@ -1712,8 +1714,8 @@ func TestPublicInitialCheckoutBaseCommitCrashMatrix(t *testing.T) {
 			if binding.SyncBase != target || binding.SyncBaseRoot != targetRoot {
 				t.Fatalf("restart Base=%+v target=%s root=%s", binding, target, targetRoot)
 			}
-			assertLinuxExt4Converged(t, "initial checkout crash "+point, environment, clientDir, worktree,
-				linuxExt4ConfirmedFiles(files))
+			assertPlatformConverged(t, "initial checkout crash "+point, environment, clientDir, worktree,
+				platformConfirmedFiles(files))
 		})
 	}
 }
@@ -1739,7 +1741,7 @@ func TestPublicInitialCheckoutBaseCommitCrashHelper(t *testing.T) {
 	os.Exit(98)
 }
 
-func linuxExt4BindCrashScenario(op, kind, point string) string {
+func platformBindCrashScenario(op, kind, point string) string {
 	return "bind checkout fs crash " + op + " " + kind + " " + point
 }
 
@@ -1770,8 +1772,8 @@ func TestPublicBindSubprocessCrashMatrix(t *testing.T) {
 				if binding.SyncBase != target || binding.SyncBaseRoot != targetRoot {
 					t.Fatalf("restart Base=%+v target=%s root=%s", binding, target, targetRoot)
 				}
-				assertLinuxExt4Converged(t, linuxExt4BindCrashScenario(test.op, test.kind, test.point),
-					environment, clientDir, worktree, linuxExt4ConfirmedFiles(files))
+				assertPlatformConverged(t, platformBindCrashScenario(test.op, test.kind, test.point),
+					environment, clientDir, worktree, platformConfirmedFiles(files))
 			})
 		}
 	}
@@ -1782,6 +1784,7 @@ func TestPublicCreateZeroIdentityReplacementPreserved(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			environment, _, _, _ := importedRemoteCheckout(t)
 			clientDir, worktree := newClientPaths(t)
+			beforeHead := mustAcceptanceHead(t, environment)
 			command := exec.Command(os.Args[0], "-test.run=^TestPublicFSActionCrashHelper$")
 			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_CRASH_HELPER=1", "FILECLOUD_PUBLIC_CRASH_CLIENT="+clientDir,
 				"FILECLOUD_PUBLIC_CRASH_WORKTREE="+worktree, "FILECLOUD_PUBLIC_CRASH_SERVER="+environment.server.URL,
@@ -1842,13 +1845,24 @@ func TestPublicCreateZeroIdentityReplacementPreserved(t *testing.T) {
 			if err != nil || !info.ModTime().UTC().Equal(mtime) || (kind == "Directory") != info.IsDir() {
 				t.Fatalf("replacement info=%v err=%v", info, err)
 			}
+			var preserved []byte
 			if kind == "File" {
-				if data, err := os.ReadFile(recovered); err != nil || string(data) != "replacement" {
-					t.Fatalf("replacement=%q err=%v", data, err)
+				preserved, err = os.ReadFile(recovered)
+				if err != nil || string(preserved) != "replacement" {
+					t.Fatalf("replacement=%q err=%v", preserved, err)
 				}
-			} else if data, err := os.ReadFile(filepath.Join(recovered, "user")); err != nil || string(data) != "user" {
-				t.Fatalf("directory replacement child=%q err=%v", data, err)
+			} else {
+				preserved, err = os.ReadFile(filepath.Join(recovered, "user"))
+				if err != nil || string(preserved) != "user" {
+					t.Fatalf("directory replacement child=%q err=%v", preserved, err)
+				}
 			}
+			expected := []byte("replacement")
+			if kind == "Directory" {
+				expected = []byte("user")
+			}
+			emitRecoveryAttestation(t, "bind checkout create "+kind+" between identity", beforeHead,
+				mustAcceptanceHead(t, environment), "", "", expected, preserved)
 		})
 	}
 }
@@ -2155,10 +2169,35 @@ func TestPublicCreateRecoveryCollisionChain(t *testing.T) {
 	}
 }
 
+func mustAcceptanceHead(t *testing.T, environment libraryCLIEnvironment) string {
+	t.Helper()
+	head, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
+	if err != nil || head.CommitID == nil {
+		t.Fatalf("read acceptance Head: head=%+v err=%v", head, err)
+	}
+	return *head.CommitID
+}
+
+func emitRecoveryAttestation(t *testing.T, scenario, oldHead, currentHead, previousBase, currentBase string,
+	confirmed, preserved []byte,
+) {
+	t.Helper()
+	if _, _, enabled := acceptance.ActivePlatform(); !enabled {
+		return
+	}
+	platform, filesystem, _ := acceptance.ActivePlatform()
+	emitPlatformAttestation(t, platformAttestation{
+		Kind: "recovery", Scenario: scenario, Platform: platform, Filesystem: filesystem,
+		FailurePoint: "between_create_identity", OldHead: oldHead, CurrentHead: currentHead,
+		PreviousSyncBase: previousBase, SyncBase: currentBase,
+		ConfirmedInputDigests: []string{object.ID(confirmed)}, PreservedInputDigests: []string{object.ID(preserved)},
+	})
+}
+
 func TestPublicSyncZeroIdentityCreateAutoRollback(t *testing.T) {
 	for _, kind := range []string{"File", "Directory"} {
 		t.Run(kind, func(t *testing.T) {
-			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
+			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
 			before := readTestBinding(t, subscriberDir, subscriberTree)
 			if kind == "File" {
 				if err := os.WriteFile(filepath.Join(publisherTree, "remote"), []byte("remote"), 0o600); err != nil {
@@ -2170,6 +2209,7 @@ func TestPublicSyncZeroIdentityCreateAutoRollback(t *testing.T) {
 			if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
 				t.Fatal(err)
 			}
+			beforeHead := mustAcceptanceHead(t, environment)
 			op := map[string]string{"File": fsOpCreateFile, "Directory": fsOpCreateDirectory}[kind]
 			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
 			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1", "FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir,
@@ -2234,9 +2274,12 @@ func TestPublicSyncZeroIdentityCreateAutoRollback(t *testing.T) {
 			if kind == "Directory" {
 				content = filepath.Join(recovered, "unknown")
 			}
-			if data, err := os.ReadFile(content); err != nil || string(data) != "unknown" {
-				t.Fatalf("recovered content=%q err=%v", data, err)
+			preserved, err := os.ReadFile(content)
+			if err != nil || string(preserved) != "unknown" {
+				t.Fatalf("recovered content=%q err=%v", preserved, err)
 			}
+			emitRecoveryAttestation(t, "sync checkout create "+kind+" between identity", beforeHead,
+				mustAcceptanceHead(t, environment), before.SyncBase, before.SyncBase, []byte("unknown"), preserved)
 		})
 	}
 }
@@ -2383,7 +2426,7 @@ func TestPublicSyncCreateRecoveryCollisionChain(t *testing.T) {
 	}
 }
 
-func linuxExt4SyncCrashScenario(name, point string) string {
+func platformSyncCrashScenario(name, point string) string {
 	return "sync checkout fs crash " + name + " " + point
 }
 
@@ -2438,11 +2481,11 @@ func TestPublicSyncSubprocessCrashMatrix(t *testing.T) {
 					}
 				}
 				assertNoSyncInternalPaths(t, subscriberTree)
-				confirmed := linuxExt4ConfirmedInputs("base")
+				confirmed := platformConfirmedInputs("base")
 				if test.kind == "File" {
-					confirmed = linuxExt4ConfirmedInputs("base", "remote")
+					confirmed = platformConfirmedInputs("base", "remote")
 				}
-				assertLinuxExt4Converged(t, linuxExt4SyncCrashScenario(test.name, test.point),
+				assertPlatformConverged(t, platformSyncCrashScenario(test.name, test.point),
 					environment, subscriberDir, subscriberTree, confirmed)
 			})
 		}
@@ -2740,8 +2783,8 @@ func TestPublicSyncTransactionCrashMatrix(t *testing.T) {
 				t.Fatalf("public transaction restart: %v", err)
 			}
 			assertPublicCheckoutConverged(t, environment, subscriberDir, subscriberTree)
-			assertLinuxExt4Converged(t, "sync transaction crash "+point, environment, subscriberDir, subscriberTree,
-				linuxExt4ConfirmedInputs("base", "remote"))
+			assertPlatformConverged(t, "sync transaction crash "+point, environment, subscriberDir, subscriberTree,
+				platformConfirmedInputs("base", "remote"))
 			for _, table := range []string{"fs_actions", "pending_checkouts", "checkout_paths"} {
 				if count := countClientRows(t, subscriberDir, table, subscriberTree); count != 0 {
 					t.Fatalf("%s rows=%d", table, count)

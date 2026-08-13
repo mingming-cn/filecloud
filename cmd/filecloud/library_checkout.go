@@ -616,7 +616,7 @@ func cachedDownload(ctx context.Context, options bindOptions, kind, id string, f
 	if err := temp.Close(); err != nil {
 		return nil, err
 	}
-	if err := unix.Renameat2(int(directory.Fd()), tempName, int(directory.Fd()), name, unix.RENAME_NOREPLACE); err != nil {
+	if err := renameNoReplace(int(directory.Fd()), tempName, int(directory.Fd()), name); err != nil {
 		if !errors.Is(err, syscall.EEXIST) {
 			return nil, fmt.Errorf("publish cached object: %w", err)
 		}
@@ -801,7 +801,7 @@ func installCheckoutDirectory(ctx context.Context, db *sql.DB, options bindOptio
 	}
 	defer parent.Close()
 
-	targetFD, targetErr := syscall.Openat(int(parent.Fd()), targetName, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	targetFD, targetErr := unix.Openat(int(parent.Fd()), targetName, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if targetErr == nil {
 		target := os.NewFile(uintptr(targetFD), value.path)
 		defer target.Close()
@@ -838,7 +838,7 @@ func installCheckoutDirectory(ctx context.Context, db *sql.DB, options bindOptio
 			return errors.Join(errors.New("created checkout directory has no durable identity"), err)
 		}
 	}
-	tempFD, err := syscall.Openat(int(parent.Fd()), tempName, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	tempFD, err := unix.Openat(int(parent.Fd()), tempName, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("open checkout temporary directory without following links: %w", err)
 	}
@@ -939,7 +939,7 @@ func installCheckoutFile(ctx context.Context, db *sql.DB, options bindOptions, v
 			return errors.Join(errors.New("created checkout file has no durable identity"), err)
 		}
 	}
-	fd, err := syscall.Openat(int(parent.Fd()), tempName, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	fd, err := unix.Openat(int(parent.Fd()), tempName, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 	created := err == nil
 	var opened unix.Stat_t
 	if errors.Is(err, syscall.EEXIST) {
@@ -951,7 +951,7 @@ func installCheckoutFile(ctx context.Context, db *sql.DB, options bindOptions, v
 			existing.Mode&syscall.S_IFMT != syscall.S_IFREG {
 			return errors.New("registered checkout temporary file is not a regular file")
 		}
-		fd, err = syscall.Openat(int(parent.Fd()), tempName, syscall.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		fd, err = unix.Openat(int(parent.Fd()), tempName, syscall.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 		if err == nil {
 			err = unix.Fstat(fd, &opened)
 		}
@@ -1060,7 +1060,7 @@ func openCheckoutParent(root *openedWorktree, path string, verify checkoutDirect
 	}
 	relative := ""
 	for _, component := range components[:len(components)-1] {
-		next, openErr := syscall.Openat(current, component, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		next, openErr := unix.Openat(current, component, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 		syscall.Close(current)
 		if openErr != nil {
 			return nil, "", fmt.Errorf("open checkout parent for %q: %w", path, openErr)
@@ -1124,8 +1124,7 @@ func setOpenFileMtime(file *os.File, value string) error {
 			return errors.New("mtime is neither canonical protocol UTC nor exact rollback evidence")
 		}
 	}
-	timestamp := unix.NsecToTimespec(parsed.UnixNano())
-	if err := unix.UtimesNanoAt(int(file.Fd()), "", []unix.Timespec{timestamp, timestamp}, unix.AT_EMPTY_PATH); err != nil {
+	if err := setFileMtime(file, parsed); err != nil {
 		return fmt.Errorf("set checkout mtime: %w", err)
 	}
 	return nil
@@ -1496,7 +1495,7 @@ func cleanupCheckoutTemps(ctx context.Context, db *sql.DB, root *openedWorktree,
 			parent.Close()
 			return errors.New("registered checkout temporary path has invalid type")
 		}
-		if uint64(stat.Dev) != temp.device || stat.Ino != temp.inode || stat.Mode&syscall.S_IFMT != expectedMode {
+		if uint64(stat.Dev) != temp.device || stat.Ino != temp.inode || uint32(stat.Mode)&syscall.S_IFMT != expectedMode {
 			parent.Close()
 			return errors.New("registered checkout temporary path identity changed; pending checkout retained")
 		}

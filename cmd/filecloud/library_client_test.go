@@ -319,7 +319,7 @@ func TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly(t *testing.T) {
 	if !strings.Contains(output.String(), "already bound") {
 		t.Fatalf("idempotent output = %q", output.String())
 	}
-	assertLinuxExt4Converged(t, "double-empty binding", environment, clientDir, worktree, nil)
+	assertPlatformConverged(t, "double-empty binding", environment, clientDir, worktree, nil)
 
 	before := *head.CommitID
 	if err := runTest(t.Context(), []string{"library", "unbind", "--client-dir", clientDir, "--worktree", worktree},
@@ -400,8 +400,8 @@ func TestLibraryBindConcurrentInitializationAdoptsWinner(t *testing.T) {
 	if err != nil || len(commit.Parents) != 0 {
 		t.Fatalf("winner is not an initial commit: %+v err=%v", commit, err)
 	}
-	assertLinuxExt4Converged(t, "concurrent initialization first client", environment, first.clientDir, first.worktree, nil)
-	assertLinuxExt4Converged(t, "concurrent initialization second client", environment, second.clientDir, second.worktree, nil)
+	assertPlatformConverged(t, "concurrent initialization first client", environment, first.clientDir, first.worktree, nil)
+	assertPlatformConverged(t, "concurrent initialization second client", environment, second.clientDir, second.worktree, nil)
 }
 
 func TestLibraryBindRejectsUnsupportedOrNonEmptyAndBindingConflicts(t *testing.T) {
@@ -468,8 +468,8 @@ func TestLibraryBindRejectsUnsupportedOrNonEmptyAndBindingConflicts(t *testing.T
 	if binding := readTestBinding(t, freshClient, otherWorktree); binding.SyncBase == "" {
 		t.Fatal("remote checkout did not establish Sync Base")
 	}
-	assertLinuxExt4Converged(t, "binding conflict original client", environment, clientDir, worktree, nil)
-	assertLinuxExt4Converged(t, "binding conflict remote checkout", environment, freshClient, otherWorktree, nil)
+	assertPlatformConverged(t, "binding conflict original client", environment, clientDir, worktree, nil)
+	assertPlatformConverged(t, "binding conflict remote checkout", environment, freshClient, otherWorktree, nil)
 }
 
 func TestLibraryBindRevalidatesBeforeHeadCASAndUnbindCancelsIntent(t *testing.T) {
@@ -489,17 +489,18 @@ func TestLibraryBindRevalidatesBeforeHeadCASAndUnbindCancelsIntent(t *testing.T)
 		t.Fatalf("Head published after worktree changed: head=%+v err=%v", head, err)
 	}
 	assertIntentCount(t, clientDir, 1)
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}
 	otherWorktree := filepath.Join(t.TempDir(), "other-worktree")
 	if err := os.Mkdir(otherWorktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := runLibraryWithConfig(t.Context(), []string{"unbind", "--client-dir", clientDir, "--worktree", otherWorktree},
-		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{}); err != nil {
+		strings.NewReader(""), io.Discard, io.Discard, config); err != nil {
 		t.Fatalf("unbind other worktree: %v", err)
 	}
 	assertIntentCount(t, clientDir, 1)
 	if err := runLibraryWithConfig(t.Context(), []string{"unbind", "--client-dir", clientDir, "--worktree", worktree},
-		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{}); err != nil {
+		strings.NewReader(""), io.Discard, io.Discard, config); err != nil {
 		t.Fatalf("cancel pending bind: %v", err)
 	}
 	assertNoIntent(t, clientDir)
@@ -1027,8 +1028,9 @@ func TestLibraryBindRejectsNoncanonicalPendingWinner(t *testing.T) {
 		t.Fatalf("noncanonical winner error = %v", err)
 	}
 	assertIntentCount(t, clientDir, 1)
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}
 	if err := runLibraryWithConfig(t.Context(), []string{"unbind", "--client-dir", clientDir, "--worktree", worktree},
-		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{}); err != nil {
+		strings.NewReader(""), io.Discard, io.Discard, config); err != nil {
 		t.Fatalf("cancel conflicting intent: %v", err)
 	}
 	assertNoIntent(t, clientDir)
@@ -1041,7 +1043,7 @@ func TestLibraryBindRejectsNoncanonicalPendingWinner(t *testing.T) {
 		t.Fatalf("unbind changed worktree: entries=%v err=%v", entries, err)
 	}
 	if err := runLibraryWithConfig(t.Context(), []string{"unbind", "--client-dir", clientDir, "--worktree", worktree},
-		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{}); err != nil {
+		strings.NewReader(""), io.Discard, io.Discard, config); err != nil {
 		t.Fatalf("repeat unbind after cancel: %v", err)
 	}
 }
@@ -1057,14 +1059,17 @@ func TestLibraryUnbindWaitsForClientLockAndRemainsLocalOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock, err := lockBinding(t.Context(), clientDir, worktree, environment.server.URL, testClientLibraryID, normalizeLibraryClientConfig(libraryClientConfig{}))
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}
+	lock, err := lockBinding(t.Context(), clientDir, worktree, environment.server.URL, testClientLibraryID, normalizeLibraryClientConfig(config))
 	if err != nil {
 		t.Fatal(err)
 	}
 	done, attempting := make(chan error, 1), make(chan struct{})
 	go func() {
 		done <- runLibraryWithConfig(t.Context(), []string{"unbind", "--client-dir", clientDir, "--worktree", worktree},
-			strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{beforeFlock: func() { close(attempting) }})
+			strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{
+				checkFilesystem: func(*os.File) error { return nil }, beforeFlock: func() { close(attempting) },
+			})
 	}()
 	<-attempting
 	select {
@@ -1149,9 +1154,28 @@ func TestLockClientDirAlreadyCanceledHasNoSideEffects(t *testing.T) {
 	}
 }
 
+func TestLockClientDirRejectsUnsupportedFilesystemBeforeCreatingLock(t *testing.T) {
+	clientDir := filepath.Join(t.TempDir(), "client")
+	checked := false
+	_, err := lockClientKeys(t.Context(), clientDir, []string{lockName("test-state")}, libraryClientConfig{
+		checkFilesystem: func(directory *os.File) error {
+			checked = directory.Fd() != ^uintptr(0)
+			return errors.New("unsupported client filesystem")
+		},
+		syncDirectory: syncDirectory,
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported client filesystem") || !checked {
+		t.Fatalf("client filesystem check: checked=%t err=%v", checked, err)
+	}
+	matches, globErr := filepath.Glob(filepath.Join(clientDir, "lock-*"))
+	if globErr != nil || len(matches) != 0 {
+		t.Fatalf("rejected client filesystem locks=%v err=%v", matches, globErr)
+	}
+}
+
 func TestLockClientDirCancellationClosesWaiter(t *testing.T) {
 	clientDir := filepath.Join(t.TempDir(), "client")
-	config := normalizeLibraryClientConfig(libraryClientConfig{})
+	config := normalizeLibraryClientConfig(libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
 	held, err := lockClientKeys(t.Context(), clientDir, []string{lockName("test-state")}, config)
 	if err != nil {
 		t.Fatal(err)
@@ -1178,7 +1202,7 @@ func TestLockClientDirCancellationClosesWaiter(t *testing.T) {
 func TestClientInitializationRetriesDirectorySync(t *testing.T) {
 	clientDir := filepath.Join(t.TempDir(), "client")
 	calls := 0
-	config := normalizeLibraryClientConfig(libraryClientConfig{syncDirectory: func(path string) error {
+	config := normalizeLibraryClientConfig(libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }, syncDirectory: func(path string) error {
 		calls++
 		if calls == 1 {
 			return errors.New("injected sync failure")
@@ -1209,6 +1233,7 @@ func TestLockClientDirRetriesAllDurabilitySteps(t *testing.T) {
 	clientDir := filepath.Join(t.TempDir(), "client")
 	fileSyncs, clientDirSyncs := 0, 0
 	config := normalizeLibraryClientConfig(libraryClientConfig{
+		checkFilesystem: func(*os.File) error { return nil },
 		syncFile: func(file *os.File) error {
 			fileSyncs++
 			return file.Sync()
@@ -1269,6 +1294,37 @@ func TestMountinfoPathRejectsInvalidEscapes(t *testing.T) {
 		if result, err := unescapeMountinfoPath(value); err == nil {
 			t.Fatalf("unescapeMountinfoPath(%q)=%q, want error", value, result)
 		}
+	}
+}
+
+func TestBindClientFilesystemCheckPrecedesRemoteAndStateCreation(t *testing.T) {
+	worktree := filepath.Join(t.TempDir(), "worktree")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateParent := t.TempDir()
+	clientDir := filepath.Join(stateParent, "client")
+	requests := atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+	checkedState := false
+	config := libraryClientConfig{checkFilesystem: func(file *os.File) error {
+		if file.Name() == worktree {
+			return nil
+		}
+		checkedState = true
+		return errors.New("unsupported client filesystem")
+	}}
+	err := runLibraryWithConfig(t.Context(), bindArgs(clientDir, server.URL, testClientLibraryID, worktree, testClientDeviceID)[1:],
+		strings.NewReader("token\n"), io.Discard, io.Discard, config)
+	if err == nil || !strings.Contains(err.Error(), "unsupported client filesystem") || !checkedState {
+		t.Fatalf("client filesystem error: checked=%t err=%v", checkedState, err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("remote requests before client filesystem rejection = %d", requests.Load())
+	}
+	if _, err := os.Stat(clientDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected client filesystem created state directory: %v", err)
 	}
 }
 

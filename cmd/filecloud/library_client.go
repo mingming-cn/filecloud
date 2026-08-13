@@ -24,13 +24,11 @@ import (
 	"time"
 
 	"github.com/mingming-cn/filecloud/internal/object"
-	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
 
 const (
 	_clientDatabaseName         = "client.db"
-	_ext4Magic                  = 0xef53
 	_headUpdateAttempts         = 3
 	_defaultTransientRetryDelay = time.Second
 	_maximumTransientRetryDelay = 30 * time.Second
@@ -73,7 +71,7 @@ type libraryClientConfig struct {
 
 func normalizeLibraryClientConfig(config libraryClientConfig) libraryClientConfig {
 	if config.checkFilesystem == nil {
-		config.checkFilesystem = requireExt4
+		config.checkFilesystem = requireSupportedFilesystem
 	}
 	if config.now == nil {
 		config.now = time.Now
@@ -200,6 +198,10 @@ func parseLibraryBind(ctx context.Context, args []string, stdin io.Reader, stder
 	canonicalWorktree := worktreeRoot.path
 	canonicalClientDir, err := canonicalStateDir(*clientDir)
 	if err != nil {
+		clear(token)
+		return bindOptions{}, errors.Join(err, worktreeRoot.Close())
+	}
+	if err := checkStateDirFilesystem(canonicalClientDir, config.checkFilesystem); err != nil {
 		clear(token)
 		return bindOptions{}, errors.Join(err, worktreeRoot.Close())
 	}
@@ -749,6 +751,9 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 	if err != nil {
 		return err
 	}
+	if err := checkStateDirFilesystem(canonicalClientDir, config.checkFilesystem); err != nil {
+		return err
+	}
 	canonicalWorktree, err := canonicalExistingPath(*worktree)
 	if err != nil {
 		return err
@@ -849,6 +854,9 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 	}
 	canonicalClientDir, err := canonicalStateDir(*clientDir)
 	if err != nil {
+		return err
+	}
+	if err := checkStateDirFilesystem(canonicalClientDir, config.checkFilesystem); err != nil {
 		return err
 	}
 	canonicalWorktree, err := canonicalUnbindPath(*worktree)
@@ -1067,6 +1075,7 @@ func lockClientKeys(ctx context.Context, clientDir string, names []string, confi
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("lock client state: %w", err)
 	}
+	checkFilesystem := config.checkFilesystem
 	config = normalizeLibraryClientConfig(config)
 	if err := os.MkdirAll(clientDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create client directory: %w", err)
@@ -1075,6 +1084,9 @@ func lockClientKeys(ctx context.Context, clientDir string, names []string, confi
 		return nil, fmt.Errorf("secure client directory: %w", err)
 	}
 	if err := config.syncDirectory(filepath.Dir(clientDir)); err != nil {
+		return nil, err
+	}
+	if err := checkStateDirFilesystem(clientDir, checkFilesystem); err != nil {
 		return nil, err
 	}
 	locks := &clientLocks{}
@@ -2667,39 +2679,6 @@ func newFlagSet(name string, output io.Writer) *flag.FlagSet {
 	return flags
 }
 
-func requireExt4(directory *os.File) error {
-	var info syscall.Statfs_t
-	if err := syscall.Fstatfs(int(directory.Fd()), &info); err != nil {
-		return fmt.Errorf("inspect worktree filesystem: %w", err)
-	}
-	if uint64(info.Type) != _ext4Magic {
-		return fmt.Errorf("unsupported worktree filesystem type 0x%x; Linux ext4 is required", uint64(info.Type))
-	}
-	filesystem, err := mountedFilesystemForDirectory(directory)
-	if err != nil {
-		return fmt.Errorf("identify worktree filesystem: %w", err)
-	}
-	if filesystem != "ext4" {
-		return fmt.Errorf("unsupported worktree filesystem %s; Linux ext4 is required", filesystem)
-	}
-	return nil
-}
-
-func mountedFilesystemForDirectory(directory *os.File) (filesystem string, retErr error) {
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(int(directory.Fd()), &stat); err != nil {
-		return "", fmt.Errorf("inspect worktree device: %w", err)
-	}
-	mountinfo, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return "", fmt.Errorf("open mountinfo: %w", err)
-	}
-	defer func() {
-		retErr = errors.Join(retErr, mountinfo.Close())
-	}()
-	return mountedFilesystem(mountinfo, directory.Name(), unix.Major(uint64(stat.Dev)), unix.Minor(uint64(stat.Dev)))
-}
-
 func mountedFilesystem(source io.Reader, path string, major, minor uint32) (string, error) {
 	longestMount := ""
 	filesystem := ""
@@ -2917,6 +2896,30 @@ func canonicalUnbindPath(path string) (string, error) {
 		resolved = filepath.Join(resolved, component)
 	}
 	return filepath.Clean(resolved), nil
+}
+
+func checkStateDirFilesystem(path string, check func(*os.File) error) error {
+	if check == nil {
+		return nil
+	}
+	probe := path
+	if _, err := os.Lstat(probe); errors.Is(err, os.ErrNotExist) {
+		probe = filepath.Dir(probe)
+	} else if err != nil {
+		return fmt.Errorf("inspect client filesystem path: %w", err)
+	}
+	fd, err := syscall.Open(probe, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open client filesystem path: %w", err)
+	}
+	directory := os.NewFile(uintptr(fd), probe)
+	if err := check(directory); err != nil {
+		return errors.Join(fmt.Errorf("check client filesystem: %w", err), directory.Close())
+	}
+	if err := directory.Close(); err != nil {
+		return fmt.Errorf("close client filesystem path: %w", err)
+	}
+	return nil
 }
 
 func canonicalStateDir(path string) (string, error) {

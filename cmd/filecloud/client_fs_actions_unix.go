@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package main
 
@@ -49,7 +49,7 @@ const (
 
 var (
 	errFSJournalRootChanged = errors.New("worktree root identity changed since journal creation")
-	fsActionOpenat2         = unix.Openat2
+	_openActionParent       = openActionParent
 )
 
 type fsAction struct {
@@ -406,13 +406,7 @@ func openFSActionParent(root *openedWorktree, relative string, expectedDevice, e
 	if relative == "" {
 		fd, err = unix.Dup(int(root.directory.Fd()))
 	} else {
-		fd, err = fsActionOpenat2(int(root.directory.Fd()), relative, &unix.OpenHow{
-			Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC,
-			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV,
-		})
-		if errors.Is(err, syscall.ENOSYS) {
-			fd, err = openFSActionParentFallback(root, relative)
-		}
+		fd, err = _openActionParent(root, relative)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("open filesystem action parent %q: %w", relative, err)
@@ -536,7 +530,7 @@ func actionPathState(parent *os.File, name string, value fsAction) (bool, bool, 
 	if value.ExpectedKind == "Directory" {
 		mode = syscall.S_IFDIR
 	}
-	matches := stat.Mode&syscall.S_IFMT == mode
+	matches := uint32(stat.Mode)&syscall.S_IFMT == mode
 	if value.ExpectedDevice != 0 || value.ExpectedInode != 0 {
 		matches = matches && uint64(stat.Dev) == value.ExpectedDevice && stat.Ino == value.ExpectedInode
 	}
@@ -578,7 +572,7 @@ func rollbackZeroIdentityCreate(ctx context.Context, db *sql.DB, root *openedWor
 	if err := unix.Fstat(int(root.directory.Fd()), &rootStat); err != nil {
 		return err
 	}
-	rootMtimeNS := time.Unix(rootStat.Mtim.Sec, rootStat.Mtim.Nsec).UnixNano()
+	rootMtimeNS := filesystemMtimeNS(time.Unix(rootStat.Mtim.Sec, rootStat.Mtim.Nsec))
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -839,7 +833,7 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 					return err
 				}
 			}
-			if err := unix.Renameat2(int(parent.Fd()), value.Source, int(parent.Fd()), value.Target, unix.RENAME_NOREPLACE); err != nil {
+			if err := renameNoReplace(int(parent.Fd()), value.Source, int(parent.Fd()), value.Target); err != nil {
 				return fmt.Errorf("execute journaled rename: %w", err)
 			}
 			changed = true
@@ -1954,7 +1948,7 @@ func completeRestorePromotionAction(ctx context.Context, db *sql.DB, root *opene
 				return err
 			}
 		}
-		if err := unix.Renameat2(int(sourceParent.Fd()), value.Source, int(targetParent.Fd()), targetLeaf, unix.RENAME_NOREPLACE); err != nil {
+		if err := renameNoReplace(int(sourceParent.Fd()), value.Source, int(targetParent.Fd()), targetLeaf); err != nil {
 			if errors.Is(err, syscall.EEXIST) {
 				return completeRestorePromotionAction(ctx, db, root, value, fault)
 			}
@@ -2065,7 +2059,7 @@ func completePromotionAction(ctx context.Context, db *sql.DB, root *openedWorktr
 				return err
 			}
 		}
-		if err := unix.Renameat2(int(sourceParent.Fd()), value.Source, int(targetParent.Fd()), targetLeaf, unix.RENAME_NOREPLACE); err != nil {
+		if err := renameNoReplace(int(sourceParent.Fd()), value.Source, int(targetParent.Fd()), targetLeaf); err != nil {
 			if errors.Is(err, syscall.EEXIST) {
 				return completePromotionAction(ctx, db, root, value, fault)
 			}

@@ -1245,7 +1245,7 @@ func registerSyncRecoveryPlan(ctx context.Context, db *sql.DB, root *openedWorkt
 	if err := unix.Fstat(int(root.directory.Fd()), &rootStat); err != nil {
 		return err
 	}
-	rootMtimeNS := time.Unix(rootStat.Mtim.Sec, rootStat.Mtim.Nsec).UnixNano()
+	rootMtimeNS := filesystemMtimeNS(time.Unix(rootStat.Mtim.Sec, rootStat.Mtim.Nsec))
 	top := make([]checkoutPath, 0)
 	for _, path := range paths {
 		if !strings.Contains(path.path, "/") {
@@ -2783,7 +2783,7 @@ func statMatchesRecovery(stat unix.Stat_t, value syncRecovery) bool {
 	if value.kind == "Directory" {
 		mode = syscall.S_IFDIR
 	}
-	return uint64(stat.Dev) == value.device && stat.Ino == value.inode && stat.Mode&syscall.S_IFMT == mode
+	return uint64(stat.Dev) == value.device && stat.Ino == value.inode && uint32(stat.Mode)&syscall.S_IFMT == mode
 }
 
 func finalizeSyncApply(ctx context.Context, db *sql.DB, binding clientBinding, pending pendingCheckout, paths []checkoutPath,
@@ -3451,7 +3451,7 @@ func statMatchesCheckoutTarget(stat unix.Stat_t, kind string, device, inode uint
 	if kind == "Directory" {
 		mode = syscall.S_IFDIR
 	}
-	return uint64(stat.Dev) == device && stat.Ino == inode && stat.Mode&syscall.S_IFMT == mode && (kind != "File" || stat.Nlink == 1)
+	return uint64(stat.Dev) == device && stat.Ino == inode && uint32(stat.Mode)&syscall.S_IFMT == mode && (kind != "File" || stat.Nlink == 1)
 }
 
 func openRollbackParent(root *openedWorktree, path string) (*os.File, string, bool, error) {
@@ -3529,7 +3529,7 @@ func restoreRollbackRootMtime(ctx context.Context, db *sql.DB, root *openedWorkt
 				return err
 			}
 			if uint64(stat.Dev) != root.device || stat.Ino != root.inode ||
-				time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec).UnixNano() != mtimeNS {
+				filesystemMtimeNS(time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec)) != mtimeNS {
 				return errors.New("completed sync rollback root mtime action no longer matches the worktree")
 			}
 			return nil

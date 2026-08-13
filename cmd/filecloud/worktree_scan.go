@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mingming-cn/filecloud/internal/object"
+	"golang.org/x/sys/unix"
 )
 
 type scannedObject struct {
@@ -66,7 +67,7 @@ type fileState struct {
 	device, inode uint64
 	mode, nlink   uint64
 	size          int64
-	mtime, ctime  syscall.Timespec
+	mtime, ctime  unix.Timespec
 }
 
 type listedEntry struct {
@@ -88,10 +89,7 @@ type scanSession struct {
 	warned      map[string]bool
 }
 
-const (
-	openPath        = 0x200000 // Linux O_PATH; inspect type without opening a device or blocking on a FIFO.
-	scanRetryBudget = 3
-)
+const scanRetryBudget = 3
 
 func scanWorktree(root *openedWorktree) (worktreeSnapshot, error) {
 	return scanWorktreeWithConfig(root, worktreeScanConfig{})
@@ -266,15 +264,11 @@ func (session *scanSession) enumerateDirectory(directory *os.File, relative stri
 }
 
 func inspectAt(directory *os.File, name, path string) (fileState, string, error) {
-	fd, err := syscall.Openat(int(directory.Fd()), name, openPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-	if err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(int(directory.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return fileState{}, "", fmt.Errorf("inspect worktree path %q without following links: %w", path, err)
 	}
-	defer syscall.Close(fd)
-	state, err := stateOfFD(fd)
-	if err != nil {
-		return fileState{}, "", fmt.Errorf("inspect worktree path %q: %w", path, err)
-	}
+	state := fileStateFromStat(stat)
 	switch state.mode & syscall.S_IFMT {
 	case syscall.S_IFREG:
 		return state, "File", nil
@@ -289,8 +283,10 @@ func openListedAt(directory *os.File, listed listedEntry, path string) (*os.File
 	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
 	if listed.kind == "Directory" {
 		flags |= syscall.O_DIRECTORY
+	} else {
+		flags |= syscall.O_NONBLOCK
 	}
-	fd, err := syscall.Openat(int(directory.Fd()), listed.name, flags, 0)
+	fd, err := unix.Openat(int(directory.Fd()), listed.name, flags, 0)
 	if err != nil {
 		return nil, fileState{}, fmt.Errorf("open worktree path %q without following links: %w", path, err)
 	}
@@ -421,7 +417,7 @@ func (session *scanSession) validateDirectory(directory *os.File, relative strin
 		}
 		if entry.kind == "Directory" {
 			err = session.validateDirectory(child, path)
-		} else if state.ctime == (syscall.Timespec{}) {
+		} else if state.ctime == (unix.Timespec{}) {
 			blocks, _, readErr := readFileBlocks(child, false)
 			if readErr != nil {
 				err = readErr
@@ -460,12 +456,16 @@ func stateOf(file *os.File) (fileState, error) {
 }
 
 func stateOfFD(fd int) (fileState, error) {
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(fd, &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
 		return fileState{}, err
 	}
+	return fileStateFromStat(stat), nil
+}
+
+func fileStateFromStat(stat unix.Stat_t) fileState {
 	return fileState{device: uint64(stat.Dev), inode: stat.Ino, mode: uint64(stat.Mode), nlink: uint64(stat.Nlink),
-		size: stat.Size, mtime: stat.Mtim, ctime: stat.Ctim}, nil
+		size: stat.Size, mtime: stat.Mtim, ctime: stat.Ctim}
 }
 
 func sameIdentity(left, right fileState) bool {
@@ -513,7 +513,7 @@ func joinScanPath(parent, name string) string {
 	return parent + "/" + name
 }
 
-func formatScanTime(value syscall.Timespec) string {
+func formatScanTime(value unix.Timespec) string {
 	return canonicalProtocolMtime(time.Unix(value.Sec, value.Nsec))
 }
 
@@ -609,8 +609,10 @@ func (root *openedWorktree) openRelative(relative string) (*os.File, error) {
 		flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
 		if index < len(components)-1 {
 			flags |= syscall.O_DIRECTORY
+		} else {
+			flags |= syscall.O_NONBLOCK
 		}
-		next, openErr := syscall.Openat(current, component, flags, 0)
+		next, openErr := unix.Openat(current, component, flags, 0)
 		syscall.Close(current)
 		if openErr != nil {
 			return nil, fmt.Errorf("reopen worktree path %q: %w", relative, openErr)

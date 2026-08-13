@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -707,7 +706,7 @@ func TestHeadUpdateCrashHelper(t *testing.T) {
 
 func newHeadCrashFixture(t *testing.T) (string, string, string) {
 	t.Helper()
-	root := os.Getenv("FILECLOUD_LINUX_EXT4_ROOT")
+	root := acceptance.Root()
 	if root == "" {
 		root = t.TempDir()
 	}
@@ -780,12 +779,13 @@ func assertHeadGraphReadable(t *testing.T, store *storage.Store, commitID string
 
 func emitHeadCrashAttestation(t *testing.T, point, oldHead, currentHead string, reachableObjects int) {
 	t.Helper()
-	if os.Getenv("FILECLOUD_RUN_1A") != "1" {
+	platform, filesystem, enabled := acceptance.ActivePlatform()
+	if !enabled {
 		return
 	}
 	line, err := acceptance.Encode(acceptance.Attestation{
-		Kind: "server-readability", Scenario: "Head update " + point, Platform: runtime.GOOS,
-		Filesystem: "ext4", ReachableObjects: reachableObjects, FailurePoint: point,
+		Kind: "server-readability", Scenario: "Head update " + point, Platform: platform,
+		Filesystem: filesystem, ReachableObjects: reachableObjects, FailurePoint: point,
 		OldHead: oldHead, CurrentHead: currentHead,
 	})
 	if err != nil {

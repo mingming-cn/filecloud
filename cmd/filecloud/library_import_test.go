@@ -83,7 +83,7 @@ func TestLibraryBindImportsLocalSnapshotAndSyncNoOps(t *testing.T) {
 	if err != nil || after.ETag != beforeETag || after.CommitID == nil || *after.CommitID != *head.CommitID {
 		t.Fatalf("no-op sync changed Head: before=%+v after=%+v err=%v", head, after, err)
 	}
-	assertLinuxExt4Converged(t, "first local import", environment, clientDir, worktree, linuxExt4ConfirmedFiles(files))
+	assertPlatformConverged(t, "first local import", environment, clientDir, worktree, platformConfirmedFiles(files))
 	if err := os.WriteFile(filepath.Join(worktree, "changed"), []byte("change"), 0o600); err != nil {
 		t.Fatal(err)
 	}

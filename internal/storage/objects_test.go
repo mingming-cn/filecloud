@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"sync"
 	"syscall"
@@ -447,7 +446,7 @@ const (
 
 func newObjectPublicationCrashStore(t *testing.T) (string, string, string) {
 	t.Helper()
-	root := os.Getenv("FILECLOUD_LINUX_EXT4_ROOT")
+	root := acceptance.Root()
 	if root == "" {
 		root = "."
 	}
@@ -540,12 +539,13 @@ func assertStoredHeadGraph(t *testing.T, store *Store, commitID, rootID string) 
 
 func emitObjectPublicationAttestation(t *testing.T, point, oldHead, currentHead string, reachableObjects int) {
 	t.Helper()
-	if os.Getenv("FILECLOUD_RUN_1A") != "1" {
+	platform, filesystem, enabled := acceptance.ActivePlatform()
+	if !enabled {
 		return
 	}
 	line, err := acceptance.Encode(acceptance.Attestation{
-		Kind: "server-readability", Scenario: "object publication " + point, Platform: runtime.GOOS,
-		Filesystem: "ext4", ReachableObjects: reachableObjects, FailurePoint: point,
+		Kind: "server-readability", Scenario: "object publication " + point, Platform: platform,
+		Filesystem: filesystem, ReachableObjects: reachableObjects, FailurePoint: point,
 		OldHead: oldHead, CurrentHead: currentHead,
 	})
 	if err != nil {

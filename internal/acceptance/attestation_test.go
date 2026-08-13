@@ -5,6 +5,16 @@ import (
 	"testing"
 )
 
+func TestActivePlatformRequiresExplicitGate(t *testing.T) {
+	if platform, filesystem, enabled := ActivePlatform(); enabled || platform != "" || filesystem != "" {
+		t.Fatalf("inactive platform = %q/%q enabled=%t", platform, filesystem, enabled)
+	}
+	t.Setenv("FILECLOUD_RUN_1B_APFS", "1")
+	if platform, filesystem, enabled := ActivePlatform(); !enabled || platform != "darwin" || filesystem != "apfs" {
+		t.Fatalf("APFS platform = %q/%q enabled=%t", platform, filesystem, enabled)
+	}
+}
+
 func TestEncodeUsesSharedPrefixAndSchema(t *testing.T) {
 	line, err := Encode(Attestation{Kind: "server-readability", Scenario: "point", Platform: "linux", Filesystem: "ext4"})
 	if err != nil {
