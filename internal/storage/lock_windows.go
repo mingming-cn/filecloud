@@ -15,7 +15,8 @@ import (
 // The first byte is the long-lived reader/writer lock. The second byte serializes
 // the exclusive-to-shared transition performed after migrations.
 type dataLock struct {
-	file *os.File
+	file      *os.File
+	guardHeld bool
 }
 
 func openDataLock(dataDir string, create bool) (*dataLock, error) {
@@ -31,11 +32,20 @@ func openDataLock(dataDir string, create bool) (*dataLock, error) {
 }
 
 func (l *dataLock) exclusive() error {
-	if err := lockByte(l.file, 0, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY); err != nil {
+	if err := lockByte(l.file, 1, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY); err != nil {
 		if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
 			return errors.New("data directory is locked by another process")
 		}
-		return fmt.Errorf("lock data directory: %w", err)
+		return fmt.Errorf("lock data-directory transition guard: %w", err)
+	}
+	l.guardHeld = true
+	if err := lockByte(l.file, 0, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY); err != nil {
+		unlockErr := unlockByte(l.file, 1)
+		l.guardHeld = false
+		if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+			return errors.Join(errors.New("data directory is locked by another process"), unlockErr)
+		}
+		return errors.Join(fmt.Errorf("lock data directory: %w", err), unlockErr)
 	}
 	return nil
 }
@@ -44,10 +54,13 @@ func (l *dataLock) shared() error {
 	// Hold the guard while changing modes so another process cannot observe an
 	// unlocked migration boundary. A shared LockFileEx lock permits other
 	// serving processes but excludes administrators requesting exclusive access.
-	if err := lockByte(l.file, 1, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY); err != nil {
-		return fmt.Errorf("guard data-directory lock downgrade: %w", err)
+	if !l.guardHeld {
+		return errors.New("data-directory lock was not exclusively held")
 	}
-	defer func() { _ = unlockByte(l.file, 1) }()
+	defer func() {
+		_ = unlockByte(l.file, 1)
+		l.guardHeld = false
+	}()
 	if err := unlockByte(l.file, 0); err != nil {
 		return fmt.Errorf("unlock exclusive data-directory lock: %w", err)
 	}
@@ -58,7 +71,12 @@ func (l *dataLock) shared() error {
 }
 
 func (l *dataLock) Close() error {
-	return errors.Join(unlockByte(l.file, 0), l.file.Close())
+	var guardErr error
+	if l.guardHeld {
+		guardErr = unlockByte(l.file, 1)
+		l.guardHeld = false
+	}
+	return errors.Join(unlockByte(l.file, 0), guardErr, l.file.Close())
 }
 
 func lockByte(file *os.File, offset uint32, flags uint32) error {
