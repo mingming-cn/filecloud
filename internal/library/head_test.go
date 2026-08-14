@@ -1,5 +1,3 @@
-//go:build !windows
-
 package library
 
 import (
@@ -16,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -693,7 +690,7 @@ func TestHeadUpdateCrashHelper(t *testing.T) {
 	}
 	defer closeStore(t, store)
 	kill := func() error {
-		return syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		return killHeadTestProcess()
 	}
 	config := Config{}
 	if point == "before" {
@@ -808,18 +805,6 @@ func readHeadObject(t *testing.T, store *storage.Store, kind, id string) []byte 
 		t.Fatalf("read Head object %s/%s: read=%v close=%v", kind, id, readErr, closeErr)
 	}
 	return data
-}
-
-func assertHeadProcessSIGKILL(t *testing.T, err error) {
-	t.Helper()
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		t.Fatalf("Head process was not killed: %v", err)
-	}
-	status, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
-		t.Fatalf("Head process status=%v err=%v", status, err)
-	}
 }
 
 func newHeadTestHandler(t *testing.T, store *storage.Store, now time.Time, config Config) http.Handler {

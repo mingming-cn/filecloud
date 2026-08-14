@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"unsafe"
 
+	"github.com/mingming-cn/filecloud/internal/fscompat"
 	"golang.org/x/sys/windows"
 )
 
@@ -33,6 +35,13 @@ func requireNTFS(directory *os.File) error {
 	if windows.GetDriveType(root) != windows.DRIVE_FIXED {
 		return errors.New("unsupported worktree volume; local fixed NTFS is required")
 	}
+	substituted, err := substitutedDrive(windows.UTF16PtrToString(root))
+	if err != nil {
+		return fmt.Errorf("inspect worktree volume mapping: %w", err)
+	}
+	if substituted {
+		return errors.New("unsupported worktree volume; substituted drives are not accepted")
+	}
 	var serial, maximum uint32
 	var flags uint32
 	filesystem := make([]uint16, 32)
@@ -55,7 +64,26 @@ func requireNTFS(directory *os.File) error {
 	if caseInfo&windows.FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0 {
 		return errors.New("case-sensitive NTFS worktree directories are unsupported")
 	}
+	if err := fscompat.SyncDirectory(int(directory.Fd())); err != nil {
+		return fmt.Errorf("verify NTFS directory persistence: %w", err)
+	}
 	return nil
+}
+
+func substitutedDrive(path string) (bool, error) {
+	volume := filepath.VolumeName(path)
+	if len(volume) != 2 || volume[1] != ':' {
+		return false, nil
+	}
+	name, err := windows.UTF16PtrFromString(volume)
+	if err != nil {
+		return false, err
+	}
+	target := make([]uint16, windows.MAX_PATH)
+	if _, err := windows.QueryDosDevice(name, &target[0], uint32(len(target))); err != nil {
+		return false, err
+	}
+	return strings.HasPrefix(windows.UTF16ToString(target), `\??\`), nil
 }
 
 func volumeRoot(path string) (*uint16, error) {

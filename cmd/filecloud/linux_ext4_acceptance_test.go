@@ -358,6 +358,7 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 		"TestMacOSAPFSAcceptanceMatrix":                  true,
 		"TestMacOSAPFSLockHelper":                        true,
 		"TestWindowsNTFSAcceptanceMatrix":                true,
+		"TestWindowsNTFSLockHelper":                      true,
 	}
 	var attestations []platformAttestation
 	collector := newPlatformAttestationCollector()

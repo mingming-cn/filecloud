@@ -1,5 +1,3 @@
-//go:build !windows
-
 package storage
 
 import (
@@ -15,7 +13,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -383,7 +380,7 @@ func TestObjectStorePublicationCrashHelper(t *testing.T) {
 	defer closeObjectStore(t, store)
 	store.objectPublicationFault = func(actual string) error {
 		if actual == point {
-			return syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return killObjectTestProcess()
 		}
 		return nil
 	}
@@ -568,18 +565,6 @@ func readStoredObject(t *testing.T, store *Store, kind, id string) []byte {
 		t.Fatalf("read stored %s/%s: read=%v close=%v", kind, id, readErr, closeErr)
 	}
 	return data
-}
-
-func assertObjectPublicationSIGKILL(t *testing.T, err error) {
-	t.Helper()
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		t.Fatalf("object publication process was not killed: %v", err)
-	}
-	status, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
-		t.Fatalf("object publication process status=%v err=%v", status, err)
-	}
 }
 
 type observedReader struct {

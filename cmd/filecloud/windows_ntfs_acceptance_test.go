@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -156,6 +157,7 @@ func TestWindowsNTFSPrimitives(t *testing.T) {
 	if data, err := os.ReadFile(filepath.Join(path, "source")); err != nil || string(data) != "source" {
 		t.Fatalf("occupied rename did not preserve source=%q err=%v", data, err)
 	}
+	verifyOccupiedRenameRecovery(t, path)
 	lockPath := filepath.Join(path, "binding.lock")
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -182,6 +184,94 @@ func TestWindowsNTFSPrimitives(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Log(line)
+}
+
+func verifyOccupiedRenameRecovery(t *testing.T, parent string) {
+	t.Helper()
+	ctx := context.Background()
+	clientDir, err := os.MkdirTemp(parent, ".occupied-client-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := os.MkdirTemp(parent, ".occupied-worktree-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := initializeClientDB(ctx, clientDir, syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := openWorktreeRoot(worktree, requireNTFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bindFSJournalRoot(ctx, db, worktree, root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "source"), []byte("user-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstatat(int(root.directory.Fd()), "source", &stat, fscompat.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Fatal(err)
+	}
+	action := fsAction{Worktree: worktree, ActionID: "1234567890abcdef1234567890abcdef", Order: 1,
+		Phase: fsPhasePreBase, Op: fsOpRename, Parent: "", ParentDevice: root.device, ParentInode: root.inode,
+		Source: "source", Target: "target", ExpectedKind: "File", ExpectedDevice: stat.Dev, ExpectedInode: stat.Ino,
+		State: fsStateIntent}
+	if err := insertFSActionIntent(ctx, db, action); err != nil {
+		t.Fatal(err)
+	}
+	name, err := windows.UTF16PtrFromString(filepath.Join(worktree, "source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := windows.CreateFile(name, windows.GENERIC_READ, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil,
+		windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverFSActions(ctx, db, worktree, root, nil); !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		windows.CloseHandle(held)
+		t.Fatalf("occupied journal recovery error=%v, want sharing violation", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(worktree, "source")); err != nil || string(data) != "user-content" {
+		windows.CloseHandle(held)
+		t.Fatalf("occupied journal recovery changed source=%q err=%v", data, err)
+	}
+	var state string
+	if err := db.QueryRowContext(ctx, "SELECT state FROM fs_actions WHERE action_id=?", action.ActionID).Scan(&state); err != nil || state != fsStateIntent {
+		windows.CloseHandle(held)
+		t.Fatalf("occupied journal state=%q err=%v, want intent", state, err)
+	}
+	if err := windows.CloseHandle(held); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(root.Close(), db.Close()); err != nil {
+		t.Fatal(err)
+	}
+	db, err = openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	root, err = openWorktreeRoot(worktree, requireNTFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := recoverFSActions(ctx, db, worktree, root, nil); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(worktree, "target")); err != nil || string(data) != "user-content" {
+		t.Fatalf("restarted journal recovery target=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(worktree, "source")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restarted journal recovery retained source: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT state FROM fs_actions WHERE action_id=?", action.ActionID).Scan(&state); err != nil || state != fsStateCompleted {
+		t.Fatalf("restarted journal state=%q err=%v, want completed", state, err)
+	}
 }
 
 func TestWindowsNTFSLockHelper(t *testing.T) {
