@@ -250,7 +250,7 @@ func verifyOccupiedRenameRecovery(t *testing.T, parent string) {
 	if err := errors.Join(root.Close(), db.Close()); err != nil {
 		t.Fatal(err)
 	}
-	db, err = openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
+	db, err = openClientDB(filepath.Join(clientDir, _clientDatabaseName), false)
 	if err != nil {
 		t.Fatal(err)
 	}

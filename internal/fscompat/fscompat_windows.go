@@ -71,6 +71,9 @@ func Open(path string, flags int, mode uint32) (int, error) {
 	if flags&O_WRONLY != 0 {
 		access = windows.GENERIC_WRITE
 	}
+	if flags&O_DIRECTORY != 0 {
+		access |= windows.GENERIC_WRITE
+	}
 	if flags&O_DELETE != 0 {
 		access |= windows.DELETE
 	}
@@ -115,7 +118,7 @@ func Openat(dirfd int, path string, flags int, mode uint32) (int, error) {
 		access |= windows.DELETE
 	}
 	if flags&O_DIRECTORY != 0 {
-		access |= windows.FILE_LIST_DIRECTORY
+		access |= windows.FILE_LIST_DIRECTORY | windows.GENERIC_WRITE
 	} else {
 		access |= windows.FILE_READ_DATA
 	}
