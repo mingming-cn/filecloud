@@ -44,18 +44,56 @@ func TestWindowsNTFSAcceptanceMatrix(t *testing.T) {
 	if err := opened.Close(); err != nil {
 		t.Fatal(err)
 	}
-	TestWindowsNTFSPrimitives(t)
+	runPlatformMatrix(t, root, platformMatrixScenarios(), "windows", "ntfs", []string{
+		"FILECLOUD_RUN_1A=",
+		"FILECLOUD_RUN_1B_APFS=",
+		"FILECLOUD_RUN_1B_NTFS=1",
+		"FILECLOUD_WINDOWS_NTFS_ROOT=" + root,
+	})
 	t.Logf("verified local NTFS worktree=%s", root)
 }
 
 // TestWindowsNTFSPrimitives exercises the handle-relative boundary. It is
 // gated because it needs a real local fixed NTFS volume and can be rejected by
 // host policy before the test body runs.
+func TestWindowsNTFSMatrixWiresFullScenarioSet(t *testing.T) {
+	required := map[string]bool{}
+	for _, scenario := range platformMatrixScenarios() {
+		required[scenario.test] = true
+	}
+	for _, test := range []string{
+		"TestPlatformCorrectnessLoop",
+		"TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly",
+		"TestScanRegularFileRetriesConcurrentRewrite",
+		"TestFSActionSubprocessCrashMatrix",
+		"TestPublicBindSubprocessCrashMatrix",
+		"TestPublicSyncSubprocessCrashMatrix",
+		"TestLibrarySyncInterrupted100MiBUploadSendsOnlyMissingBlocks",
+		"TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject",
+	} {
+		if !required[test] {
+			t.Fatalf("Windows NTFS matrix omitted %s", test)
+		}
+	}
+}
+
 func TestWindowsNTFSPrimitives(t *testing.T) {
 	if os.Getenv("FILECLOUD_RUN_1B_NTFS") != "1" {
 		t.Skip("set FILECLOUD_RUN_1B_NTFS=1 to run the Windows/NTFS primitive spike")
 	}
-	path := t.TempDir()
+	path := acceptance.Root()
+	if path == "" {
+		path = "."
+	}
+	path, err := os.MkdirTemp(path, ".windows-ntfs-primitives-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(path); err != nil {
+			t.Errorf("remove NTFS primitive directory: %v", err)
+		}
+	})
 	root, err := openWorktreeRoot(path, requireNTFS)
 	if err != nil {
 		t.Fatal(err)
@@ -88,13 +126,13 @@ func TestWindowsNTFSPrimitives(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer windows.CloseHandle(held)
-	if err := renameNoReplace(int(root.directory.Fd()), "source", int(root.directory.Fd()), "renamed"); err == nil {
-		t.Fatal("occupied source unexpectedly renamed")
+	if err := renameNoReplace(int(root.directory.Fd()), "source", int(root.directory.Fd()), "renamed"); !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("occupied source rename error=%v, want sharing violation", err)
 	}
 	if data, err := os.ReadFile(filepath.Join(path, "source")); err != nil || string(data) != "source" {
 		t.Fatalf("occupied rename did not preserve source=%q err=%v", data, err)
 	}
-	if err := root.directory.Sync(); err != nil {
+	if err := fscompat.SyncDirectory(int(root.directory.Fd())); err != nil {
 		t.Fatalf("flush NTFS parent directory: %v", err)
 	}
 	line, err := acceptance.Encode(acceptance.Attestation{

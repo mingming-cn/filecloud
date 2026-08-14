@@ -1,5 +1,3 @@
-//go:build !windows
-
 package main
 
 import (
@@ -15,48 +13,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/mingming-cn/filecloud/internal/acceptance"
+	"github.com/mingming-cn/filecloud/internal/fscompat"
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/object"
 	"github.com/mingming-cn/filecloud/internal/storage"
 )
-
-func TestLinuxExt4AcceptanceMatrix(t *testing.T) {
-	if os.Getenv("FILECLOUD_PLATFORM_MATRIX_CHILD") == "1" {
-		t.Skip("Linux/ext4 acceptance child suite does not recurse")
-	}
-	if os.Getenv("FILECLOUD_RUN_1A") != "1" {
-		t.Skip("set FILECLOUD_RUN_1A=1 to run the Linux/ext4 acceptance matrix")
-	}
-	ext4Temp, err := os.MkdirTemp(".", ".linux-ext4-matrix-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ext4Temp, err = filepath.Abs(ext4Temp)
-	if err != nil {
-		t.Fatal(errors.Join(err, os.RemoveAll(ext4Temp)))
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(ext4Temp); err != nil {
-			t.Errorf("remove Linux/ext4 matrix directory: %v", err)
-		}
-	})
-	requireLinuxExt4(t, ext4Temp)
-
-	scenarios := platformMatrixScenarios()
-	runPlatformMatrix(t, ext4Temp, scenarios, "linux", "ext4", []string{
-		"FILECLOUD_RUN_1A=1",
-		"FILECLOUD_RUN_1B_APFS=",
-		"FILECLOUD_LINUX_EXT4_ROOT=" + ext4Temp,
-	})
-}
 
 func platformMatrixScenarios() []platformMatrixScenario {
 	return []platformMatrixScenario{
@@ -287,9 +254,17 @@ func validatePlatformAttestations(attestations []platformAttestation, required m
 				return fmt.Errorf("platform recovery attestation %q is invalid", attestation.Scenario)
 			}
 		case "filesystem-primitives":
-			if !attestation.NoFollow || !attestation.StableFileIdentity || !attestation.NoReplaceRename || !attestation.NoReplaceLink ||
-				!attestation.SameDirectoryRename || !attestation.DirectorySync || !attestation.CrossProcessLock ||
-				!attestation.OldFDWritesDetached || attestation.Warning == "" {
+			if !attestation.NoFollow || !attestation.StableFileIdentity || !attestation.NoReplaceRename ||
+				!attestation.SameDirectoryRename || !attestation.DirectorySync {
+				return fmt.Errorf("platform filesystem-primitives attestation %q is incomplete", attestation.Scenario)
+			}
+			if platform == "windows" && filesystem == "ntfs" {
+				if !attestation.OccupiedRenamePreserved {
+					return fmt.Errorf("Windows filesystem-primitives attestation %q did not preserve an occupied rename source", attestation.Scenario)
+				}
+				break
+			}
+			if !attestation.NoReplaceLink || !attestation.CrossProcessLock || !attestation.OldFDWritesDetached || attestation.Warning == "" {
 				return fmt.Errorf("platform filesystem-primitives attestation %q is incomplete", attestation.Scenario)
 			}
 		default:
@@ -380,6 +355,7 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 		"TestLinuxExt4AcceptanceMatrix":                  true,
 		"TestMacOSAPFSAcceptanceMatrix":                  true,
 		"TestMacOSAPFSLockHelper":                        true,
+		"TestWindowsNTFSAcceptanceMatrix":                true,
 	}
 	var attestations []platformAttestation
 	collector := newPlatformAttestationCollector()
@@ -444,6 +420,9 @@ func TestRequiredPlatformAttestationCounts(t *testing.T) {
 	}
 	if got := len(requiredPlatformAttestations("darwin", "apfs")); got != 109 {
 		t.Fatalf("macOS/APFS attestations=%d, want 109", got)
+	}
+	if got := len(requiredPlatformAttestations("windows", "ntfs")); got != 109 {
+		t.Fatalf("Windows/NTFS attestations=%d, want 109", got)
 	}
 }
 
@@ -513,6 +492,9 @@ func requiredPlatformAttestations(platform, filesystem string) map[string]string
 	}
 	if platform == "darwin" && filesystem == "apfs" {
 		result["macOS APFS primitives"] = "filesystem-primitives"
+	}
+	if platform == "windows" && filesystem == "ntfs" {
+		result["Windows NTFS primitives"] = "filesystem-primitives"
 	}
 	for _, category := range []struct{ op, kind string }{
 		{fsOpCreateFile, "File"}, {fsOpCreateDirectory, "Directory"},
@@ -686,31 +668,6 @@ func newPlatformClientPaths(t *testing.T) (string, string) {
 	return clientDir, canonical
 }
 
-func requireLinuxExt4(t *testing.T, worktree string) {
-	t.Helper()
-	if runtime.GOOS != "linux" {
-		t.Fatalf("Linux/ext4 acceptance requires Linux/ext4, got %s", runtime.GOOS)
-	}
-	root, err := openWorktreeRoot(worktree, requireSupportedFilesystem)
-	if err != nil {
-		t.Fatalf("Linux/ext4 acceptance requires an ext-family worktree: %v", err)
-	}
-	defer func() {
-		if err := root.Close(); err != nil {
-			t.Errorf("close ext4 worktree: %v", err)
-		}
-	}()
-	filesystem, err := mountedFilesystemForDirectory(root.directory)
-	if err != nil {
-		t.Fatalf("identify worktree filesystem: %v", err)
-	}
-	var info syscall.Statfs_t
-	if err := syscall.Fstatfs(int(root.directory.Fd()), &info); err != nil {
-		t.Fatalf("inspect ext4 worktree: %v", err)
-	}
-	t.Logf("platform=%s filesystem=%s magic=0x%x worktree=%s", runtime.GOOS, filesystem, uint64(info.Type), worktree)
-}
-
 func assertPlatformSameConvergence(t *testing.T, scenario string, environment libraryCLIEnvironment,
 	first, second platformClient, confirmed []platformConfirmedInput,
 ) {
@@ -746,8 +703,8 @@ func assertPlatformConverged(t *testing.T, scenario string, environment libraryC
 	if len(journalBindings) != 1 {
 		t.Fatalf("%s has %d filesystem journal root registrations", scenario, len(journalBindings))
 	}
-	var rootStat syscall.Stat_t
-	if err := syscall.Stat(worktree, &rootStat); err != nil {
+	var rootStat fscompat.Stat_t
+	if err := fscompat.Lstat(worktree, &rootStat); err != nil {
 		t.Fatalf("%s inspect worktree root: %v", scenario, err)
 	}
 	registered := journalBindings[0]

@@ -1,5 +1,3 @@
-//go:build !windows
-
 package main
 
 import (
@@ -8,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -202,7 +199,7 @@ func TestScanTrackedSymlinkIsFatal(t *testing.T) {
 
 func TestScanIgnoresUntrackedFIFOWithWarning(t *testing.T) {
 	root, path := newScannerTestRoot(t, map[string]string{"file": "data"})
-	if err := syscall.Mkfifo(path("pipe"), 0o600); err != nil {
+	if err := createTestFIFO(path("pipe")); err != nil {
 		t.Fatal(err)
 	}
 	var warning bytes.Buffer
@@ -222,7 +219,7 @@ func TestScanIgnoresUntrackedFIFOWithWarning(t *testing.T) {
 
 func TestInitialScanStillRejectsUnsupportedPath(t *testing.T) {
 	root, path := newScannerTestRoot(t, nil)
-	if err := syscall.Mkfifo(path("pipe"), 0o600); err != nil {
+	if err := createTestFIFO(path("pipe")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := scanWorktree(root); err == nil || !strings.Contains(err.Error(), "unsupported") {

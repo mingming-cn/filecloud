@@ -4,6 +4,7 @@ package fscompat
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"time"
 	"unsafe"
@@ -24,9 +25,12 @@ const (
 	O_NOFOLLOW          = 0x20000
 	O_CLOEXEC           = 0
 	O_NONBLOCK          = 0
-	S_IFMT              = 0xf000
-	S_IFREG             = 0x8000
-	S_IFDIR             = 0x4000
+	// O_DELETE requests DELETE access without changing POSIX callers on Unix.
+	// NT rename and disposition operations require it on the source handle.
+	O_DELETE = 0x40000
+	S_IFMT   = 0xf000
+	S_IFREG  = 0x8000
+	S_IFDIR  = 0x4000
 )
 
 var (
@@ -52,6 +56,11 @@ type Stat_t struct {
 	Mtim, Ctim Timespec
 }
 
+type _fileBasicInfo struct {
+	CreationTime, LastAccessTime, LastWriteTime, ChangeTime int64
+	FileAttributes                                          uint32
+}
+
 func Open(path string, flags int, mode uint32) (int, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
@@ -60,6 +69,9 @@ func Open(path string, flags int, mode uint32) (int, error) {
 	access := uint32(windows.GENERIC_READ)
 	if flags&O_WRONLY != 0 {
 		access = windows.GENERIC_WRITE
+	}
+	if flags&O_DELETE != 0 {
+		access |= windows.DELETE
 	}
 	disposition := uint32(windows.OPEN_EXISTING)
 	if flags&O_CREAT != 0 && flags&O_EXCL != 0 {
@@ -98,6 +110,9 @@ func Openat(dirfd int, path string, flags int, mode uint32) (int, error) {
 	if flags&O_WRONLY != 0 {
 		access |= windows.FILE_WRITE_DATA | windows.FILE_WRITE_ATTRIBUTES
 	}
+	if flags&O_DELETE != 0 {
+		access |= windows.DELETE
+	}
 	if flags&O_DIRECTORY != 0 {
 		access |= windows.FILE_LIST_DIRECTORY
 	} else {
@@ -119,7 +134,7 @@ func Openat(dirfd int, path string, flags int, mode uint32) (int, error) {
 	var status windows.IO_STATUS_BLOCK
 	if err := windows.NtCreateFile(&h, access, &oa, &status, nil, 0,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, disposition, options, 0, 0); err != nil {
-		return -1, err
+		return -1, NormalizeError(err)
 	}
 	if err := rejectReparse(h); err != nil {
 		windows.CloseHandle(h)
@@ -148,9 +163,15 @@ func Fstat(fd int, stat *Stat_t) error {
 	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
 		kind = S_IFDIR
 	}
+	var basic _fileBasicInfo
+	if err := windows.GetFileInformationByHandleEx(windows.Handle(fd), windows.FileBasicInfo,
+		(*byte)(unsafe.Pointer(&basic)), uint32(unsafe.Sizeof(basic))); err != nil {
+		return err
+	}
 	mtime := time.Unix(0, info.LastWriteTime.Nanoseconds())
-	ctime := time.Unix(0, info.CreationTime.Nanoseconds())
-	*stat = Stat_t{Dev: uint64(info.VolumeSerialNumber), Ino: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow), Mode: kind, Nlink: uint64(info.NumberOfLinks), Size: int64(uint64(info.FileSizeHigh)<<32 | uint64(info.FileSizeLow)), Mtim: Timespec{mtime.Unix(), int64(mtime.Nanosecond())}, Ctim: Timespec{ctime.Unix(), int64(ctime.Nanosecond())}}
+	changeTime := windows.Filetime{LowDateTime: uint32(basic.ChangeTime), HighDateTime: uint32(uint64(basic.ChangeTime) >> 32)}
+	change := time.Unix(0, changeTime.Nanoseconds())
+	*stat = Stat_t{Dev: uint64(info.VolumeSerialNumber), Ino: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow), Mode: kind, Nlink: uint64(info.NumberOfLinks), Size: int64(uint64(info.FileSizeHigh)<<32 | uint64(info.FileSizeLow)), Mtim: Timespec{mtime.Unix(), int64(mtime.Nanosecond())}, Ctim: Timespec{change.Unix(), int64(change.Nanosecond())}}
 	if stat.Ino == 0 {
 		return errors.New("NTFS file identity is not safely representable")
 	}
@@ -173,12 +194,22 @@ func Lstat(path string, stat *Stat_t) error {
 	return Fstat(fd, stat)
 }
 func Dup(fd int) (int, error) {
-	var current, duplicate windows.Handle
+	var duplicate windows.Handle
 	if err := windows.DuplicateHandle(windows.CurrentProcess(), windows.Handle(fd), windows.CurrentProcess(), &duplicate, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
 		return -1, err
 	}
-	_ = current
 	return int(duplicate), nil
+}
+
+// OpenDirectoryEnumeration opens '.' relative to the verified parent instead
+// of duplicating a handle with an existing directory cursor. Windows directory
+// enumeration state is handle-local and does not support Unix Seek(0) reset.
+func OpenDirectoryEnumeration(fd int, name string) (*os.File, error) {
+	directory, err := Openat(fd, ".", O_RDONLY|O_DIRECTORY|O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(directory), name), nil
 }
 func Close(fd int) error { return windows.CloseHandle(windows.Handle(fd)) }
 func Mkdirat(dirfd int, path string, mode uint32) error {
@@ -189,7 +220,7 @@ func Mkdirat(dirfd int, path string, mode uint32) error {
 	return Close(fd)
 }
 func Unlinkat(dirfd int, path string, flags int) error {
-	openFlags := O_WRONLY | O_NOFOLLOW
+	openFlags := O_WRONLY | O_NOFOLLOW | O_DELETE
 	if flags&AT_REMOVEDIR != 0 {
 		openFlags |= O_DIRECTORY
 	}
@@ -201,12 +232,32 @@ func Unlinkat(dirfd int, path string, flags int) error {
 	deleteFile := byte(1)
 	var status windows.IO_STATUS_BLOCK
 	if err := windows.NtSetInformationFile(windows.Handle(fd), &status, &deleteFile, 1, windows.FileDispositionInformation); err != nil {
-		return err
+		return NormalizeError(err)
 	}
 	return nil
 }
-func Ftruncate(fd int, size int64) error { return os.NewFile(uintptr(fd), "").Truncate(size) }
-func Fchmod(fd int, mode uint32) error   { return nil }
+func Ftruncate(fd int, size int64) error {
+	if size < 0 {
+		return errors.New("negative truncate size")
+	}
+	high := int32(size >> 32)
+	if _, err := windows.SetFilePointer(windows.Handle(fd), int32(size), &high, windows.FILE_BEGIN); err != nil {
+		return err
+	}
+	return windows.SetEndOfFile(windows.Handle(fd))
+}
+
+// Windows mode bits do not map to POSIX permissions. The cache root is created
+// by the current user and its ACL remains authoritative; silently claiming a
+// chmod succeeded would weaken that boundary.
+func Fchmod(fd int, mode uint32) error {
+	if mode != 0o700 {
+		return fmt.Errorf("Windows cannot apply POSIX mode %#o", mode)
+	}
+	return nil
+}
+func SyncDirectory(fd int) error { return windows.FlushFileBuffers(windows.Handle(fd)) }
+
 func Flock(fd int, operation int) error {
 	if operation&LOCK_UN != 0 {
 		return windows.UnlockFileEx(windows.Handle(fd), 0, 1, 0, &windows.Overlapped{})
@@ -216,4 +267,14 @@ func Flock(fd int, operation int) error {
 		flags |= windows.LOCKFILE_EXCLUSIVE_LOCK
 	}
 	return windows.LockFileEx(windows.Handle(fd), flags, 0, 1, 0, &windows.Overlapped{})
+}
+
+// NormalizeError turns NT native statuses into the Win32 errors shared code
+// compares with errors.Is (for example ERROR_FILE_NOT_FOUND and ERROR_SHARING_VIOLATION).
+func NormalizeError(err error) error {
+	var status windows.NTStatus
+	if errors.As(err, &status) {
+		return status.Errno()
+	}
+	return err
 }

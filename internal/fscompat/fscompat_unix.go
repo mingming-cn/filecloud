@@ -3,7 +3,12 @@
 // Package fscompat isolates handle-relative filesystem operations used by the client.
 package fscompat
 
-import "golang.org/x/sys/unix"
+import (
+	"errors"
+	"os"
+
+	"golang.org/x/sys/unix"
+)
 
 type Stat_t = unix.Stat_t
 type Timespec = unix.Timespec
@@ -19,6 +24,7 @@ const (
 	O_NOFOLLOW          = unix.O_NOFOLLOW
 	O_CLOEXEC           = unix.O_CLOEXEC
 	O_NONBLOCK          = unix.O_NONBLOCK
+	O_DELETE            = 0
 	S_IFMT              = unix.S_IFMT
 	S_IFREG             = unix.S_IFREG
 	S_IFDIR             = unix.S_IFDIR
@@ -48,3 +54,18 @@ func Unlinkat(dirfd int, path string, flags int) error  { return unix.Unlinkat(d
 func Ftruncate(fd int, size int64) error                { return unix.Ftruncate(fd, size) }
 func Fchmod(fd int, mode uint32) error                  { return unix.Fchmod(fd, mode) }
 func Flock(fd int, operation int) error                 { return unix.Flock(fd, operation) }
+func SyncDirectory(fd int) error                        { return unix.Fsync(fd) }
+
+// OpenDirectoryEnumeration returns a separate directory description so each
+// scanner pass starts at the beginning without sharing another pass's offset.
+func OpenDirectoryEnumeration(fd int, name string) (*os.File, error) {
+	duplicate, err := unix.Dup(fd)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(duplicate), name)
+	if _, err := file.Seek(0, 0); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	return file, nil
+}

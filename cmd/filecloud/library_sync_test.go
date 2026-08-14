@@ -1,5 +1,3 @@
-//go:build !windows
-
 package main
 
 import (
@@ -21,14 +19,13 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/mingming-cn/filecloud/internal/fscompat"
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/object"
-	"golang.org/x/sys/unix"
 	"golang.org/x/text/cases"
 )
 
@@ -2467,16 +2464,12 @@ func TestLibrarySyncMutationBeforeFirstPromotionCrashMatrix(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer held.Close()
-				beforeInfo, err := held.Stat()
+				before, err := testOpenFileStat(held)
 				if err != nil {
-					t.Fatal(err)
-				}
-				before, ok := beforeInfo.Sys().(*syscall.Stat_t)
-				if !ok {
-					t.Fatal("read held conflict identity")
+					t.Fatal("read held conflict identity: ", err)
 				}
 				command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
-				command.ExtraFiles = []*os.File{held}
+				attachTestHeldFile(command, held)
 				command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
 					"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
 					"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
@@ -2544,16 +2537,11 @@ func TestLibrarySyncMutationBeforeFirstPromotionCrashMatrix(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				afterInfo, statErr := mutated.Stat()
-				if statErr != nil {
-					mutated.Close()
-					t.Fatal(statErr)
-				}
-				after, ok := afterInfo.Sys().(*syscall.Stat_t)
+				after, statErr := testOpenFileStat(mutated)
 				data, readErr := io.ReadAll(mutated)
 				closeErr := mutated.Close()
-				if !ok || readErr != nil || closeErr != nil || after.Dev != before.Dev || after.Ino != before.Ino || string(data) != "changed" {
-					t.Fatalf("mutated target identity=%v content=%q err=%v", ok && after.Dev == before.Dev && after.Ino == before.Ino, data, errors.Join(readErr, closeErr))
+				if statErr != nil || readErr != nil || closeErr != nil || after.Dev != before.Dev || after.Ino != before.Ino || string(data) != "changed" {
+					t.Fatalf("mutated target identity=%v content=%q err=%v", statErr == nil && after.Dev == before.Dev && after.Ino == before.Ino, data, errors.Join(statErr, readErr, closeErr))
 				}
 				if fixed, err := os.ReadFile(filepath.Join(subscriberTree, filepath.FromSlash(expected))); err != nil || string(fixed) != "local" {
 					t.Fatalf("fixed Candidate=%q err=%v", fixed, err)
@@ -2936,7 +2924,11 @@ func TestLibraryRejectsOrphanPromotionBeforeReplay(t *testing.T) {
 				db.Close()
 				t.Fatal(err)
 			}
-			stat := info.Sys().(*syscall.Stat_t)
+			stat, err := testOpenFileStat(held)
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
 			snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
 			id, err := scanRegularFile(held, "forged", info, &snapshot)
 			if err != nil {
@@ -2997,8 +2989,8 @@ func TestLibraryRejectsOrphanPromotionBeforeReplay(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if current, err := held.Stat(); err != nil || current.Sys().(*syscall.Stat_t).Ino != stat.Ino {
-				t.Fatalf("%s forged source identity changed: info=%v err=%v", operation, current, err)
+			if current, err := testOpenFileStat(held); err != nil || current.Ino != stat.Ino {
+				t.Fatalf("%s forged source identity changed: stat=%v err=%v", operation, current, err)
 			}
 			if data, err := os.ReadFile(forgedPath); err != nil || string(data) != "forged" {
 				t.Fatalf("%s forged source=%q err=%v", operation, data, err)
@@ -3355,7 +3347,7 @@ func TestDanglingPromotionLinkageRejectedWithEmptyJournal(t *testing.T) {
 			}
 			afterInfo, err := held.Stat()
 			data, readErr := os.ReadFile(matches[0])
-			if err != nil || readErr != nil || afterInfo.Sys().(*syscall.Stat_t).Ino != beforeInfo.Sys().(*syscall.Stat_t).Ino ||
+			if err != nil || readErr != nil || !os.SameFile(afterInfo, beforeInfo) ||
 				string(data) != "local" || readTestBinding(t, subscriberDir, subscriberTree) != beforeBinding {
 				t.Fatalf("%s changed file/binding info=%v/%v data=%q/%v", operation, beforeInfo, afterInfo, data, readErr)
 			}
@@ -3643,15 +3635,15 @@ func TestLibrarySyncRejectsPromotionChainFork(t *testing.T) {
 		t.Fatal(err)
 	}
 	parent, source := splitFSActionPath(root.Target)
-	info, err := os.Stat(filepath.Join(subscriberTree, filepath.FromSlash(root.Target)))
-	if err != nil {
+	targetPath := filepath.Join(subscriberTree, filepath.FromSlash(root.Target))
+	if _, err := os.Stat(targetPath); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
+	stat, err := testPathStat(targetPath)
+	if err != nil {
 		db.Close()
-		t.Fatal("read promotion target identity")
+		t.Fatal("read promotion target identity: ", err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		id, err := newFSActionID()
@@ -4019,9 +4011,9 @@ func TestLibrarySyncCasefoldAliasRaceRelocatesCapturedPromotion(t *testing.T) {
 							if err := os.WriteFile(aliasPath, []byte("alias"), 0o600); err != nil {
 								return err
 							}
-							info, err := os.Stat(aliasPath)
+							stat, err := testPathStat(aliasPath)
 							if err == nil {
-								aliasInode = info.Sys().(*syscall.Stat_t).Ino
+								aliasInode = stat.Ino
 							}
 							return err
 						}})
@@ -4057,7 +4049,7 @@ func TestLibrarySyncCasefoldAliasRaceRelocatesCapturedPromotion(t *testing.T) {
 						t.Fatal(readErr)
 					}
 					contents[string(data)] = true
-					if info.Sys().(*syscall.Stat_t).Ino == aliasInode && string(data) == "alias" {
+					if stat, err := testPathStat(filepath.Join(searchRoot, entry.Name())); err == nil && stat.Ino == aliasInode && string(data) == "alias" {
 						aliasMoved = true
 					}
 				}
@@ -4131,9 +4123,9 @@ func TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget(t *testing.T) {
 							if err := os.WriteFile(alias, []byte("alias"), 0o600); err != nil {
 								return err
 							}
-							info, err := os.Stat(alias)
+							stat, err := testPathStat(alias)
 							if err == nil {
-								aliasInode = info.Sys().(*syscall.Stat_t).Ino
+								aliasInode = stat.Ino
 							}
 							return err
 						}})
@@ -4147,7 +4139,11 @@ func TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget(t *testing.T) {
 				}
 				aliasFound := false
 				if err := filepath.Walk(subscriberTree, func(path string, info os.FileInfo, err error) error {
-					if err == nil && info.Mode().IsRegular() && info.Sys().(*syscall.Stat_t).Ino == aliasInode {
+					if err == nil && info.Mode().IsRegular() {
+						stat, statErr := testPathStat(path)
+						if statErr != nil || stat.Ino != aliasInode {
+							return statErr
+						}
 						data, readErr := os.ReadFile(path)
 						aliasFound = readErr == nil && string(data) == "alias" && filepath.ToSlash(strings.TrimPrefix(path, subscriberTree+string(filepath.Separator))) != targetPath
 						return readErr
@@ -4208,12 +4204,12 @@ func TestLibrarySyncCasefoldAliasRelocationCrashMatrix(t *testing.T) {
 			}
 			defer held.Close()
 			command := exec.Command(os.Args[0], "-test.run=^TestPublicSyncFSActionCrashHelper$")
-			command.ExtraFiles = []*os.File{held}
+			attachTestHeldFile(command, held)
 			command.Env = append(os.Environ(), "FILECLOUD_PUBLIC_SYNC_HELPER=1",
 				"FILECLOUD_PUBLIC_CRASH_CLIENT="+subscriberDir, "FILECLOUD_PUBLIC_CRASH_WORKTREE="+subscriberTree,
 				"FILECLOUD_PUBLIC_CRASH_PHASE="+fsPhasePreBase, "FILECLOUD_PUBLIC_CRASH_OP="+fsOpRename,
 				"FILECLOUD_PUBLIC_CRASH_KIND=File", "FILECLOUD_PUBLIC_CRASH_POINT="+test.point,
-				"FILECLOUD_PUBLIC_CRASH_ROLE=casefold-alias-relocation")
+				"FILECLOUD_PUBLIC_CRASH_ROLE=casefold-alias-relocation", "FILECLOUD_PUBLIC_MUTATION_PATH="+test.relative)
 			assertProcessSIGKILL(t, command.Run())
 			var aliasPath string
 			if err := filepath.Walk(subscriberTree, func(path string, info os.FileInfo, err error) error {
@@ -4245,7 +4241,7 @@ func TestLibrarySyncCasefoldAliasRelocationCrashMatrix(t *testing.T) {
 			}
 			moved := false
 			if err := filepath.Walk(subscriberTree, func(path string, info os.FileInfo, err error) error {
-				if err != nil || !info.Mode().IsRegular() || info.Sys().(*syscall.Stat_t).Ino != aliasBefore.Sys().(*syscall.Stat_t).Ino {
+				if err != nil || !info.Mode().IsRegular() || !os.SameFile(info, aliasBefore) {
 					return err
 				}
 				data, readErr := os.ReadFile(path)
@@ -5308,8 +5304,8 @@ func TestRestoreRollbackRootMtimeRejectsStaleActionEvidence(t *testing.T) {
 			if err := bindFSJournalRoot(t.Context(), db, worktree, root); err != nil {
 				t.Fatal(err)
 			}
-			var stat unix.Stat_t
-			if err := unix.Fstat(int(root.directory.Fd()), &stat); err != nil {
+			var stat fscompat.Stat_t
+			if err := fscompat.Fstat(int(root.directory.Fd()), &stat); err != nil {
 				t.Fatal(err)
 			}
 			mtimeNS := filesystemMtimeNS(time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec))
@@ -5400,8 +5396,8 @@ func TestRestoreRollbackRootMtimeRejectsWrongRootBeforeStateOrFSChanges(t *testi
 				if err := bindFSJournalRoot(t.Context(), db, worktree, root); err != nil {
 					t.Fatal(err)
 				}
-				var stat unix.Stat_t
-				if err := unix.Fstat(int(root.directory.Fd()), &stat); err != nil {
+				var stat fscompat.Stat_t
+				if err := fscompat.Fstat(int(root.directory.Fd()), &stat); err != nil {
 					t.Fatal(err)
 				}
 				mtimeNS := filesystemMtimeNS(time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec))
@@ -5504,8 +5500,8 @@ func TestPublicCheckoutRecoveryRejectsCorruptRootMtimeStateBeforeFSChanges(t *te
 				db.Close()
 				t.Fatal(err)
 			}
-			var source syscall.Stat_t
-			if err := syscall.Stat(filepath.Join(state.worktree, "action-source"), &source); err != nil {
+			source, err := testPathStat(filepath.Join(state.worktree, "action-source"))
+			if err != nil {
 				root.Close()
 				db.Close()
 				t.Fatal(err)
@@ -5867,8 +5863,8 @@ func TestRestorePromotionOwnershipRejectsInvalidStatesWithoutFSChanges(t *testin
 			if err != nil || openedLeaf != leaf {
 				t.Fatalf("source parent leaf=%q err=%v", openedLeaf, err)
 			}
-			var parentStat syscall.Stat_t
-			if err := syscall.Fstat(int(parent.Fd()), &parentStat); err != nil {
+			var parentStat fscompat.Stat_t
+			if err := fscompat.Fstat(int(parent.Fd()), &parentStat); err != nil {
 				parent.Close()
 				t.Fatal(err)
 			}
@@ -6491,8 +6487,7 @@ func TestLibrarySyncRollbackVerifiesInstalledFileContent(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			beforeStat, afterStat := before.Sys().(*syscall.Stat_t), after.Sys().(*syscall.Stat_t)
-			if beforeStat.Ino != afterStat.Ino {
+			if !os.SameFile(before, after) {
 				t.Fatal("test mutation replaced installed inode")
 			}
 			err = runLibraryWithConfig(t.Context(), []string{"unbind", "--client-dir", subscriberDir, "--worktree", subscriberTree},
@@ -6690,7 +6685,7 @@ func TestLegacyEmptyIndexDerivesTrackedUnsupportedPathsFromSyncBase(t *testing.T
 		replace func(string) error
 	}{
 		{"symlink", func(path string) error { return os.Symlink("target", path) }},
-		{"fifo", func(path string) error { return syscall.Mkfifo(path, 0o600) }},
+		{"fifo", func(path string) error { return createTestFIFO(path) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
@@ -6746,7 +6741,7 @@ func TestSyncTrackedFIFODoesNotPublishDeletion(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Mkfifo(path, 0o600); err != nil {
+	if err := createTestFIFO(path); err != nil {
 		t.Fatal(err)
 	}
 	puts.Store(0)
@@ -6767,12 +6762,12 @@ func TestSyncTrackedOpenFailureDoesNotPublishDeletion(t *testing.T) {
 			checkFilesystem: func(*os.File) error { return nil }, now: time.Now,
 			scanFault: func(event scanFault) error {
 				if event.phase == "before-open" && event.path == "base" {
-					return syscall.EACCES
+					return testAccessDenied
 				}
 				return nil
 			},
 		})
-	if err == nil || !errors.Is(err, syscall.EACCES) {
+	if err == nil || !errors.Is(err, testAccessDenied) {
 		t.Fatalf("tracked open failure=%v", err)
 	}
 	assertFailedScanState(t, environment, clientDir, worktree, before, indexCount, puts.Load())
@@ -6823,7 +6818,7 @@ func assertFailedScanState(t *testing.T, environment libraryCLIEnvironment, clie
 
 func TestSyncWarnsAndIgnoresUntrackedUnsupportedPath(t *testing.T) {
 	_, clientDir, worktree, _, _, puts, _ := newSyncPair(t)
-	if err := syscall.Mkfifo(filepath.Join(worktree, "pipe"), 0o600); err != nil {
+	if err := createTestFIFO(filepath.Join(worktree, "pipe")); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer

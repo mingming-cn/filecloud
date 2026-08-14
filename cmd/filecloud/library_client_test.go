@@ -1,5 +1,3 @@
-//go:build !windows
-
 package main
 
 import (
@@ -22,10 +20,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/mingming-cn/filecloud/internal/fscompat"
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/object"
 	"github.com/mingming-cn/filecloud/internal/storage"
@@ -1340,8 +1338,8 @@ func TestOpenEmptyWorktreeFilesystemCheckUsesHeldFDAndPrecedesRemote(t *testing.
 	defer server.Close()
 	checked := false
 	config := libraryClientConfig{checkFilesystem: func(file *os.File) error {
-		var stat syscall.Stat_t
-		if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
+		var stat fscompat.Stat_t
+		if err := fscompat.Fstat(int(file.Fd()), &stat); err != nil {
 			t.Fatalf("filesystem seam did not receive a held fd: %v", err)
 		}
 		checked = true

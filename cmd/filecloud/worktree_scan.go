@@ -132,16 +132,7 @@ func scanWorktreeWithConfig(root *openedWorktree, config worktreeScanConfig) (wo
 }
 
 func duplicateDirectory(directory *os.File, name string) (*os.File, error) {
-	fd, err := fscompat.Dup(int(directory.Fd()))
-	if err != nil {
-		return nil, err
-	}
-	file := os.NewFile(uintptr(fd), name)
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		file.Close()
-		return nil, err
-	}
-	return file, nil
+	return fscompat.OpenDirectoryEnumeration(int(directory.Fd()), name)
 }
 
 func (session *scanSession) scanDirectory(directory *os.File, relative string) (string, error) {
@@ -215,12 +206,14 @@ func (session *scanSession) scanDirectory(directory *os.File, relative string) (
 }
 
 func (session *scanSession) enumerateDirectory(directory *os.File, relative string) ([]listedEntry, error) {
-	if _, err := directory.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("rewind directory %q: %w", relative, err)
-	}
-	entries, err := directory.Readdirnames(-1)
+	enumeration, err := fscompat.OpenDirectoryEnumeration(int(directory.Fd()), relative)
 	if err != nil {
-		return nil, fmt.Errorf("read directory %q: %w", relative, err)
+		return nil, fmt.Errorf("open directory enumeration %q: %w", relative, err)
+	}
+	entries, readErr := enumeration.Readdirnames(-1)
+	closeErr := enumeration.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, fmt.Errorf("read directory %q: %w", relative, errors.Join(readErr, closeErr))
 	}
 	result := make([]listedEntry, 0, len(entries))
 	for _, name := range entries {

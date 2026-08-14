@@ -1,5 +1,3 @@
-//go:build linux || darwin
-
 package main
 
 import (
@@ -16,14 +14,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/mingming-cn/filecloud/internal/acceptance"
+	"github.com/mingming-cn/filecloud/internal/fscompat"
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/object"
-	"golang.org/x/sys/unix"
 )
 
 func TestClientDBUsesDurableWAL(t *testing.T) {
@@ -892,8 +889,8 @@ func TestFSActionRejectsReplacedParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(int(parent.Fd()), &stat); err != nil {
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstat(int(parent.Fd()), &stat); err != nil {
 		t.Fatal(err)
 	}
 	parent.Close()
@@ -926,9 +923,9 @@ func TestFSActionRejectsSymlinkParentAndCrossMount(t *testing.T) {
 		t.Fatal("symlink action parent was accepted")
 	}
 	old := _openActionParent
-	_openActionParent = func(*openedWorktree, string) (int, error) { return -1, syscall.EXDEV }
+	_openActionParent = func(*openedWorktree, string) (int, error) { return -1, testCrossDevice }
 	t.Cleanup(func() { _openActionParent = old })
-	if _, err := openFSActionParent(root, "real", 0, 0); !errors.Is(err, syscall.EXDEV) {
+	if _, err := openFSActionParent(root, "real", 0, 0); !errors.Is(err, testCrossDevice) {
 		t.Fatalf("cross-mount error=%v", err)
 	}
 }
@@ -950,8 +947,8 @@ func TestFSActionRenameRejectsDifferentExistingInode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
-	var stat unix.Stat_t
-	if err := unix.Fstatat(int(root.directory.Fd()), "source", &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstatat(int(root.directory.Fd()), "source", &stat, fscompat.AT_SYMLINK_NOFOLLOW); err != nil {
 		t.Fatal(err)
 	}
 	action := fsAction{Worktree: rootPath, ActionID: "1234567890abcdef1234567890abcdef", Order: 1,
@@ -1236,8 +1233,8 @@ func TestFSActionRenameRecovery(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(rootPath, "source"), []byte("data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstatat(int(root.directory.Fd()), "source", &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstatat(int(root.directory.Fd()), "source", &stat, fscompat.AT_SYMLINK_NOFOLLOW); err != nil {
 		t.Fatal(err)
 	}
 	action := fsAction{Worktree: rootPath, ActionID: "fedcba9876543210fedcba9876543210", Order: 1,
@@ -1438,8 +1435,8 @@ func captureExactTree(t *testing.T, root string) map[string]exactPathState {
 			return err
 		}
 		state := exactPathState{info: info}
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			state.nlink = uint64(stat.Nlink)
+		if stat, statErr := testPathStat(path); statErr == nil {
+			state.nlink = stat.Nlink
 		}
 		if info.Mode().IsRegular() {
 			state.data, err = os.ReadFile(path)
@@ -1476,18 +1473,6 @@ func assertExactTree(t *testing.T, root string, before map[string]exactPathState
 	if len(changed) != 0 {
 		sort.Strings(changed)
 		t.Fatalf("tree changed:\n%s", strings.Join(changed, "\n"))
-	}
-}
-
-func assertProcessSIGKILL(t *testing.T, err error) {
-	t.Helper()
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		t.Fatalf("process did not fail with ExitError: %v", err)
-	}
-	status, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
-		t.Fatalf("process was not killed by SIGKILL: status=%v err=%v", status, err)
 	}
 }
 
@@ -1724,10 +1709,7 @@ func TestPublicInitialCheckoutBaseCommitCrashHelper(t *testing.T) {
 	if os.Getenv("FILECLOUD_INITIAL_COMMIT_HELPER") != "1" {
 		t.Skip("subprocess helper")
 	}
-	kill := func() error {
-		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
-		return nil
-	}
+	kill := func() error { return killTestProcess() }
 	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}
 	if os.Getenv("FILECLOUD_INITIAL_COMMIT_POINT") == "before" {
 		config.beforeCheckoutBaseCommit = kill
@@ -2730,13 +2712,9 @@ func TestPublicSyncTransactionCrashMatrix(t *testing.T) {
 							base = indexed
 						}
 					}
-					info, err := os.Lstat(filepath.Join(subscriberTree, recoveryName))
+					stat, err := testPathStat(filepath.Join(subscriberTree, recoveryName))
 					if err != nil {
 						t.Fatal(err)
-					}
-					stat, ok := info.Sys().(*syscall.Stat_t)
-					if !ok {
-						t.Fatalf("recovery stat has unexpected type: %T", info.Sys())
 					}
 					wantRecoveries = []transactionRecoveryState{{path: base.path, recoveryName: recoveryName,
 						kind: base.kind, objectID: base.objectID, mtime: base.canonicalMtime, size: base.size,
@@ -2744,13 +2722,9 @@ func TestPublicSyncTransactionCrashMatrix(t *testing.T) {
 				}
 				assertTransactionStateEqual(t, "sync_recoveries", recoveries, wantRecoveries)
 				for index, path := range newIndex {
-					info, err := os.Stat(filepath.Join(subscriberTree, path.path))
+					stat, err := testPathStat(filepath.Join(subscriberTree, path.path))
 					if err != nil {
 						t.Fatal(err)
-					}
-					stat, ok := info.Sys().(*syscall.Stat_t)
-					if !ok {
-						t.Fatalf("%s stat has unexpected type", path.path)
 					}
 					wantCheckout[index] = transactionCheckoutState{path: path.path, kind: path.kind, objectID: path.objectID,
 						canonicalMtime: path.canonicalMtime, actualMtime: path.actualMtime, size: path.size,
@@ -2801,7 +2775,7 @@ func TestPublicSyncTransactionCrashHelper(t *testing.T) {
 	}
 	fault := func(point string) error {
 		if point == os.Getenv("FILECLOUD_PUBLIC_TRANSACTION_POINT") {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return killTestProcess()
 		}
 		return nil
 	}
@@ -2911,7 +2885,7 @@ func TestPublicUnbindFSActionCrashHelper(t *testing.T) {
 	fault := func(point string, action fsAction) error {
 		if point == os.Getenv("FILECLOUD_PUBLIC_CRASH_POINT") && action.Phase == fsPhaseRollback &&
 			action.Op == os.Getenv("FILECLOUD_PUBLIC_CRASH_OP") && action.ExpectedKind == os.Getenv("FILECLOUD_PUBLIC_CRASH_KIND") {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return killTestProcess()
 		}
 		return nil
 	}
@@ -2993,7 +2967,7 @@ func TestPublicSyncFSActionCrashHelper(t *testing.T) {
 			matchedFaults++
 			matchIndex, _ := strconv.Atoi(os.Getenv("FILECLOUD_PUBLIC_CRASH_MATCH_INDEX"))
 			if matchIndex <= 1 || matchedFaults == matchIndex {
-				_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+				return killTestProcess()
 			}
 		}
 		return nil
@@ -3011,11 +2985,11 @@ func TestPublicSyncFSActionCrashHelper(t *testing.T) {
 				return nil
 			}
 			mutationInjected = true
-			held := os.NewFile(3, "held-conflict")
-			if held == nil {
-				return errors.New("inherited conflict descriptor is absent")
+			held, err := openTestHeldConflictFile()
+			if err != nil {
+				return err
 			}
-			_, err := held.WriteAt([]byte("late!"), 0)
+			_, err = held.WriteAt([]byte("late!"), 0)
 			return errors.Join(err, held.Sync())
 		}
 	}
@@ -3026,9 +3000,9 @@ func TestPublicSyncFSActionCrashHelper(t *testing.T) {
 				return nil
 			}
 			mutationInjected = true
-			held := os.NewFile(3, "held-conflict")
-			if held == nil {
-				return errors.New("inherited conflict descriptor is absent")
+			held, err := openTestHeldConflictFile()
+			if err != nil {
+				return err
 			}
 			if _, err := held.WriteAt([]byte("changed"), 0); err != nil {
 				return err
@@ -3078,7 +3052,7 @@ func TestPublicFSActionCrashHelper(t *testing.T) {
 			matches = matches && action.Target == target
 		}
 		if matches {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return killTestProcess()
 		}
 		return nil
 	}
@@ -3150,8 +3124,8 @@ func TestFSActionCrashHelper(t *testing.T) {
 		t.Fatalf("unknown scenario %q", scenario)
 	}
 	if action.Op != fsOpCreateFile && action.Op != fsOpCreateDirectory {
-		var stat unix.Stat_t
-		if err := unix.Fstatat(int(root.directory.Fd()), action.Source, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		var stat fscompat.Stat_t
+		if err := fscompat.Fstatat(int(root.directory.Fd()), action.Source, &stat, fscompat.AT_SYMLINK_NOFOLLOW); err != nil {
 			t.Fatal(err)
 		}
 		action.ExpectedDevice, action.ExpectedInode = uint64(stat.Dev), stat.Ino
@@ -3174,8 +3148,7 @@ func TestFSActionCrashHelper(t *testing.T) {
 		if at != point {
 			return nil
 		}
-		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
-		return nil
+		return killTestProcess()
 	}
 	_ = executeFSAction(ctx, db, root, action, fault)
 	os.Exit(98)
@@ -3212,8 +3185,8 @@ func TestFSActionRemoveIntentPreservesOldFDModification(t *testing.T) {
 		t.Fatal(errors.Join(err, closeErr))
 	}
 	mtime := info.ModTime().UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
-	var stat unix.Stat_t
-	if err := unix.Fstat(int(held.Fd()), &stat); err != nil {
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstat(int(held.Fd()), &stat); err != nil {
 		t.Fatal(err)
 	}
 	modified := false
@@ -3281,7 +3254,10 @@ func setupRecoveryDirectory(t *testing.T) (*sql.DB, *openedWorktree, string, syn
 	if closeErr := file.Close(); err != nil || closeErr != nil {
 		t.Fatal(errors.Join(err, closeErr))
 	}
-	stat := info.Sys().(*syscall.Stat_t)
+	stat, err := testPathStat(filepath.Join(rootPath, "captured"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	tombstone := syncTombstonePrefix + "11223344556677889900aabbccddeeff"
 	if err := os.Rename(filepath.Join(rootPath, "captured"), filepath.Join(rootPath, tombstone)); err != nil {
 		t.Fatal(err)

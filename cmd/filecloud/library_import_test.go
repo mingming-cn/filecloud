@@ -1,5 +1,3 @@
-//go:build !windows
-
 package main
 
 import (
@@ -12,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -162,7 +159,7 @@ func TestLibraryBindImportRejectsUnsupportedAndCollidingPaths(t *testing.T) {
 		setup func(string) error
 	}{
 		{"symlink", func(root string) error { return os.Symlink("target", filepath.Join(root, "link")) }},
-		{"fifo", func(root string) error { return syscall.Mkfifo(filepath.Join(root, "pipe"), 0o600) }},
+		{"fifo", func(root string) error { return createTestFIFO(filepath.Join(root, "pipe")) }},
 		{"casefold", func(root string) error {
 			if err := os.WriteFile(filepath.Join(root, "Readme"), []byte("a"), 0o600); err != nil {
 				return err

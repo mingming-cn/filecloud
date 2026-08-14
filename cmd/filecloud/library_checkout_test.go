@@ -1,5 +1,3 @@
-//go:build !windows
-
 package main
 
 import (
@@ -15,10 +13,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/mingming-cn/filecloud/internal/fscompat"
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/object"
 )
@@ -520,7 +518,7 @@ func TestLibraryBindCheckoutRecoversTemporaryIdentityWindow(t *testing.T) {
 				if err := os.Symlink("outside", temp); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := syscall.Mkfifo(temp, 0o600); err != nil {
+			} else if err := createTestFIFO(temp); err != nil {
 				t.Fatal(err)
 			}
 			err = runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard)
@@ -529,7 +527,7 @@ func TestLibraryBindCheckoutRecoversTemporaryIdentityWindow(t *testing.T) {
 			}
 			assertPendingCheckout(t, clientDir, target)
 			info, statErr := os.Lstat(temp)
-			if statErr != nil || (kind == "symlink" && info.Mode()&os.ModeSymlink == 0) || (kind == "fifo" && info.Mode()&os.ModeNamedPipe == 0) {
+			if statErr != nil || (kind == "symlink" && info.Mode()&os.ModeSymlink == 0) || (kind == "fifo" && !isTestFIFO(info)) {
 				t.Fatalf("rejected %s changed: info=%v err=%v", kind, info, statErr)
 			}
 		})
@@ -1750,8 +1748,8 @@ func TestPendingCheckoutRootMtimeStateValidation(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(worktree, "source"), []byte("source"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			var source syscall.Stat_t
-			if err := syscall.Stat(filepath.Join(worktree, "source"), &source); err != nil {
+			var source fscompat.Stat_t
+			if err := fscompat.Lstat(filepath.Join(worktree, "source"), &source); err != nil {
 				t.Fatal(err)
 			}
 			action := fsAction{Worktree: worktree, ActionID: "00112233445566778899aabbccddeeff", Order: 0,

@@ -27,7 +27,7 @@ func openActionParent(root *openedWorktree, relative string) (int, error) {
 // ReplaceIfExists is the NT no-replace operation; sharing violations are returned
 // unchanged so the journal retains the source for a later recovery attempt.
 func renameNoReplace(sourceParent int, source string, targetParent int, target string) error {
-	fd, err := fscompat.Openat(sourceParent, source, fscompat.O_RDONLY|fscompat.O_NOFOLLOW, 0)
+	fd, err := fscompat.Openat(sourceParent, source, fscompat.O_RDONLY|fscompat.O_NOFOLLOW|fscompat.O_DELETE, 0)
 	if err != nil {
 		return err
 	}
@@ -49,7 +49,7 @@ func renameNoReplace(sourceParent int, source string, targetParent int, target s
 	if errors.Is(err, windows.STATUS_OBJECT_NAME_COLLISION) || errors.Is(err, windows.STATUS_OBJECT_NAME_EXISTS) {
 		return fscompat.EEXIST
 	}
-	return err
+	return fscompat.NormalizeError(err)
 }
 
 func filesystemMtimeNS(value time.Time) int64 { return value.UnixNano() }
