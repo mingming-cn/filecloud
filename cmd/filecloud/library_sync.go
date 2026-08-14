@@ -2069,10 +2069,7 @@ func addFallbackRootOccupancy(root *openedWorktree, selected string, late map[st
 			return errors.New("selected fallback root is invalid")
 		}
 	}
-	if _, err := root.directory.Seek(0, 0); err != nil {
-		return err
-	}
-	names, err := root.directory.Readdirnames(-1)
+	names, err := readDirectoryNames(root.directory, -1)
 	if err != nil {
 		return err
 	}
@@ -2415,10 +2412,7 @@ func validateRootPromotionTarget(expected, target string, namingSeeds ...string)
 }
 
 func parentCasefoldAliases(parent *os.File, exact string) ([]string, error) {
-	if _, err := parent.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
-	names, err := parent.Readdirnames(-1)
+	names, err := readDirectoryNames(parent, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -2445,10 +2439,7 @@ func nextConflictVisiblePath(parent *os.File, parentPath, current string, proven
 	} else if currentParent != parentPath {
 		return "", errors.New("conflict collision parent changed")
 	}
-	if _, err := parent.Seek(0, io.SeekStart); err != nil {
-		return "", err
-	}
-	names, err := parent.Readdirnames(-1)
+	names, err := readDirectoryNames(parent, -1)
 	if err != nil {
 		return "", err
 	}

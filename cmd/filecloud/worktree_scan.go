@@ -135,6 +135,15 @@ func duplicateDirectory(directory *os.File, name string) (*os.File, error) {
 	return fscompat.OpenDirectoryEnumeration(int(directory.Fd()), name)
 }
 
+func readDirectoryNames(directory *os.File, count int) ([]string, error) {
+	enumeration, err := fscompat.OpenDirectoryEnumeration(int(directory.Fd()), directory.Name())
+	if err != nil {
+		return nil, err
+	}
+	names, readErr := enumeration.Readdirnames(count)
+	return names, errors.Join(readErr, enumeration.Close())
+}
+
 func (session *scanSession) scanDirectory(directory *os.File, relative string) (string, error) {
 	before, err := stateOf(directory)
 	if err != nil {

@@ -1527,10 +1527,7 @@ func ensurePromotionFallbackRoot(ctx context.Context, db *sql.DB, root *openedWo
 	if !validFSActionID(rootID) {
 		return "", 0, 0, errors.New("invalid promotion root for fallback directory")
 	}
-	if _, err := root.directory.Seek(0, 0); err != nil {
-		return "", 0, 0, err
-	}
-	names, err := root.directory.Readdirnames(-1)
+	names, err := readDirectoryNames(root.directory, -1)
 	if err != nil {
 		return "", 0, 0, err
 	}

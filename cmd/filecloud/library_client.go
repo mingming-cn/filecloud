@@ -2825,10 +2825,7 @@ func (root *openedWorktree) validateEmpty() error {
 	if err := root.validateIdentity(); err != nil {
 		return err
 	}
-	if _, err := root.directory.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("rewind worktree: %w", err)
-	}
-	_, err := root.directory.Readdirnames(1)
+	_, err := readDirectoryNames(root.directory, 1)
 	if err == nil {
 		return errors.New("local worktree is non-empty; local import requires --import-local (issue #8)")
 	}
