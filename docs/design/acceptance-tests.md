@@ -156,6 +156,19 @@ FILECLOUD_RUN_1B_APFS=1 go test ./cmd/filecloud \
 
 APFS 还必须产生额外的 `filesystem-primitives` 证明，因此精确要求 109 条结构化证明；该证明实测 no-follow、文件身份、`RENAME_EXCL` 不覆盖、同目录 rename、目录 fd 同步、独立进程排他锁和旧 fd 行为。旧 fd 在 pathname 被 checkout 替换后仍写入旧 inode，活动路径不受影响；若旧 inode 已无目录项，最后一个 fd 关闭后该延迟写可能消失，因此该行为属于明确警告边界，不是第一阶段绝对无损保证。详细 spike 与来源见 [macOS/APFS 文件系统原语 spike](../research/macos-apfs-primitives.md)。APFS 门禁证明进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
 
+## Windows/NTFS 1B 可执行门禁
+
+Windows/NTFS 门禁必须在 Windows 主机的本地固定 NTFS checkout 中显式运行；普通回归和 Linux 交叉编译不构成 NTFS 通过：
+
+```powershell
+$env:FILECLOUD_RUN_1B_NTFS=1
+go test ./cmd/filecloud -run '^TestWindowsNTFSAcceptanceMatrix$' -count=1 -timeout=30m -v
+```
+
+绑定从已打开的目录句柄读取卷信息，只接受 `NTFS`、`DRIVE_FIXED` 和 reparse point、hard-link、persistent ACL、Unicode 能力齐全的卷；网络盘、映射盘及无法确认能力的卷直接拒绝。每个工作目录路径段必须由相对父句柄的 `NtCreateFile` 以 `OBJ_DONT_REPARSE` 和 `FILE_OPEN_REPARSE_POINT` 打开，禁止降级成全路径操作。门禁必须记录 no-follow、稳定文件 ID、no-replace rename、目录 flush、跨进程锁以及未共享 delete 的占用文件导致 rename 明确失败且源内容保留。详情和一手来源见 [Windows/NTFS 文件系统原语 spike](../research/windows-ntfs-primitives.md)。
+
+当前非 Windows 主机只能交叉编译该实现；实机 gate 的 skip 不能被解释为 NTFS 通过。
+
 ## 1C 运维命令
 
 ### GC

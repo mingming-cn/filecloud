@@ -40,6 +40,7 @@ type Attestation struct {
 	DirectorySync             bool     `json:"directorySync,omitempty"`
 	CrossProcessLock          bool     `json:"crossProcessLock,omitempty"`
 	OldFDWritesDetached       bool     `json:"oldFdWritesDetached,omitempty"`
+	OccupiedRenamePreserved   bool     `json:"occupiedRenamePreserved,omitempty"`
 	Warning                   string   `json:"warning,omitempty"`
 }
 
@@ -51,12 +52,18 @@ func ActivePlatform() (platform, filesystem string, enabled bool) {
 	if os.Getenv("FILECLOUD_RUN_1B_APFS") == "1" {
 		return "darwin", "apfs", true
 	}
+	if os.Getenv("FILECLOUD_RUN_1B_NTFS") == "1" {
+		return "windows", "ntfs", true
+	}
 	return "", "", false
 }
 
 // Root returns the verified filesystem root supplied by the active gate.
 func Root() string {
 	if root := os.Getenv("FILECLOUD_ACCEPTANCE_ROOT"); root != "" {
+		return root
+	}
+	if root := os.Getenv("FILECLOUD_WINDOWS_NTFS_ROOT"); root != "" {
 		return root
 	}
 	return os.Getenv("FILECLOUD_LINUX_EXT4_ROOT")

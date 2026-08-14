@@ -13,6 +13,11 @@ func TestActivePlatformRequiresExplicitGate(t *testing.T) {
 	if platform, filesystem, enabled := ActivePlatform(); !enabled || platform != "darwin" || filesystem != "apfs" {
 		t.Fatalf("APFS platform = %q/%q enabled=%t", platform, filesystem, enabled)
 	}
+	t.Setenv("FILECLOUD_RUN_1B_APFS", "")
+	t.Setenv("FILECLOUD_RUN_1B_NTFS", "1")
+	if platform, filesystem, enabled := ActivePlatform(); !enabled || platform != "windows" || filesystem != "ntfs" {
+		t.Fatalf("NTFS platform = %q/%q enabled=%t", platform, filesystem, enabled)
+	}
 }
 
 func TestEncodeUsesSharedPrefixAndSchema(t *testing.T) {

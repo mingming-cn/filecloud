@@ -7,6 +7,7 @@
 - [领域词汇](./CONTEXT.md)
 - [Seafile 文件同步调研](./docs/research/seafile-sync.md)
 - [macOS/APFS 文件系统原语 spike](./docs/research/macos-apfs-primitives.md)
+- [Windows/NTFS 文件系统原语 spike](./docs/research/windows-ntfs-primitives.md)
 - [同步架构](./docs/design/architecture.md)
 - [HTTP API 契约](./docs/design/http-api.md)
 - [第一阶段实施计划](./docs/design/phase-1-plan.md)
@@ -35,4 +36,11 @@ macOS/APFS 1B 门禁必须在本地 APFS checkout 中显式运行；交叉编译
 FILECLOUD_RUN_1B_APFS=1 go test ./cmd/filecloud \
   -run '^TestMacOSAPFSAcceptanceMatrix$' \
   -count=1 -timeout=30m -v
+```
+
+Windows/NTFS 1B 门禁必须在本地固定 NTFS checkout 中显式运行；Linux 交叉编译不能代替该门禁：
+
+```powershell
+$env:FILECLOUD_RUN_1B_NTFS=1
+go test ./cmd/filecloud -run '^TestWindowsNTFSAcceptanceMatrix$' -count=1 -timeout=30m -v
 ```
