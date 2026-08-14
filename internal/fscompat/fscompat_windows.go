@@ -5,6 +5,7 @@ package fscompat
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"time"
 	"unsafe"
@@ -172,7 +173,7 @@ func Fstat(fd int, stat *Stat_t) error {
 	changeTime := windows.Filetime{LowDateTime: uint32(basic.ChangeTime), HighDateTime: uint32(uint64(basic.ChangeTime) >> 32)}
 	change := time.Unix(0, changeTime.Nanoseconds())
 	*stat = Stat_t{Dev: uint64(info.VolumeSerialNumber), Ino: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow), Mode: kind, Nlink: uint64(info.NumberOfLinks), Size: int64(uint64(info.FileSizeHigh)<<32 | uint64(info.FileSizeLow)), Mtim: Timespec{mtime.Unix(), int64(mtime.Nanosecond())}, Ctim: Timespec{change.Unix(), int64(change.Nanosecond())}}
-	if stat.Ino == 0 {
+	if stat.Ino == 0 || stat.Ino > math.MaxInt64 {
 		return errors.New("NTFS file identity is not safely representable")
 	}
 	return nil

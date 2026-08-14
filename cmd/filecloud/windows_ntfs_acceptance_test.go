@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -111,10 +112,33 @@ func TestWindowsNTFSPrimitives(t *testing.T) {
 	if data, err := os.ReadFile(filepath.Join(path, "target")); err != nil || string(data) != "target" {
 		t.Fatalf("no-replace rename changed target=%q err=%v", data, err)
 	}
-	if err := os.Symlink("target", filepath.Join(path, "link")); err == nil {
-		if _, err := fscompat.Openat(int(root.directory.Fd()), "link", fscompat.O_RDONLY|fscompat.O_NOFOLLOW, 0); err == nil {
-			t.Fatal("handle-relative no-follow opened a reparse point")
-		}
+	if err := os.Symlink("target", filepath.Join(path, "link")); err != nil {
+		t.Fatalf("create NTFS reparse-point fixture: %v", err)
+	}
+	if fd, err := fscompat.Openat(int(root.directory.Fd()), "link", fscompat.O_RDONLY|fscompat.O_NOFOLLOW, 0); err == nil {
+		fscompat.Close(fd)
+		t.Fatal("handle-relative no-follow opened a reparse point")
+	}
+	if err := os.WriteFile(filepath.Join(path, "identity-source"), []byte("identity"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var before fscompat.Stat_t
+	if err := fscompat.Fstatat(int(root.directory.Fd()), "identity-source", &before, fscompat.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Fatal(err)
+	}
+	if err := renameNoReplace(int(root.directory.Fd()), "identity-source", int(root.directory.Fd()), "identity-target"); err != nil {
+		t.Fatalf("same-directory no-replace rename: %v", err)
+	}
+	var after fscompat.Stat_t
+	if err := fscompat.Fstatat(int(root.directory.Fd()), "identity-target", &after, fscompat.AT_SYMLINK_NOFOLLOW); err != nil ||
+		before.Dev != after.Dev || before.Ino != after.Ino {
+		t.Fatalf("renamed file identity changed: before=%d/%d after=%d/%d err=%v", before.Dev, before.Ino, after.Dev, after.Ino, err)
+	}
+	if err := os.Link(filepath.Join(path, "identity-target"), filepath.Join(path, "target")); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("no-replace hard-link error=%v, want exists", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(path, "target")); err != nil || string(data) != "target" {
+		t.Fatalf("hard-link publication replaced target=%q err=%v", data, err)
 	}
 	name, err := windows.UTF16PtrFromString(filepath.Join(path, "source"))
 	if err != nil {
@@ -132,16 +156,49 @@ func TestWindowsNTFSPrimitives(t *testing.T) {
 	if data, err := os.ReadFile(filepath.Join(path, "source")); err != nil || string(data) != "source" {
 		t.Fatalf("occupied rename did not preserve source=%q err=%v", data, err)
 	}
+	lockPath := filepath.Join(path, "binding.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := fscompat.Flock(int(lockFile.Fd()), fscompat.LOCK_EX|fscompat.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestWindowsNTFSLockHelper$")
+	command.Env = append(os.Environ(), "FILECLOUD_NTFS_LOCK_HELPER=1", "FILECLOUD_NTFS_LOCK_PATH="+lockPath)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("verify cross-process NTFS lock: %v\n%s", err, output)
+	}
 	if err := fscompat.SyncDirectory(int(root.directory.Fd())); err != nil {
 		t.Fatalf("flush NTFS parent directory: %v", err)
 	}
 	line, err := acceptance.Encode(acceptance.Attestation{
 		Kind: "filesystem-primitives", Scenario: "Windows NTFS primitives", Platform: runtime.GOOS, Filesystem: "ntfs",
-		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, SameDirectoryRename: true,
-		DirectorySync: true, OccupiedRenamePreserved: true,
+		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, NoReplaceLink: true, SameDirectoryRename: true,
+		DirectorySync: true, CrossProcessLock: true, OccupiedRenamePreserved: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Log(line)
+}
+
+func TestWindowsNTFSLockHelper(t *testing.T) {
+	if os.Getenv("FILECLOUD_NTFS_LOCK_HELPER") != "1" {
+		t.Skip("NTFS lock helper only")
+	}
+	file, err := os.OpenFile(os.Getenv("FILECLOUD_NTFS_LOCK_PATH"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	err = fscompat.Flock(int(file.Fd()), fscompat.LOCK_EX|fscompat.LOCK_NB)
+	if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("unexpected NTFS lock error: %v", err)
+	}
+	t.Fatal("acquired an NTFS lock held by another process")
 }

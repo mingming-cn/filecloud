@@ -259,8 +259,8 @@ func validatePlatformAttestations(attestations []platformAttestation, required m
 				return fmt.Errorf("platform filesystem-primitives attestation %q is incomplete", attestation.Scenario)
 			}
 			if platform == "windows" && filesystem == "ntfs" {
-				if !attestation.OccupiedRenamePreserved {
-					return fmt.Errorf("Windows filesystem-primitives attestation %q did not preserve an occupied rename source", attestation.Scenario)
+				if !attestation.NoReplaceLink || !attestation.CrossProcessLock || !attestation.OccupiedRenamePreserved {
+					return fmt.Errorf("Windows filesystem-primitives attestation %q is incomplete", attestation.Scenario)
 				}
 				break
 			}
@@ -327,6 +327,8 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 	command.Env = append(os.Environ(),
 		append([]string{
 			"TMPDIR=" + filesystemRoot,
+			"TMP=" + filesystemRoot,
+			"TEMP=" + filesystemRoot,
 			"FILECLOUD_ACCEPTANCE_ROOT=" + filesystemRoot,
 			"FILECLOUD_PLATFORM_MATRIX_CHILD=1",
 		}, environment...)...,
