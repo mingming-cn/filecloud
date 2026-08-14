@@ -15,11 +15,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
+	fscompat "github.com/mingming-cn/filecloud/internal/fscompat"
 	"github.com/mingming-cn/filecloud/internal/object"
-	"golang.org/x/sys/unix"
 	"golang.org/x/text/cases"
 )
 
@@ -596,7 +595,7 @@ func cachedDownload(ctx context.Context, options bindOptions, kind, id string, f
 		return nil, fmt.Errorf("name cached object temporary file: %w", err)
 	}
 	tempName := ".download-" + hex.EncodeToString(random[:])
-	fd, err := unix.Openat(int(directory.Fd()), tempName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	fd, err := fscompat.Openat(int(directory.Fd()), tempName, fscompat.O_WRONLY|fscompat.O_CREAT|fscompat.O_EXCL|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create cached object: %w", err)
 	}
@@ -604,7 +603,7 @@ func cachedDownload(ctx context.Context, options bindOptions, kind, id string, f
 	removeTemp := true
 	defer func() {
 		if removeTemp {
-			_ = unix.Unlinkat(int(directory.Fd()), tempName, 0)
+			_ = fscompat.Unlinkat(int(directory.Fd()), tempName, 0)
 		}
 	}()
 	if _, err := temp.Write(data); err != nil {
@@ -617,14 +616,14 @@ func cachedDownload(ctx context.Context, options bindOptions, kind, id string, f
 		return nil, err
 	}
 	if err := renameNoReplace(int(directory.Fd()), tempName, int(directory.Fd()), name); err != nil {
-		if !errors.Is(err, syscall.EEXIST) {
+		if !errors.Is(err, fscompat.EEXIST) {
 			return nil, fmt.Errorf("publish cached object: %w", err)
 		}
 		existing, found, readErr := readCacheFile(directory, name)
 		if readErr != nil || !found || validate(existing) != nil {
 			return nil, errors.New("existing cached object failed verification")
 		}
-		if err := unix.Unlinkat(int(directory.Fd()), tempName, 0); err != nil {
+		if err := fscompat.Unlinkat(int(directory.Fd()), tempName, 0); err != nil {
 			return nil, fmt.Errorf("remove duplicate cached object temporary file: %w", err)
 		}
 		removeTemp = false
@@ -642,17 +641,17 @@ func openVerifiedCacheRoot(clientDir string) (*os.File, error) {
 	if err != nil || canonical != clientDir {
 		return nil, errors.New("client cache root changed identity")
 	}
-	fd, err := unix.Open(clientDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := fscompat.Open(clientDir, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open client cache root: %w", err)
 	}
-	var opened, path unix.Stat_t
-	if err := unix.Fstat(fd, &opened); err != nil {
-		unix.Close(fd)
+	var opened, path fscompat.Stat_t
+	if err := fscompat.Fstat(fd, &opened); err != nil {
+		fscompat.Close(fd)
 		return nil, fmt.Errorf("inspect client cache root: %w", err)
 	}
-	if err := unix.Lstat(clientDir, &path); err != nil || opened.Dev != path.Dev || opened.Ino != path.Ino || path.Mode&syscall.S_IFMT != syscall.S_IFDIR {
-		unix.Close(fd)
+	if err := fscompat.Lstat(clientDir, &path); err != nil || opened.Dev != path.Dev || opened.Ino != path.Ino || path.Mode&fscompat.S_IFMT != fscompat.S_IFDIR {
+		fscompat.Close(fd)
 		return nil, errors.New("client cache root changed identity")
 	}
 	return os.NewFile(uintptr(fd), clientDir), nil
@@ -662,28 +661,28 @@ func openCacheDirectory(root *os.File, kind, prefix string) (*os.File, error) {
 	if root == nil {
 		return nil, errors.New("client cache root is not open")
 	}
-	rootFD, err := unix.Dup(int(root.Fd()))
+	rootFD, err := fscompat.Dup(int(root.Fd()))
 	if err != nil {
 		return nil, fmt.Errorf("duplicate client cache root: %w", err)
 	}
 	current := os.NewFile(uintptr(rootFD), root.Name())
 	for _, name := range []string{"objects", kind, prefix} {
-		if err := unix.Mkdirat(int(current.Fd()), name, 0o700); err != nil && !errors.Is(err, syscall.EEXIST) {
+		if err := fscompat.Mkdirat(int(current.Fd()), name, 0o700); err != nil && !errors.Is(err, fscompat.EEXIST) {
 			current.Close()
 			return nil, fmt.Errorf("create object cache directory: %w", err)
 		}
-		nextFD, err := unix.Openat(int(current.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		nextFD, err := fscompat.Openat(int(current.Fd()), name, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 		if err != nil {
 			current.Close()
 			return nil, fmt.Errorf("open object cache directory without following links: %w", err)
 		}
-		if err := unix.Fchmod(nextFD, 0o700); err != nil {
-			unix.Close(nextFD)
+		if err := fscompat.Fchmod(nextFD, 0o700); err != nil {
+			fscompat.Close(nextFD)
 			current.Close()
 			return nil, fmt.Errorf("secure object cache directory: %w", err)
 		}
 		if err := current.Sync(); err != nil {
-			unix.Close(nextFD)
+			fscompat.Close(nextFD)
 			current.Close()
 			return nil, fmt.Errorf("sync object cache parent: %w", err)
 		}
@@ -694,8 +693,8 @@ func openCacheDirectory(root *os.File, kind, prefix string) (*os.File, error) {
 }
 
 func readCacheFile(directory *os.File, name string) ([]byte, bool, error) {
-	fd, err := unix.Openat(int(directory.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if errors.Is(err, syscall.ENOENT) {
+	fd, err := fscompat.Openat(int(directory.Fd()), name, fscompat.O_RDONLY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+	if errors.Is(err, fscompat.ENOENT) {
 		return nil, false, nil
 	}
 	if err != nil {
@@ -801,12 +800,12 @@ func installCheckoutDirectory(ctx context.Context, db *sql.DB, options bindOptio
 	}
 	defer parent.Close()
 
-	targetFD, targetErr := unix.Openat(int(parent.Fd()), targetName, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	targetFD, targetErr := fscompat.Openat(int(parent.Fd()), targetName, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 	if targetErr == nil {
 		target := os.NewFile(uintptr(targetFD), value.path)
 		defer target.Close()
-		var stat unix.Stat_t
-		if err := unix.Fstat(targetFD, &stat); err != nil {
+		var stat fscompat.Stat_t
+		if err := fscompat.Fstat(targetFD, &stat); err != nil {
 			return fmt.Errorf("inspect checkout target directory %q: %w", value.path, err)
 		}
 		matchesTarget := targetDevice != 0 && targetInode != 0 && uint64(stat.Dev) == targetDevice && stat.Ino == targetInode
@@ -822,7 +821,7 @@ func installCheckoutDirectory(ctx context.Context, db *sql.DB, options bindOptio
 		}
 		return recordCheckoutDirectoryInstalled(ctx, db, options.worktree, value, stat, config)
 	}
-	if !errors.Is(targetErr, syscall.ENOENT) {
+	if !errors.Is(targetErr, fscompat.ENOENT) {
 		return fmt.Errorf("open checkout target directory %q without following links: %w", value.path, targetErr)
 	}
 
@@ -838,14 +837,14 @@ func installCheckoutDirectory(ctx context.Context, db *sql.DB, options bindOptio
 			return errors.Join(errors.New("created checkout directory has no durable identity"), err)
 		}
 	}
-	tempFD, err := unix.Openat(int(parent.Fd()), tempName, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	tempFD, err := fscompat.Openat(int(parent.Fd()), tempName, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("open checkout temporary directory without following links: %w", err)
 	}
 	temp := os.NewFile(uintptr(tempFD), tempName)
 	defer temp.Close()
-	var opened unix.Stat_t
-	if err := unix.Fstat(tempFD, &opened); err != nil {
+	var opened fscompat.Stat_t
+	if err := fscompat.Fstat(tempFD, &opened); err != nil {
 		return fmt.Errorf("inspect checkout temporary directory: %w", err)
 	}
 	if tempDevice == 0 || tempInode == 0 || uint64(opened.Dev) != tempDevice || opened.Ino != tempInode {
@@ -888,8 +887,8 @@ func installCheckoutFile(ctx context.Context, db *sql.DB, options bindOptions, v
 		return err
 	}
 	defer parent.Close()
-	var stat unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstatat(int(parent.Fd()), name, &stat, fscompat.AT_SYMLINK_NOFOLLOW); err == nil {
 		if tempDevice == 0 || tempInode == 0 {
 			return fmt.Errorf("installed checkout file %q has no registered identity; pending checkout retained", value.path)
 		}
@@ -915,7 +914,7 @@ func installCheckoutFile(ctx context.Context, db *sql.DB, options bindOptions, v
 			return errors.Join(fmt.Errorf("verify installed checkout file path before completion: %w", err), installed.Close())
 		}
 		return errors.Join(recordCheckoutCompleted(ctx, db, options.worktree, value), installed.Close())
-	} else if !errors.Is(err, syscall.ENOENT) {
+	} else if !errors.Is(err, fscompat.ENOENT) {
 		return err
 	}
 	if !registered || tempName == "" {
@@ -939,34 +938,34 @@ func installCheckoutFile(ctx context.Context, db *sql.DB, options bindOptions, v
 			return errors.Join(errors.New("created checkout file has no durable identity"), err)
 		}
 	}
-	fd, err := unix.Openat(int(parent.Fd()), tempName, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	fd, err := fscompat.Openat(int(parent.Fd()), tempName, fscompat.O_WRONLY|fscompat.O_CREAT|fscompat.O_EXCL|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0o600)
 	created := err == nil
-	var opened unix.Stat_t
-	if errors.Is(err, syscall.EEXIST) {
+	var opened fscompat.Stat_t
+	if errors.Is(err, fscompat.EEXIST) {
 		if tempDevice == 0 || tempInode == 0 {
 			return errors.New("registered checkout temporary file has no identity; pending checkout retained")
 		}
-		var existing unix.Stat_t
-		if statErr := unix.Fstatat(int(parent.Fd()), tempName, &existing, unix.AT_SYMLINK_NOFOLLOW); statErr != nil ||
-			existing.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		var existing fscompat.Stat_t
+		if statErr := fscompat.Fstatat(int(parent.Fd()), tempName, &existing, fscompat.AT_SYMLINK_NOFOLLOW); statErr != nil ||
+			existing.Mode&fscompat.S_IFMT != fscompat.S_IFREG {
 			return errors.New("registered checkout temporary file is not a regular file")
 		}
-		fd, err = unix.Openat(int(parent.Fd()), tempName, syscall.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		fd, err = fscompat.Openat(int(parent.Fd()), tempName, fscompat.O_WRONLY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 		if err == nil {
-			err = unix.Fstat(fd, &opened)
+			err = fscompat.Fstat(fd, &opened)
 		}
-		if err == nil && (opened.Dev != existing.Dev || opened.Ino != existing.Ino || opened.Mode&syscall.S_IFMT != syscall.S_IFREG) {
+		if err == nil && (opened.Dev != existing.Dev || opened.Ino != existing.Ino || opened.Mode&fscompat.S_IFMT != fscompat.S_IFREG) {
 			err = errors.New("registered checkout temporary file changed while opening")
 		}
 		if err == nil && (uint64(opened.Dev) != tempDevice || opened.Ino != tempInode) {
 			err = errors.New("registered checkout temporary file identity changed")
 		}
 	} else if err == nil {
-		err = unix.Fstat(fd, &opened)
+		err = fscompat.Fstat(fd, &opened)
 	}
 	if err != nil {
 		if fd >= 0 {
-			syscall.Close(fd)
+			fscompat.Close(fd)
 		}
 		return fmt.Errorf("open checkout temporary file: %w", err)
 	}
@@ -974,25 +973,25 @@ func installCheckoutFile(ctx context.Context, db *sql.DB, options bindOptions, v
 		tempDevice, tempInode = uint64(opened.Dev), opened.Ino
 	}
 	if err := verifyCheckoutFileIdentity(fd, tempDevice, tempInode); err != nil {
-		return errors.Join(fmt.Errorf("verify checkout temporary file: %w", err), syscall.Close(fd))
+		return errors.Join(fmt.Errorf("verify checkout temporary file: %w", err), fscompat.Close(fd))
 	}
 	if needsIdentity || created {
 		identityErr := recordCheckoutTempIdentity(ctx, db, options.worktree, value.path, tempName, opened, config)
 		if identityErr != nil {
-			return errors.Join(fmt.Errorf("record checkout temporary identity: %w", identityErr), syscall.Close(fd))
+			return errors.Join(fmt.Errorf("record checkout temporary identity: %w", identityErr), fscompat.Close(fd))
 		}
 	}
 	if config.beforeCheckoutFileWrite != nil {
 		if err := config.beforeCheckoutFileWrite(value.path, tempName); err != nil {
-			return errors.Join(fmt.Errorf("before checkout file write: %w", err), syscall.Close(fd))
+			return errors.Join(fmt.Errorf("before checkout file write: %w", err), fscompat.Close(fd))
 		}
 	}
 	if err := verifyCheckoutFileIdentity(fd, tempDevice, tempInode); err != nil {
-		return errors.Join(fmt.Errorf("verify checkout temporary file before write: %w", err), syscall.Close(fd))
+		return errors.Join(fmt.Errorf("verify checkout temporary file before write: %w", err), fscompat.Close(fd))
 	}
 	if !created {
-		if err := unix.Ftruncate(fd, 0); err != nil {
-			syscall.Close(fd)
+		if err := fscompat.Ftruncate(fd, 0); err != nil {
+			fscompat.Close(fd)
 			return fmt.Errorf("truncate registered checkout temporary file: %w", err)
 		}
 	}
@@ -1050,18 +1049,18 @@ func installCheckoutFile(ctx context.Context, db *sql.DB, options bindOptions, v
 	return recordCheckoutCompleted(ctx, db, options.worktree, value)
 }
 
-type checkoutDirectoryVerifier func(string, unix.Stat_t) error
+type checkoutDirectoryVerifier func(string, fscompat.Stat_t) error
 
 func openCheckoutParent(root *openedWorktree, path string, verify checkoutDirectoryVerifier) (*os.File, string, error) {
 	components := strings.Split(path, "/")
-	current, err := syscall.Dup(int(root.directory.Fd()))
+	current, err := fscompat.Dup(int(root.directory.Fd()))
 	if err != nil {
 		return nil, "", err
 	}
 	relative := ""
 	for _, component := range components[:len(components)-1] {
-		next, openErr := unix.Openat(current, component, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-		syscall.Close(current)
+		next, openErr := fscompat.Openat(current, component, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+		fscompat.Close(current)
 		if openErr != nil {
 			return nil, "", fmt.Errorf("open checkout parent for %q: %w", path, openErr)
 		}
@@ -1072,13 +1071,13 @@ func openCheckoutParent(root *openedWorktree, path string, verify checkoutDirect
 			relative += "/" + component
 		}
 		if verify != nil {
-			var stat unix.Stat_t
-			if err := unix.Fstat(current, &stat); err != nil {
-				syscall.Close(current)
+			var stat fscompat.Stat_t
+			if err := fscompat.Fstat(current, &stat); err != nil {
+				fscompat.Close(current)
 				return nil, "", fmt.Errorf("inspect checkout parent %q: %w", relative, err)
 			}
 			if err := verify(relative, stat); err != nil {
-				syscall.Close(current)
+				fscompat.Close(current)
 				return nil, "", err
 			}
 		}
@@ -1093,13 +1092,13 @@ func setCheckoutMtime(ctx context.Context, db *sql.DB, options bindOptions, valu
 		return err
 	}
 	defer parent.Close()
-	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := fscompat.Openat(int(parent.Fd()), name, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("open checkout directory for mtime %q: %w", value.path, err)
 	}
 	directory := os.NewFile(uintptr(fd), value.path)
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstat(fd, &stat); err != nil {
 		return errors.Join(err, directory.Close())
 	}
 	if err := verify(value.path, stat); err != nil {
@@ -1151,19 +1150,19 @@ func checkoutDirectoryState(ctx context.Context, db *sql.DB, worktree, path stri
 }
 
 func checkoutParentVerifier(ctx context.Context, db *sql.DB, worktree string) checkoutDirectoryVerifier {
-	return func(path string, stat unix.Stat_t) error {
+	return func(path string, stat fscompat.Stat_t) error {
 		_, device, inode, err := checkoutDirectoryState(ctx, db, worktree, path)
 		if err != nil {
 			return err
 		}
-		if device == 0 || inode == 0 || uint64(stat.Dev) != device || stat.Ino != inode || stat.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		if device == 0 || inode == 0 || uint64(stat.Dev) != device || stat.Ino != inode || stat.Mode&fscompat.S_IFMT != fscompat.S_IFDIR {
 			return fmt.Errorf("registered checkout parent directory %q identity changed", path)
 		}
 		return nil
 	}
 }
 
-func recordCheckoutDirectoryTempIdentity(ctx context.Context, db *sql.DB, worktree, path, tempName string, stat unix.Stat_t, config libraryClientConfig) error {
+func recordCheckoutDirectoryTempIdentity(ctx context.Context, db *sql.DB, worktree, path, tempName string, stat fscompat.Stat_t, config libraryClientConfig) error {
 	if config.beforeCheckoutDirectoryIdentity != nil {
 		if err := config.beforeCheckoutDirectoryIdentity(); err != nil {
 			return err
@@ -1182,7 +1181,7 @@ func recordCheckoutDirectoryTempIdentity(ctx context.Context, db *sql.DB, worktr
 	return nil
 }
 
-func recordCheckoutDirectoryInstalled(ctx context.Context, db *sql.DB, worktree string, value checkoutPath, stat unix.Stat_t, config libraryClientConfig) error {
+func recordCheckoutDirectoryInstalled(ctx context.Context, db *sql.DB, worktree string, value checkoutPath, stat fscompat.Stat_t, config libraryClientConfig) error {
 	if config.afterCheckoutInstall != nil {
 		if err := config.afterCheckoutInstall(value.path, value.kind); err != nil {
 			return fmt.Errorf("record installed checkout directory: %w", err)
@@ -1203,12 +1202,12 @@ func recordCheckoutDirectoryInstalled(ctx context.Context, db *sql.DB, worktree 
 	return nil
 }
 
-func verifyDirectoryPathIdentity(parent *os.File, name string, expected unix.Stat_t) error {
-	var current unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), name, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+func verifyDirectoryPathIdentity(parent *os.File, name string, expected fscompat.Stat_t) error {
+	var current fscompat.Stat_t
+	if err := fscompat.Fstatat(int(parent.Fd()), name, &current, fscompat.AT_SYMLINK_NOFOLLOW); err != nil {
 		return fmt.Errorf("inspect checkout directory path identity: %w", err)
 	}
-	if current.Dev != expected.Dev || current.Ino != expected.Ino || current.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+	if current.Dev != expected.Dev || current.Ino != expected.Ino || current.Mode&fscompat.S_IFMT != fscompat.S_IFDIR {
 		return errors.New("checkout directory path identity changed")
 	}
 	return nil
@@ -1262,7 +1261,7 @@ func registerCheckoutTemp(ctx context.Context, db *sql.DB, worktree string, valu
 	return nil
 }
 
-func recordCheckoutTempIdentity(ctx context.Context, db *sql.DB, worktree, path, tempName string, stat unix.Stat_t, config libraryClientConfig) error {
+func recordCheckoutTempIdentity(ctx context.Context, db *sql.DB, worktree, path, tempName string, stat fscompat.Stat_t, config libraryClientConfig) error {
 	if config.beforeCheckoutTempIdentity != nil {
 		if err := config.beforeCheckoutTempIdentity(); err != nil {
 			return err
@@ -1290,27 +1289,27 @@ func recordCheckoutCompleted(ctx context.Context, db *sql.DB, worktree string, v
 }
 
 func verifyCheckoutFileIdentity(fd int, expectedDevice, expectedInode uint64) error {
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstat(fd, &stat); err != nil {
 		return err
 	}
-	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG || uint64(stat.Dev) != expectedDevice || stat.Ino != expectedInode || stat.Nlink != 1 {
+	if stat.Mode&fscompat.S_IFMT != fscompat.S_IFREG || uint64(stat.Dev) != expectedDevice || stat.Ino != expectedInode || stat.Nlink != 1 {
 		return errors.New("checkout file identity or link count changed")
 	}
 	return nil
 }
 
 func verifyCheckoutFilePathIdentity(parent *os.File, name string, expectedDevice, expectedInode uint64) error {
-	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := fscompat.Openat(int(parent.Fd()), name, fscompat.O_RDONLY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	return errors.Join(verifyCheckoutFileIdentity(fd, expectedDevice, expectedInode), syscall.Close(fd))
+	return errors.Join(verifyCheckoutFileIdentity(fd, expectedDevice, expectedInode), fscompat.Close(fd))
 }
 
 func verifyInstalledFile(ctx context.Context, db *sql.DB, options bindOptions, value checkoutPath, parent *os.File,
 	name string, expectedDevice, expectedInode uint64, config libraryClientConfig) (installed *os.File, resultErr error) {
-	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := fscompat.Openat(int(parent.Fd()), name, fscompat.O_RDONLY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, errors.New("installed checkout file changed")
 	}
@@ -1470,9 +1469,9 @@ func cleanupCheckoutTemps(ctx context.Context, db *sql.DB, root *openedWorktree,
 		if err != nil {
 			return err
 		}
-		var stat unix.Stat_t
-		err = unix.Fstatat(int(parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW)
-		if errors.Is(err, syscall.ENOENT) {
+		var stat fscompat.Stat_t
+		err = fscompat.Fstatat(int(parent.Fd()), name, &stat, fscompat.AT_SYMLINK_NOFOLLOW)
+		if errors.Is(err, fscompat.ENOENT) {
 			parent.Close()
 			continue
 		}
@@ -1488,14 +1487,14 @@ func cleanupCheckoutTemps(ctx context.Context, db *sql.DB, root *openedWorktree,
 				return errors.Join(errors.New("registered checkout temporary path has no durable identity"), err)
 			}
 		}
-		expectedMode := uint32(syscall.S_IFREG)
+		expectedMode := uint32(fscompat.S_IFREG)
 		if temp.kind == "Directory" {
-			expectedMode = syscall.S_IFDIR
+			expectedMode = fscompat.S_IFDIR
 		} else if temp.kind != "File" {
 			parent.Close()
 			return errors.New("registered checkout temporary path has invalid type")
 		}
-		if uint64(stat.Dev) != temp.device || stat.Ino != temp.inode || uint32(stat.Mode)&syscall.S_IFMT != expectedMode {
+		if uint64(stat.Dev) != temp.device || stat.Ino != temp.inode || uint32(stat.Mode)&fscompat.S_IFMT != expectedMode {
 			parent.Close()
 			return errors.New("registered checkout temporary path identity changed; pending checkout retained")
 		}

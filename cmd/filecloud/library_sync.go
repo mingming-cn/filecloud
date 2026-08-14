@@ -15,11 +15,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
+	fscompat "github.com/mingming-cn/filecloud/internal/fscompat"
 	"github.com/mingming-cn/filecloud/internal/object"
-	"golang.org/x/sys/unix"
 	"golang.org/x/text/cases"
 )
 
@@ -1159,7 +1158,7 @@ func continueSyncCheckout(ctx context.Context, db *sql.DB, options bindOptions, 
 				name = recovery.tombstone
 			}
 			if recovery.kind == "File" && directPromotions[recovery.path] {
-				if _, err := statAt(options.worktreeRoot.directory, name); errors.Is(err, syscall.ENOENT) {
+				if _, err := statAt(options.worktreeRoot.directory, name); errors.Is(err, fscompat.ENOENT) {
 					continue
 				}
 			}
@@ -1241,8 +1240,8 @@ func registerSyncRecoveryPlan(ctx context.Context, db *sql.DB, root *openedWorkt
 	if err := root.validateIdentity(); err != nil {
 		return err
 	}
-	var rootStat unix.Stat_t
-	if err := unix.Fstat(int(root.directory.Fd()), &rootStat); err != nil {
+	var rootStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(root.directory.Fd()), &rootStat); err != nil {
 		return err
 	}
 	rootMtimeNS := filesystemMtimeNS(time.Unix(rootStat.Mtim.Sec, rootStat.Mtim.Nsec))
@@ -1458,9 +1457,10 @@ func validateCompletedPromotion(ctx context.Context, db *sql.DB, root *openedWor
 		if openErr != nil {
 			return fsAction{}, errors.Join(openErr, targetParent.Close())
 		}
-		stat, statOK := info.Sys().(*syscall.Stat_t)
-		var parentStat unix.Stat_t
-		parentStatErr := unix.Fstat(int(targetParent.Fd()), &parentStat)
+		stat, statErr := statOfOpenFile(file)
+		statOK := statErr == nil
+		var parentStat fscompat.Stat_t
+		parentStatErr := fscompat.Fstat(int(targetParent.Fd()), &parentStat)
 		snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
 		id, scanErr := scanRegularFile(file, promotion.Target, info, &snapshot)
 		mtime := canonicalProtocolMtime(info.ModTime())
@@ -1829,7 +1829,8 @@ func resetPromotedCheckoutIfNeeded(ctx context.Context, db *sql.DB, root *opened
 	}
 	file, info, openErr := openScannableAt(parent, leaf, path)
 	if openErr == nil {
-		stat, ok := info.Sys().(*syscall.Stat_t)
+		stat, statErr := statOfOpenFile(file)
+		ok := statErr == nil
 		snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
 		id, scanErr := scanRegularFile(file, path, info, &snapshot)
 		mtime := canonicalProtocolMtime(info.ModTime())
@@ -1845,7 +1846,7 @@ func resetPromotedCheckoutIfNeeded(ctx context.Context, db *sql.DB, root *opened
 		}
 	} else {
 		closeErr := parent.Close()
-		if !errors.Is(openErr, syscall.ENOENT) || closeErr != nil {
+		if !errors.Is(openErr, fscompat.ENOENT) || closeErr != nil {
 			return errors.Join(openErr, closeErr)
 		}
 	}
@@ -1976,10 +1977,10 @@ func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 		visible, visibleErr := statAt(root.directory, value.path)
 		hidden, hiddenErr := statAt(root.directory, value.name)
 		visibleExists, hiddenExists := visibleErr == nil, hiddenErr == nil
-		if visibleErr != nil && !errors.Is(visibleErr, syscall.ENOENT) {
+		if visibleErr != nil && !errors.Is(visibleErr, fscompat.ENOENT) {
 			return visibleErr
 		}
-		if hiddenErr != nil && !errors.Is(hiddenErr, syscall.ENOENT) {
+		if hiddenErr != nil && !errors.Is(hiddenErr, fscompat.ENOENT) {
 			return hiddenErr
 		}
 		if value.completed {
@@ -2012,7 +2013,7 @@ func prepareSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 				return fmt.Errorf("worktree path %q changed at recovery rename: %w", value.path, err)
 			}
 			if !statMatchesRecovery(current, value) {
-				if value.kind != "File" || current.Mode&syscall.S_IFMT != syscall.S_IFREG {
+				if value.kind != "File" || current.Mode&fscompat.S_IFMT != fscompat.S_IFREG {
 					return fmt.Errorf("worktree path %q changed structurally at recovery rename; Issue #18 owns preservation", value.path)
 				}
 				args := append([]any{uint64(current.Dev), current.Ino}, syncRecoveryCASArgs(value)...)
@@ -2603,7 +2604,7 @@ func promoteCapturedConflictFiles(ctx context.Context, db *sql.DB, root *openedW
 			return err
 		}
 		file, info, err := openScannableAt(parent, sourceLeaf, promotion.source)
-		if errors.Is(err, syscall.ENOENT) {
+		if errors.Is(err, fscompat.ENOENT) {
 			if closeErr := parent.Close(); closeErr != nil {
 				return closeErr
 			}
@@ -2622,7 +2623,8 @@ func promoteCapturedConflictFiles(ctx context.Context, db *sql.DB, root *openedW
 			parent.Close()
 			return err
 		}
-		sourceStat, ok := info.Sys().(*syscall.Stat_t)
+		sourceStat, statErr := statOfOpenFile(file)
+		ok := statErr == nil
 		sourceSnapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
 		sourceID, scanErr := scanRegularFile(file, promotion.source, info, &sourceSnapshot)
 		closeErr := file.Close()
@@ -2735,7 +2737,7 @@ func verifyAllSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktr
 			name = value.tombstone
 		}
 		if value.kind == "File" && directPromotions[value.path] {
-			if _, err := statAt(root.directory, name); errors.Is(err, syscall.ENOENT) {
+			if _, err := statAt(root.directory, name); errors.Is(err, fscompat.ENOENT) {
 				continue
 			}
 		}
@@ -2752,7 +2754,8 @@ func verifyNamedRecovery(parent *os.File, name string, expected syncRecovery) er
 		return err
 	}
 	defer file.Close()
-	stat, ok := info.Sys().(*syscall.Stat_t)
+	stat, statErr := statOfOpenFile(file)
+	ok := statErr == nil
 	if !ok || (expected.device != 0 && (uint64(stat.Dev) != expected.device || stat.Ino != expected.inode)) {
 		return errors.New("captured path identity changed")
 	}
@@ -2772,18 +2775,18 @@ func verifyNamedRecovery(parent *os.File, name string, expected syncRecovery) er
 	return nil
 }
 
-func statAt(parent *os.File, name string) (unix.Stat_t, error) {
-	var stat unix.Stat_t
-	err := unix.Fstatat(int(parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW)
+func statAt(parent *os.File, name string) (fscompat.Stat_t, error) {
+	var stat fscompat.Stat_t
+	err := fscompat.Fstatat(int(parent.Fd()), name, &stat, fscompat.AT_SYMLINK_NOFOLLOW)
 	return stat, err
 }
 
-func statMatchesRecovery(stat unix.Stat_t, value syncRecovery) bool {
-	mode := uint32(syscall.S_IFREG)
+func statMatchesRecovery(stat fscompat.Stat_t, value syncRecovery) bool {
+	mode := uint32(fscompat.S_IFREG)
 	if value.kind == "Directory" {
-		mode = syscall.S_IFDIR
+		mode = fscompat.S_IFDIR
 	}
-	return uint64(stat.Dev) == value.device && stat.Ino == value.inode && uint32(stat.Mode)&syscall.S_IFMT == mode
+	return uint64(stat.Dev) == value.device && stat.Ino == value.inode && uint32(stat.Mode)&fscompat.S_IFMT == mode
 }
 
 func finalizeSyncApply(ctx context.Context, db *sql.DB, binding clientBinding, pending pendingCheckout, paths []checkoutPath,
@@ -2871,7 +2874,8 @@ func snapshotRecoveryRemoval(parent *os.File, name string, expected syncRecovery
 		return nil, err
 	}
 	defer file.Close()
-	stat, ok := info.Sys().(*syscall.Stat_t)
+	stat, statErr := statOfOpenFile(file)
+	ok := statErr == nil
 	if !ok || !info.IsDir() || uint64(stat.Dev) != expected.device || stat.Ino != expected.inode ||
 		canonicalProtocolMtime(info.ModTime()) != expected.mtime {
 		return nil, errors.New("captured directory identity, type, or mtime changed")
@@ -3027,10 +3031,10 @@ func cleanupSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktree
 		recoveryStat, recoveryErr := statAt(root.directory, value.name)
 		tombstoneStat, tombstoneErr := statAt(root.directory, value.tombstone)
 		recoveryExists, tombstoneExists := recoveryErr == nil, tombstoneErr == nil
-		if recoveryErr != nil && !errors.Is(recoveryErr, syscall.ENOENT) {
+		if recoveryErr != nil && !errors.Is(recoveryErr, fscompat.ENOENT) {
 			return recoveryErr
 		}
-		if tombstoneErr != nil && !errors.Is(tombstoneErr, syscall.ENOENT) {
+		if tombstoneErr != nil && !errors.Is(tombstoneErr, fscompat.ENOENT) {
 			return tombstoneErr
 		}
 		switch {
@@ -3292,7 +3296,7 @@ func rollbackCheckoutTarget(ctx context.Context, db *sql.DB, root *openedWorktre
 	}
 	_, visibleErr := statAt(parent, name)
 	visibleExists := visibleErr == nil
-	if visibleErr != nil && !errors.Is(visibleErr, syscall.ENOENT) {
+	if visibleErr != nil && !errors.Is(visibleErr, fscompat.ENOENT) {
 		return visibleErr
 	}
 	if value.rollbackName == "" {
@@ -3321,7 +3325,7 @@ func rollbackCheckoutTarget(ctx context.Context, db *sql.DB, root *openedWorktre
 	}
 	tombstone, tombstoneErr := statAt(parent, value.rollbackName)
 	tombstoneExists := tombstoneErr == nil
-	if tombstoneErr != nil && !errors.Is(tombstoneErr, syscall.ENOENT) {
+	if tombstoneErr != nil && !errors.Is(tombstoneErr, fscompat.ENOENT) {
 		return tombstoneErr
 	}
 	switch {
@@ -3375,14 +3379,14 @@ func verifyRollbackCheckoutTarget(parent, cacheRoot *os.File, name string, value
 	if err != nil || metadata.Size != value.size {
 		return errors.Join(errors.New("cached checkout File metadata changed"), err)
 	}
-	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := fscompat.Openat(int(parent.Fd()), name, fscompat.O_RDONLY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
 	file := os.NewFile(uintptr(fd), value.path)
 	defer file.Close()
-	var before unix.Stat_t
-	if err := unix.Fstat(fd, &before); err != nil || !statMatchesCheckoutTarget(before, "File", device, inode) ||
+	var before fscompat.Stat_t
+	if err := fscompat.Fstat(fd, &before); err != nil || !statMatchesCheckoutTarget(before, "File", device, inode) ||
 		before.Size != value.size || canonicalStatMtime(before) != value.mtime {
 		return errors.Join(errors.New("checkout file identity, size, or canonical mtime changed"), err)
 	}
@@ -3401,19 +3405,19 @@ func verifyRollbackCheckoutTarget(parent, cacheRoot *os.File, name string, value
 	if count, readErr := file.Read(extra[:]); count != 0 || !errors.Is(readErr, io.EOF) {
 		return errors.New("checkout file size changed")
 	}
-	var after unix.Stat_t
-	if err := unix.Fstat(fd, &after); err != nil || !sameRollbackFileState(before, after) || !statMatchesCheckoutTarget(after, "File", device, inode) {
+	var after fscompat.Stat_t
+	if err := fscompat.Fstat(fd, &after); err != nil || !sameRollbackFileState(before, after) || !statMatchesCheckoutTarget(after, "File", device, inode) {
 		return errors.Join(errors.New("checkout file changed during rollback verification"), err)
 	}
 	return nil
 }
 
-func sameRollbackFileState(left, right unix.Stat_t) bool {
+func sameRollbackFileState(left, right fscompat.Stat_t) bool {
 	return left.Dev == right.Dev && left.Ino == right.Ino && left.Mode == right.Mode && left.Nlink == right.Nlink &&
 		left.Size == right.Size && left.Mtim == right.Mtim && left.Ctim == right.Ctim
 }
 
-func canonicalStatMtime(stat unix.Stat_t) string {
+func canonicalStatMtime(stat fscompat.Stat_t) string {
 	return canonicalProtocolMtime(time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec))
 }
 
@@ -3421,13 +3425,13 @@ func readCachedRollbackFile(cacheRoot *os.File, id string) (object.File, error) 
 	if cacheRoot == nil || !object.ValidID(id) {
 		return object.File{}, errors.New("invalid cached checkout File")
 	}
-	fd, err := unix.Dup(int(cacheRoot.Fd()))
+	fd, err := fscompat.Dup(int(cacheRoot.Fd()))
 	if err != nil {
 		return object.File{}, err
 	}
 	current := os.NewFile(uintptr(fd), cacheRoot.Name())
 	for _, name := range []string{"objects", "files", id[:2]} {
-		next, openErr := unix.Openat(int(current.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		next, openErr := fscompat.Openat(int(current.Fd()), name, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 		current.Close()
 		if openErr != nil {
 			return object.File{}, fmt.Errorf("open cached checkout File metadata: %w", openErr)
@@ -3446,25 +3450,25 @@ func readCachedRollbackFile(cacheRoot *os.File, id string) (object.File, error) 
 	return file, nil
 }
 
-func statMatchesCheckoutTarget(stat unix.Stat_t, kind string, device, inode uint64) bool {
-	mode := uint32(syscall.S_IFREG)
+func statMatchesCheckoutTarget(stat fscompat.Stat_t, kind string, device, inode uint64) bool {
+	mode := uint32(fscompat.S_IFREG)
 	if kind == "Directory" {
-		mode = syscall.S_IFDIR
+		mode = fscompat.S_IFDIR
 	}
-	return uint64(stat.Dev) == device && stat.Ino == inode && uint32(stat.Mode)&syscall.S_IFMT == mode && (kind != "File" || stat.Nlink == 1)
+	return uint64(stat.Dev) == device && stat.Ino == inode && uint32(stat.Mode)&fscompat.S_IFMT == mode && (kind != "File" || stat.Nlink == 1)
 }
 
 func openRollbackParent(root *openedWorktree, path string) (*os.File, string, bool, error) {
 	components := strings.Split(path, "/")
-	current, err := unix.Dup(int(root.directory.Fd()))
+	current, err := fscompat.Dup(int(root.directory.Fd()))
 	if err != nil {
 		return nil, "", false, err
 	}
 	currentPath := root.path
 	for _, component := range components[:len(components)-1] {
-		next, openErr := unix.Openat(current, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		unix.Close(current)
-		if errors.Is(openErr, syscall.ENOENT) {
+		next, openErr := fscompat.Openat(current, component, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+		fscompat.Close(current)
+		if errors.Is(openErr, fscompat.ENOENT) {
 			return nil, "", false, nil
 		}
 		if openErr != nil {
@@ -3524,8 +3528,8 @@ func restoreRollbackRootMtime(ctx context.Context, db *sql.DB, root *openedWorkt
 	}
 	if existing != nil {
 		if existing.State == fsStateCompleted {
-			var stat unix.Stat_t
-			if err := unix.Fstat(int(root.directory.Fd()), &stat); err != nil {
+			var stat fscompat.Stat_t
+			if err := fscompat.Fstat(int(root.directory.Fd()), &stat); err != nil {
 				return err
 			}
 			if uint64(stat.Dev) != root.device || stat.Ino != root.inode ||
@@ -3549,10 +3553,10 @@ func rollbackSyncRecoveries(ctx context.Context, db *sql.DB, root *openedWorktre
 		visible, visibleErr := statAt(root.directory, value.path)
 		hidden, hiddenErr := statAt(root.directory, value.name)
 		visibleExists, hiddenExists := visibleErr == nil, hiddenErr == nil
-		if visibleErr != nil && !errors.Is(visibleErr, syscall.ENOENT) {
+		if visibleErr != nil && !errors.Is(visibleErr, fscompat.ENOENT) {
 			return visibleErr
 		}
-		if hiddenErr != nil && !errors.Is(hiddenErr, syscall.ENOENT) {
+		if hiddenErr != nil && !errors.Is(hiddenErr, fscompat.ENOENT) {
 			return hiddenErr
 		}
 		switch {

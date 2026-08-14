@@ -1,5 +1,3 @@
-//go:build linux || darwin
-
 package main
 
 import (
@@ -14,12 +12,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
+	fscompat "github.com/mingming-cn/filecloud/internal/fscompat"
 	"github.com/mingming-cn/filecloud/internal/object"
-	"golang.org/x/sys/unix"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 )
@@ -404,7 +401,7 @@ func openFSActionParent(root *openedWorktree, relative string, expectedDevice, e
 	var fd int
 	var err error
 	if relative == "" {
-		fd, err = unix.Dup(int(root.directory.Fd()))
+		fd, err = fscompat.Dup(int(root.directory.Fd()))
 	} else {
 		fd, err = _openActionParent(root, relative)
 	}
@@ -412,11 +409,11 @@ func openFSActionParent(root *openedWorktree, relative string, expectedDevice, e
 		return nil, fmt.Errorf("open filesystem action parent %q: %w", relative, err)
 	}
 	parent := os.NewFile(uintptr(fd), relative)
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstat(fd, &stat); err != nil {
 		return nil, errors.Join(err, parent.Close())
 	}
-	if stat.Mode&syscall.S_IFMT != syscall.S_IFDIR || uint64(stat.Dev) != root.device ||
+	if stat.Mode&fscompat.S_IFMT != fscompat.S_IFDIR || uint64(stat.Dev) != root.device ||
 		(expectedDevice != 0 && (uint64(stat.Dev) != expectedDevice || stat.Ino != expectedInode)) {
 		return nil, errors.Join(errors.New("filesystem action parent identity or mount changed"), parent.Close())
 	}
@@ -424,19 +421,19 @@ func openFSActionParent(root *openedWorktree, relative string, expectedDevice, e
 }
 
 func openFSActionParentFallback(root *openedWorktree, relative string) (int, error) {
-	current, err := unix.Dup(int(root.directory.Fd()))
+	current, err := fscompat.Dup(int(root.directory.Fd()))
 	if err != nil {
 		return -1, err
 	}
 	for _, component := range strings.Split(relative, "/") {
-		next, openErr := unix.Openat(current, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		unix.Close(current)
+		next, openErr := fscompat.Openat(current, component, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+		fscompat.Close(current)
 		if openErr != nil {
 			return -1, openErr
 		}
-		var stat unix.Stat_t
-		if err := unix.Fstat(next, &stat); err != nil || uint64(stat.Dev) != root.device {
-			unix.Close(next)
+		var stat fscompat.Stat_t
+		if err := fscompat.Fstat(next, &stat); err != nil || uint64(stat.Dev) != root.device {
+			fscompat.Close(next)
 			return -1, errors.Join(errors.New("filesystem action crossed a mount"), err)
 		}
 		current = next
@@ -506,18 +503,18 @@ func executeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, valu
 }
 
 func actionPathState(parent *os.File, name string, value fsAction) (bool, bool, error) {
-	var stat unix.Stat_t
+	var stat fscompat.Stat_t
 	if name == "" {
 		if value.Op != fsOpMtime {
 			return false, false, nil
 		}
-		err := unix.Fstat(int(parent.Fd()), &stat)
-		matches := err == nil && value.ExpectedKind == "Directory" && stat.Mode&syscall.S_IFMT == syscall.S_IFDIR &&
+		err := fscompat.Fstat(int(parent.Fd()), &stat)
+		matches := err == nil && value.ExpectedKind == "Directory" && stat.Mode&fscompat.S_IFMT == fscompat.S_IFDIR &&
 			uint64(stat.Dev) == value.ExpectedDevice && stat.Ino == value.ExpectedInode
 		return err == nil, matches, err
 	}
-	err := unix.Fstatat(int(parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW)
-	if errors.Is(err, syscall.ENOENT) {
+	err := fscompat.Fstatat(int(parent.Fd()), name, &stat, fscompat.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(err, fscompat.ENOENT) {
 		return false, false, nil
 	}
 	if err != nil {
@@ -526,11 +523,11 @@ func actionPathState(parent *os.File, name string, value fsAction) (bool, bool, 
 	if value.Outcome == "preserve_unknown" {
 		return true, true, nil
 	}
-	mode := uint32(syscall.S_IFREG)
+	mode := uint32(fscompat.S_IFREG)
 	if value.ExpectedKind == "Directory" {
-		mode = syscall.S_IFDIR
+		mode = fscompat.S_IFDIR
 	}
-	matches := uint32(stat.Mode)&syscall.S_IFMT == mode
+	matches := uint32(stat.Mode)&fscompat.S_IFMT == mode
 	if value.ExpectedDevice != 0 || value.ExpectedInode != 0 {
 		matches = matches && uint64(stat.Dev) == value.ExpectedDevice && stat.Ino == value.ExpectedInode
 	}
@@ -559,7 +556,7 @@ func verifyFSRemovalObject(parent *os.File, value fsAction) error {
 }
 
 func rollbackZeroIdentityCreate(ctx context.Context, db *sql.DB, root *openedWorktree, value fsAction,
-	_ unix.Stat_t, fault fsActionFault) error {
+	_ fscompat.Stat_t, fault fsActionFault) error {
 	target, err := recoveryVisibleLeaf(value.Parent, value.ActionID, 1)
 	if err != nil {
 		return err
@@ -568,8 +565,8 @@ func rollbackZeroIdentityCreate(ctx context.Context, db *sql.DB, root *openedWor
 	if err != nil {
 		return err
 	}
-	var rootStat unix.Stat_t
-	if err := unix.Fstat(int(root.directory.Fd()), &rootStat); err != nil {
+	var rootStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(root.directory.Fd()), &rootStat); err != nil {
 		return err
 	}
 	rootMtimeNS := filesystemMtimeNS(time.Unix(rootStat.Mtim.Sec, rootStat.Mtim.Nsec))
@@ -745,14 +742,14 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 		}
 		if sourceExists {
 			if value.ExpectedDevice == 0 || value.ExpectedInode == 0 {
-				var stat unix.Stat_t
-				if err := unix.Fstatat(int(parent.Fd()), value.Source, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+				var stat fscompat.Stat_t
+				if err := fscompat.Fstatat(int(parent.Fd()), value.Source, &stat, fscompat.AT_SYMLINK_NOFOLLOW); err != nil {
 					return err
 				}
 				if _, fallbackRootCreate := fallbackRootCreateOwner(value); !fallbackRootCreate {
 					return rollbackZeroIdentityCreate(ctx, db, root, value, stat, fault)
 				}
-				if stat.Mode&syscall.S_IFMT != syscall.S_IFDIR || uint64(stat.Dev) != root.device {
+				if stat.Mode&fscompat.S_IFMT != fscompat.S_IFDIR || uint64(stat.Dev) != root.device {
 					return errors.New("filesystem fallback root creation collided with a non-directory")
 				}
 			}
@@ -773,20 +770,20 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 				if alias {
 					return completeFallbackRootCollision(ctx, db, value, fault)
 				}
-				var raced unix.Stat_t
-				if err := unix.Fstatat(int(parent.Fd()), value.Source, &raced, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+				var raced fscompat.Stat_t
+				if err := fscompat.Fstatat(int(parent.Fd()), value.Source, &raced, fscompat.AT_SYMLINK_NOFOLLOW); err == nil {
 					return completeFSAction(ctx, db, root, value, fault)
-				} else if !errors.Is(err, syscall.ENOENT) {
+				} else if !errors.Is(err, fscompat.ENOENT) {
 					return err
 				}
 			}
 			if value.Op == fsOpCreateDirectory {
-				err = unix.Mkdirat(int(parent.Fd()), value.Source, 0o700)
+				err = fscompat.Mkdirat(int(parent.Fd()), value.Source, 0o700)
 			} else {
 				var fd int
-				fd, err = unix.Openat(int(parent.Fd()), value.Source, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+				fd, err = fscompat.Openat(int(parent.Fd()), value.Source, fscompat.O_WRONLY|fscompat.O_CREAT|fscompat.O_EXCL|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0o600)
 				if err == nil {
-					err = unix.Close(fd)
+					err = fscompat.Close(fd)
 				}
 			}
 			if err != nil {
@@ -799,8 +796,8 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 				}
 			}
 		}
-		var createdStat unix.Stat_t
-		if err := unix.Fstatat(int(parent.Fd()), value.Source, &createdStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		var createdStat fscompat.Stat_t
+		if err := fscompat.Fstatat(int(parent.Fd()), value.Source, &createdStat, fscompat.AT_SYMLINK_NOFOLLOW); err != nil {
 			return err
 		}
 		if value.ExpectedDevice == 0 && value.ExpectedInode == 0 {
@@ -860,10 +857,10 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 			}
 			flags := 0
 			if value.Op == fsOpRmdir {
-				flags = unix.AT_REMOVEDIR
+				flags = fscompat.AT_REMOVEDIR
 			}
-			if err := unix.Unlinkat(int(parent.Fd()), value.Source, flags); err != nil {
-				if value.Op == fsOpRmdir && (errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST)) {
+			if err := fscompat.Unlinkat(int(parent.Fd()), value.Source, flags); err != nil {
+				if value.Op == fsOpRmdir && (errors.Is(err, fscompat.ENOTEMPTY) || errors.Is(err, fscompat.EEXIST)) {
 					return errors.New("checkout rollback directory contains unexpected user content")
 				}
 				return fmt.Errorf("execute journaled removal: %w", err)
@@ -879,15 +876,15 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 				return err
 			}
 		}
-		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+		flags := fscompat.O_RDONLY | fscompat.O_NOFOLLOW | fscompat.O_CLOEXEC
 		if value.ExpectedKind == "Directory" {
-			flags |= unix.O_DIRECTORY
+			flags |= fscompat.O_DIRECTORY
 		}
 		var fd int
 		if value.Source == "" {
-			fd, err = unix.Dup(int(parent.Fd()))
+			fd, err = fscompat.Dup(int(parent.Fd()))
 		} else {
-			fd, err = unix.Openat(int(parent.Fd()), value.Source, flags, 0)
+			fd, err = fscompat.Openat(int(parent.Fd()), value.Source, flags, 0)
 		}
 		if err != nil {
 			return err
@@ -1190,8 +1187,8 @@ func journalCreate(ctx context.Context, db *sql.DB, root *openedWorktree, worktr
 	if err != nil {
 		return err
 	}
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
+	var parentStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(parent.Fd()), &parentStat); err != nil {
 		parent.Close()
 		return err
 	}
@@ -1305,8 +1302,8 @@ func journalMtime(ctx context.Context, db *sql.DB, root *openedWorktree, worktre
 	if err != nil {
 		return err
 	}
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
+	var parentStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(parent.Fd()), &parentStat); err != nil {
 		parent.Close()
 		return err
 	}
@@ -1337,8 +1334,8 @@ func journalRemove(ctx context.Context, db *sql.DB, root *openedWorktree, worktr
 	if err != nil {
 		return err
 	}
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
+	var parentStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(parent.Fd()), &parentStat); err != nil {
 		parent.Close()
 		return err
 	}
@@ -1377,8 +1374,8 @@ func journalRename(ctx context.Context, db *sql.DB, root *openedWorktree, worktr
 	if err != nil {
 		return err
 	}
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
+	var parentStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(parent.Fd()), &parentStat); err != nil {
 		parent.Close()
 		return err
 	}
@@ -1409,8 +1406,8 @@ func journalPromotion(ctx context.Context, db *sql.DB, root *openedWorktree, wor
 	if err != nil {
 		return err
 	}
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
+	var parentStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(parent.Fd()), &parentStat); err != nil {
 		parent.Close()
 		return err
 	}
@@ -1425,8 +1422,8 @@ func journalPromotion(ctx context.Context, db *sql.DB, root *openedWorktree, wor
 	if err != nil {
 		return err
 	}
-	var targetParentStat unix.Stat_t
-	if err := unix.Fstat(int(targetParent.Fd()), &targetParentStat); err != nil {
+	var targetParentStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(targetParent.Fd()), &targetParentStat); err != nil {
 		targetParent.Close()
 		return err
 	}
@@ -1549,11 +1546,11 @@ func ensurePromotionFallbackRoot(ctx context.Context, db *sql.DB, root *openedWo
 			name += " " + strconv.Itoa(ordinal)
 		}
 		if exact[name] {
-			var stat unix.Stat_t
-			if err := unix.Fstatat(int(root.directory.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			var stat fscompat.Stat_t
+			if err := fscompat.Fstatat(int(root.directory.Fd()), name, &stat, fscompat.AT_SYMLINK_NOFOLLOW); err != nil {
 				return "", 0, 0, err
 			}
-			if stat.Mode&syscall.S_IFMT == syscall.S_IFDIR && uint64(stat.Dev) == root.device {
+			if stat.Mode&fscompat.S_IFMT == fscompat.S_IFDIR && uint64(stat.Dev) == root.device {
 				return name, uint64(stat.Dev), stat.Ino, nil
 			}
 			continue
@@ -1771,8 +1768,8 @@ func journalRestorePromotion(ctx context.Context, db *sql.DB, root *openedWorktr
 		sourceParent.Close()
 		return errors.New("promotion restore source path changed during resolution")
 	}
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(int(sourceParent.Fd()), &parentStat); err != nil {
+	var parentStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(sourceParent.Fd()), &parentStat); err != nil {
 		sourceParent.Close()
 		return err
 	}
@@ -1887,21 +1884,21 @@ func openRestorePromotionTargetParent(root *openedWorktree, recovery syncRecover
 	if recovery.kind != "Directory" || components[0] != recovery.name {
 		return nil, "", errors.New("filesystem restore promotion descendant has no directory recovery owner")
 	}
-	fd, err := unix.Openat(int(root.directory.Fd()), recovery.name,
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := fscompat.Openat(int(root.directory.Fd()), recovery.name,
+		fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, "", err
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil || !statMatchesRecovery(stat, recovery) {
-		unix.Close(fd)
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstat(fd, &stat); err != nil || !statMatchesRecovery(stat, recovery) {
+		fscompat.Close(fd)
 		return nil, "", errors.Join(errors.New("filesystem restore promotion recovery root changed identity"), err)
 	}
 	current := fd
 	for _, component := range components[1 : len(components)-1] {
-		next, openErr := unix.Openat(current, component,
-			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		unix.Close(current)
+		next, openErr := fscompat.Openat(current, component,
+			fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+		fscompat.Close(current)
 		if openErr != nil {
 			return nil, "", openErr
 		}
@@ -1949,7 +1946,7 @@ func completeRestorePromotionAction(ctx context.Context, db *sql.DB, root *opene
 			}
 		}
 		if err := renameNoReplace(int(sourceParent.Fd()), value.Source, int(targetParent.Fd()), targetLeaf); err != nil {
-			if errors.Is(err, syscall.EEXIST) {
+			if errors.Is(err, fscompat.EEXIST) {
 				return completeRestorePromotionAction(ctx, db, root, value, fault)
 			}
 			return fmt.Errorf("execute journaled promotion restore: %w", err)
@@ -2060,7 +2057,7 @@ func completePromotionAction(ctx context.Context, db *sql.DB, root *openedWorktr
 			}
 		}
 		if err := renameNoReplace(int(sourceParent.Fd()), value.Source, int(targetParent.Fd()), targetLeaf); err != nil {
-			if errors.Is(err, syscall.EEXIST) {
+			if errors.Is(err, fscompat.EEXIST) {
 				return completePromotionAction(ctx, db, root, value, fault)
 			}
 			return fmt.Errorf("execute journaled promotion: %w", err)
@@ -2112,7 +2109,8 @@ func preservePromotionCollision(ctx context.Context, db *sql.DB, root *openedWor
 	if err != nil {
 		return err
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
+	stat, statErr := statOfOpenFile(file)
+	ok := statErr == nil
 	snapshot := worktreeSnapshot{blocks: make(map[string]blockSource)}
 	id, scanErr := scanRegularFile(file, sourcePath, info, &snapshot)
 	closeErr := file.Close()
@@ -2149,8 +2147,8 @@ func preservePromotionCollision(ctx context.Context, db *sql.DB, root *openedWor
 	if err != nil {
 		return err
 	}
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(int(targetParent.Fd()), &parentStat); err != nil {
+	var parentStat fscompat.Stat_t
+	if err := fscompat.Fstat(int(targetParent.Fd()), &parentStat); err != nil {
 		return err
 	}
 	successor, err := nextPromotionChainPath(tailTarget, seed, sourcePath)

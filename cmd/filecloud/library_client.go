@@ -20,9 +20,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
+	fscompat "github.com/mingming-cn/filecloud/internal/fscompat"
 	"github.com/mingming-cn/filecloud/internal/object"
 	_ "modernc.org/sqlite"
 )
@@ -1127,11 +1127,11 @@ func flockContext(ctx context.Context, file *os.File) error {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("lock client state: %w", err)
 		}
-		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := fscompat.Flock(int(file.Fd()), fscompat.LOCK_EX|fscompat.LOCK_NB)
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+		if !errors.Is(err, fscompat.EWOULDBLOCK) && !errors.Is(err, fscompat.EAGAIN) {
 			return fmt.Errorf("lock client state: %w", err)
 		}
 		select {
@@ -1144,7 +1144,7 @@ func flockContext(ctx context.Context, file *os.File) error {
 
 func (locks *clientLocks) Close() (retErr error) {
 	for index := len(locks.files) - 1; index >= 0; index-- {
-		retErr = errors.Join(retErr, syscall.Flock(int(locks.files[index].Fd()), syscall.LOCK_UN), locks.files[index].Close())
+		retErr = errors.Join(retErr, fscompat.Flock(int(locks.files[index].Fd()), fscompat.LOCK_UN), locks.files[index].Close())
 	}
 	locks.files = nil
 	return retErr
@@ -2774,13 +2774,13 @@ func openWorktreeRoot(path string, checkFilesystem func(*os.File) error) (*opene
 	if err != nil {
 		return nil, err
 	}
-	fd, err := syscall.Open(canonical, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	fd, err := fscompat.Open(canonical, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open worktree: %w", err)
 	}
 	root := &openedWorktree{path: canonical, directory: os.NewFile(uintptr(fd), canonical)}
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(fd, &stat); err != nil {
+	var stat fscompat.Stat_t
+	if err := fscompat.Fstat(fd, &stat); err != nil {
 		return nil, errors.Join(fmt.Errorf("inspect opened worktree: %w", err), root.Close())
 	}
 	root.device, root.inode = uint64(stat.Dev), stat.Ino
@@ -2805,14 +2805,14 @@ func (root *openedWorktree) validateIdentity() error {
 			return errors.New("worktree path changed to a symlink during bind")
 		}
 	}
-	var pathStat, openedStat syscall.Stat_t
-	if err := syscall.Lstat(root.path, &pathStat); err != nil {
+	var pathStat, openedStat fscompat.Stat_t
+	if err := fscompat.Lstat(root.path, &pathStat); err != nil {
 		return fmt.Errorf("inspect worktree: %w", err)
 	}
-	if pathStat.Mode&syscall.S_IFMT != syscall.S_IFDIR || uint64(pathStat.Dev) != root.device || pathStat.Ino != root.inode {
+	if pathStat.Mode&fscompat.S_IFMT != fscompat.S_IFDIR || uint64(pathStat.Dev) != root.device || pathStat.Ino != root.inode {
 		return errors.New("worktree identity changed during bind")
 	}
-	if err := syscall.Fstat(int(root.directory.Fd()), &openedStat); err != nil {
+	if err := fscompat.Fstat(int(root.directory.Fd()), &openedStat); err != nil {
 		return fmt.Errorf("inspect opened worktree: %w", err)
 	}
 	if uint64(openedStat.Dev) != root.device || openedStat.Ino != root.inode {
@@ -2908,7 +2908,7 @@ func checkStateDirFilesystem(path string, check func(*os.File) error) error {
 	} else if err != nil {
 		return fmt.Errorf("inspect client filesystem path: %w", err)
 	}
-	fd, err := syscall.Open(probe, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	fd, err := fscompat.Open(probe, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("open client filesystem path: %w", err)
 	}
