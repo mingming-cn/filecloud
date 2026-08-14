@@ -171,6 +171,9 @@ func TestLibraryBindImportRejectsUnsupportedAndCollidingPaths(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
 			clientDir, worktree := newClientPaths(t)
+			if test.name == "casefold" && !testFilesystemCaseSensitive(t, worktree) {
+				t.Skip("casefold aliases cannot coexist on this filesystem")
+			}
 			if err := test.setup(worktree); err != nil {
 				t.Fatal(err)
 			}

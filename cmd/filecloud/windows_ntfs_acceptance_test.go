@@ -135,6 +135,11 @@ func TestWindowsNTFSPrimitives(t *testing.T) {
 		before.Dev != after.Dev || before.Ino != after.Ino {
 		t.Fatalf("renamed file identity changed: before=%d/%d after=%d/%d err=%v", before.Dev, before.Ino, after.Dev, after.Ino, err)
 	}
+	var folded fscompat.Stat_t
+	if err := fscompat.Fstatat(int(root.directory.Fd()), "IDENTITY-TARGET", &folded, fscompat.AT_SYMLINK_NOFOLLOW); err != nil ||
+		folded.Dev != after.Dev || folded.Ino != after.Ino {
+		t.Fatalf("NTFS case-fold lookup identity=%d/%d, want %d/%d err=%v", folded.Dev, folded.Ino, after.Dev, after.Ino, err)
+	}
 	if err := os.Link(filepath.Join(path, "identity-target"), filepath.Join(path, "target")); !errors.Is(err, os.ErrExist) {
 		t.Fatalf("no-replace hard-link error=%v, want exists", err)
 	}
@@ -177,8 +182,9 @@ func TestWindowsNTFSPrimitives(t *testing.T) {
 	}
 	line, err := acceptance.Encode(acceptance.Attestation{
 		Kind: "filesystem-primitives", Scenario: "Windows NTFS primitives", Platform: runtime.GOOS, Filesystem: "ntfs",
-		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, NoReplaceLink: true, SameDirectoryRename: true,
-		DirectorySync: true, CrossProcessLock: true, OccupiedRenamePreserved: true,
+		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, NoReplaceLink: true,
+		CasefoldLookup: "case-insensitive-alias", SameDirectoryRename: true, DirectorySync: true,
+		CrossProcessLock: true, OccupiedRenamePreserved: true,
 	})
 	if err != nil {
 		t.Fatal(err)

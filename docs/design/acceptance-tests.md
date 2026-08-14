@@ -68,7 +68,7 @@
 
 删除/修改与类型冲突按上表处理：Remote 类型或删除占原路径，Local 完整对象或子树进入确定冲突路径；目录副本必须包含嵌套文件、空目录和规范 mtime。冲突 leaf 在 UTF-8 边界截短并覆盖 239/240/241 bytes、exact 1024-byte path、ordinal `9→10`/`99→100`、reserved/trailing name 与 case-fold 占用。原父路径无法容纳或运行时 normal ordinal 耗尽时，公开同步矩阵覆盖根冲突目录 absent、exact Directory 复用、exact File 碰撞、case-fold alias 与并发 alias、root ordinal 9999 耗尽、多个同 basename 请求，以及 File/Directory lineage 与 inode 保留；leaf ordinal 9999 由确定性合并器边界测试覆盖。运行时跨父转换还覆盖 root create、Intent、rename、两侧父同步和 Completed 后重启。初次 merge、连续 HeadConflict 和 pending/CAS replay 必须生成相同名称、DirectoryId 与 CommitId；重复同步不新增 Commit。
 
-mtime 固定向量覆盖同 FileId 取规范 UTC 最大值、DirectoryId 仅复用 Local/Remote 时取该侧值、两侧相同或新合成时取最大值；同一整秒内不同实际纳秒且内容不变不生成新对象或 Commit，保留 mtime 的字节变化仍发布新 FileId。结构目录冲突复用逐文件 promotion，并在 Linux 上对 Intent、action、父目录同步和 Completed 等公开持久阶段执行进程崩溃重启矩阵。该结论仅覆盖 Linux 进程崩溃；断电以及 APFS/NTFS 的 ID 固定向量之外平台崩溃测试仍属后续工作。
+mtime 固定向量覆盖同 FileId 取规范 UTC 最大值、DirectoryId 仅复用 Local/Remote 时取该侧值、两侧相同或新合成时取最大值；同一整秒内不同实际纳秒且内容不变不生成新对象或 Commit，保留 mtime 的字节变化仍发布新 FileId。结构目录冲突复用逐文件 promotion，并在 Linux/ext4 与 macOS/APFS 上对 Intent、action、父目录同步和 Completed 等公开持久阶段执行进程崩溃重启矩阵。该结论不覆盖物理断电；NTFS 的平台崩溃测试仍属后续工作。
 
 ## 扫描竞态
 
@@ -154,7 +154,7 @@ FILECLOUD_RUN_1B_APFS=1 go test ./cmd/filecloud \
 
 门禁在仓库所在挂载创建专用根，通过 held worktree fd 的 `fstatfs` 确认 `Fstypename=apfs` 与 `MNT_LOCAL`，再通过 `fgetattrlist(ATTR_VOL_CAPABILITIES)` 要求 `VOL_CAP_INT_RENAME_EXCL` 和 `VOL_CAP_INT_FLOCK` 同时 valid/supported。无法确认、网络卷或缺失能力时直接失败。随后复用 1A 的完整 required-pass 清单、全仓 `go test -json ./...`、故障注入点和结构化 Oracle，不维护缩减的 APFS 套件。
 
-APFS 还必须产生额外的 `filesystem-primitives` 证明，因此精确要求 109 条结构化证明；该证明实测 no-follow、文件身份、`RENAME_EXCL` 不覆盖、同目录 rename、目录 fd 同步、独立进程排他锁和旧 fd 行为。旧 fd 在 pathname 被 checkout 替换后仍写入旧 inode，活动路径不受影响；若旧 inode 已无目录项，最后一个 fd 关闭后该延迟写可能消失，因此该行为属于明确警告边界，不是第一阶段绝对无损保证。详细 spike 与来源见 [macOS/APFS 文件系统原语 spike](../research/macos-apfs-primitives.md)。APFS 门禁证明进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
+APFS 还必须产生额外的 `filesystem-primitives` 证明，因此精确要求 109 条结构化证明；该证明实测 no-follow、文件身份、`RENAME_EXCL` 与 hard link 不覆盖、卷的大小写 lookup 模式、同目录 rename、目录 fd 同步、独立进程排他锁和旧 fd 行为。旧 fd 在 pathname 被 checkout 替换后仍写入旧 inode，活动路径不受影响；若旧 inode 已无目录项，最后一个 fd 关闭后该延迟写可能消失，因此该行为属于明确警告边界，不是第一阶段绝对无损保证。详细 spike 与来源见 [macOS/APFS 文件系统原语 spike](../research/macos-apfs-primitives.md)。APFS 门禁证明进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
 
 ## Windows/NTFS 1B 可执行门禁
 

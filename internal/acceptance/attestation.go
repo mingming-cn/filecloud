@@ -36,6 +36,7 @@ type Attestation struct {
 	StableFileIdentity        bool     `json:"stableFileIdentity,omitempty"`
 	NoReplaceRename           bool     `json:"noReplaceRename,omitempty"`
 	NoReplaceLink             bool     `json:"noReplaceLink,omitempty"`
+	CasefoldLookup            string   `json:"casefoldLookup,omitempty"`
 	SameDirectoryRename       bool     `json:"sameDirectoryRename,omitempty"`
 	DirectorySync             bool     `json:"directorySync,omitempty"`
 	CrossProcessLock          bool     `json:"crossProcessLock,omitempty"`

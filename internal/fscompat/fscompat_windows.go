@@ -20,6 +20,7 @@ const (
 	AT_REMOVEDIR        = 2
 	O_RDONLY            = 0
 	O_WRONLY            = 1
+	O_RDWR              = 2
 	O_CREAT             = 0x40
 	O_EXCL              = 0x80
 	O_DIRECTORY         = 0x10000
@@ -71,6 +72,9 @@ func Open(path string, flags int, mode uint32) (int, error) {
 	if flags&O_WRONLY != 0 {
 		access = windows.GENERIC_WRITE
 	}
+	if flags&O_RDWR != 0 {
+		access |= windows.GENERIC_WRITE
+	}
 	if flags&O_DIRECTORY != 0 {
 		access |= windows.GENERIC_WRITE
 	}
@@ -111,7 +115,7 @@ func Openat(dirfd int, path string, flags int, mode uint32) (int, error) {
 		return -1, err
 	}
 	access := uint32(windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE)
-	if flags&O_WRONLY != 0 {
+	if flags&(O_WRONLY|O_RDWR) != 0 {
 		access |= windows.FILE_WRITE_DATA | windows.FILE_WRITE_ATTRIBUTES
 	}
 	if flags&O_DELETE != 0 {

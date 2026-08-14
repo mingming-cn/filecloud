@@ -1095,6 +1095,11 @@ func TestLibraryBindRejectsWorktreeReplacementBeforeCAS(t *testing.T) {
 			environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
 			clientDir, worktree := newClientPaths(t)
 			original := worktree + ".original"
+			t.Cleanup(func() {
+				if err := os.RemoveAll(original); err != nil {
+					t.Errorf("remove original worktree: %v", err)
+				}
+			})
 			err := runLibraryWithConfig(t.Context(), bindArgs(clientDir, environment.server.URL, testClientLibraryID, worktree, testClientDeviceID)[1:],
 				strings.NewReader(environment.token+"\n"), io.Discard, io.Discard, libraryClientConfig{
 					checkFilesystem: func(*os.File) error { return nil },
@@ -1435,14 +1440,38 @@ func mustServerURL(t *testing.T, raw string) *url.URL {
 	return parsed
 }
 
-func newClientPaths(t *testing.T) (string, string) {
+func testFilesystemCaseSensitive(t *testing.T, root string) bool {
 	t.Helper()
-	clientDir := filepath.Join(t.TempDir(), "client")
-	worktree := filepath.Join(t.TempDir(), "worktree")
-	if err := os.Mkdir(worktree, 0o700); err != nil {
+	lower := filepath.Join(root, ".filecloud-case-probe")
+	upper := filepath.Join(root, ".FILECLOUD-CASE-PROBE")
+	if err := os.WriteFile(lower, []byte("lower"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return clientDir, worktree
+	defer func() {
+		if err := os.Remove(lower); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("remove case probe: %v", err)
+		}
+	}()
+	file, err := os.OpenFile(upper, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(upper); err != nil {
+		t.Fatal(err)
+	}
+	return true
+}
+
+func newClientPaths(t *testing.T) (string, string) {
+	t.Helper()
+	clientDir := filepath.Join(platformTestTempDir(t), "client")
+	return clientDir, platformTestTempDir(t)
 }
 
 func assertNoIntent(t *testing.T, clientDir string) { assertIntentCount(t, clientDir, 0) }

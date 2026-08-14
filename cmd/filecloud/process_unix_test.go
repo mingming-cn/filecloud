@@ -24,4 +24,9 @@ func assertProcessSIGKILL(t *testing.T, err error) {
 	}
 }
 
-func killTestProcess() error { return syscall.Kill(os.Getpid(), syscall.SIGKILL) }
+func killTestProcess() error {
+	if err := syscall.Kill(os.Getpid(), syscall.SIGKILL); err != nil {
+		return err
+	}
+	select {}
+}

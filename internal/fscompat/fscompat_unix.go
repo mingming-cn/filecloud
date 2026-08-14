@@ -18,6 +18,7 @@ const (
 	AT_REMOVEDIR        = unix.AT_REMOVEDIR
 	O_RDONLY            = unix.O_RDONLY
 	O_WRONLY            = unix.O_WRONLY
+	O_RDWR              = unix.O_RDWR
 	O_CREAT             = unix.O_CREAT
 	O_EXCL              = unix.O_EXCL
 	O_DIRECTORY         = unix.O_DIRECTORY

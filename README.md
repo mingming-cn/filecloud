@@ -1,6 +1,6 @@
 # filecloud
 
-面向多设备的内容寻址文件同步系统。当前已实现单节点服务端、Linux/ext4 1A 正确性闭环，以及 macOS/APFS 客户端原语和完整 1B 验收门禁；Windows/NTFS、APFS 实机验收与 1C 运维能力仍按第一阶段计划推进。
+面向多设备的内容寻址文件同步系统。当前已实现单节点服务端、Linux/ext4 1A 与 macOS/APFS 1B 正确性闭环；Windows/NTFS 和 1C 运维能力仍按第一阶段计划推进。
 
 ## 文档
 

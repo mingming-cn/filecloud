@@ -11,7 +11,10 @@ import (
 )
 
 func killObjectTestProcess() error {
-	return syscall.Kill(os.Getpid(), syscall.SIGKILL)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGKILL); err != nil {
+		return err
+	}
+	select {}
 }
 
 func assertObjectPublicationSIGKILL(t *testing.T, err error) {

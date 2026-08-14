@@ -11,7 +11,10 @@ import (
 )
 
 func killHeadTestProcess() error {
-	return syscall.Kill(os.Getpid(), syscall.SIGKILL)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGKILL); err != nil {
+		return err
+	}
+	select {}
 }
 
 func assertHeadProcessSIGKILL(t *testing.T, err error) {
