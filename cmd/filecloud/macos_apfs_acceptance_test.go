@@ -36,6 +36,20 @@ func TestMacOSAPFSAcceptanceMatrix(t *testing.T) {
 		}
 	})
 	requireMacOSAPFS(t, apfsTemp)
+	shortRoot := platformTestTempDir(t)
+	requireMacOSAPFS(t, shortRoot)
+	var acceptanceStat, shortStat unix.Stat_t
+	if err := unix.Stat(apfsTemp, &acceptanceStat); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Stat(shortRoot, &shortStat); err != nil {
+		t.Fatal(err)
+	}
+	if acceptanceStat.Dev != shortStat.Dev ||
+		testFilesystemCaseSensitive(t, apfsTemp) != testFilesystemCaseSensitive(t, shortRoot) {
+		t.Fatalf("short Darwin test root does not match acceptance filesystem: acceptance device=%d short device=%d",
+			acceptanceStat.Dev, shortStat.Dev)
+	}
 	runPlatformMatrix(t, apfsTemp, platformMatrixScenarios(), "darwin", "apfs", []string{
 		"FILECLOUD_RUN_1A=",
 		"FILECLOUD_RUN_1B_APFS=1",
@@ -61,6 +75,10 @@ func TestMacOSAPFSPrimitives(t *testing.T) {
 		}
 	})
 	requireMacOSAPFS(t, rootPath)
+	casefoldLookup := "case-sensitive-distinct"
+	if !testFilesystemCaseSensitive(t, rootPath) {
+		casefoldLookup = "case-insensitive-alias"
+	}
 	root, err := openWorktreeRoot(rootPath, requireAPFS)
 	if err != nil {
 		t.Fatal(err)
@@ -163,8 +181,9 @@ func TestMacOSAPFSPrimitives(t *testing.T) {
 
 	emitPlatformAttestation(t, platformAttestation{
 		Kind: "filesystem-primitives", Scenario: "macOS APFS primitives", Platform: runtime.GOOS, Filesystem: "apfs",
-		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, NoReplaceLink: true, SameDirectoryRename: true,
-		DirectorySync: true, CrossProcessLock: true, OldFDWritesDetached: true,
+		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, NoReplaceLink: true, CasefoldLookup: casefoldLookup,
+		SameDirectoryRename: true,
+		DirectorySync:       true, CrossProcessLock: true, OldFDWritesDetached: true,
 		Warning: "a writer holding an old file descriptor can modify the detached old inode after checkout; the active path remains the checked-out inode",
 	})
 }

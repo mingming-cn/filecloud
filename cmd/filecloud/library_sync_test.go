@@ -1887,6 +1887,9 @@ func TestLibrarySyncLongConflictNamesConverge(t *testing.T) {
 			existingRoot: "FILECLOUD CONFLICTS", existingKind: "Directory", wantRoot: "Filecloud Conflicts 2"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if test.name == "root fallback casefold alias" && !testFilesystemCaseSensitive(t, platformTestTempDir(t)) {
+				t.Skip("casefold aliases cannot coexist on this filesystem")
+			}
 			environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, commits := newSyncPair(t)
 			if test.existingRoot != "" {
 				existing := filepath.Join(publisherTree, test.existingRoot)
@@ -3954,6 +3957,9 @@ func TestLibrarySyncPromotionCollisionPreservesRacingInode(t *testing.T) {
 }
 
 func TestLibrarySyncCasefoldAliasRaceRelocatesCapturedPromotion(t *testing.T) {
+	if !testFilesystemCaseSensitive(t, platformTestTempDir(t)) {
+		t.Skip("casefold aliases cannot coexist on this filesystem")
+	}
 	longFallback := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
 		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("a", 13) + "/f"
 	for _, relative := range []string{"base", longFallback} {
@@ -4072,6 +4078,9 @@ func TestLibrarySyncCasefoldAliasRaceRelocatesCapturedPromotion(t *testing.T) {
 }
 
 func TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget(t *testing.T) {
+	if !testFilesystemCaseSensitive(t, platformTestTempDir(t)) {
+		t.Skip("casefold aliases cannot coexist on this filesystem")
+	}
 	longFallback := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
 		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("a", 13) + "/f"
 	for _, relative := range []string{"base", longFallback} {
@@ -4164,6 +4173,9 @@ func TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget(t *testing.T) {
 }
 
 func TestLibrarySyncCasefoldAliasRelocationCrashMatrix(t *testing.T) {
+	if !testFilesystemCaseSensitive(t, platformTestTempDir(t)) {
+		t.Skip("casefold aliases cannot coexist on this filesystem")
+	}
 	longFallback := strings.Repeat("a", 240) + "/" + strings.Repeat("b", 240) + "/" +
 		strings.Repeat("c", 240) + "/" + strings.Repeat("d", 240) + "/" + strings.Repeat("a", 13) + "/f"
 	cases := []struct{ relative, point string }{
@@ -5424,6 +5436,11 @@ func TestRestoreRollbackRootMtimeRejectsWrongRootBeforeStateOrFSChanges(t *testi
 				oldPath, replacementPath := worktree, ""
 				if scenario == "path replacement" {
 					oldPath = worktree + "-opened"
+					t.Cleanup(func() {
+						if err := os.RemoveAll(oldPath); err != nil {
+							t.Errorf("remove opened worktree: %v", err)
+						}
+					})
 					if err := os.Rename(worktree, oldPath); err != nil {
 						t.Fatal(err)
 					}

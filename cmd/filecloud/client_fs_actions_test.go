@@ -972,6 +972,11 @@ func TestPublicSyncRejectsRootReplacementAndCorruptJournal(t *testing.T) {
 	t.Run("root replacement", func(t *testing.T) {
 		state := newImportedBinding(t)
 		old := state.worktree + "-old"
+		t.Cleanup(func() {
+			if err := os.RemoveAll(old); err != nil {
+				t.Errorf("remove old worktree: %v", err)
+			}
+		})
 		if err := os.Rename(state.worktree, old); err != nil {
 			t.Fatal(err)
 		}
@@ -1284,7 +1289,13 @@ func TestFSJournalRootReplacementRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	root.Close()
-	if err := os.Rename(rootPath, rootPath+"-old"); err != nil {
+	oldRoot := rootPath + "-old"
+	t.Cleanup(func() {
+		if err := os.RemoveAll(oldRoot); err != nil {
+			t.Errorf("remove old root: %v", err)
+		}
+	})
+	if err := os.Rename(rootPath, oldRoot); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(rootPath, 0o700); err != nil {
@@ -1467,7 +1478,8 @@ func assertExactTree(t *testing.T, root string, before map[string]exactPathState
 	var changed []string
 	for path, want := range before {
 		got, ok := after[path]
-		if !ok || !os.SameFile(want.info, got.info) || !want.info.ModTime().Equal(got.info.ModTime()) ||
+		if !ok || !os.SameFile(want.info, got.info) ||
+			filesystemMtimeNS(want.info.ModTime()) != filesystemMtimeNS(got.info.ModTime()) ||
 			want.info.Mode() != got.info.Mode() || want.linkTarget != got.linkTarget ||
 			want.nlink != got.nlink || !bytes.Equal(want.data, got.data) {
 			changed = append(changed, fmt.Sprintf("%q: before=%v after=%v data=%q want=%q", path, want.info, got.info, got.data, want.data))
@@ -1477,6 +1489,13 @@ func assertExactTree(t *testing.T, root string, before map[string]exactPathState
 		sort.Strings(changed)
 		t.Fatalf("tree changed:\n%s", strings.Join(changed, "\n"))
 	}
+}
+
+func killTestProcess() error {
+	if err := syscall.Kill(os.Getpid(), syscall.SIGKILL); err != nil {
+		return err
+	}
+	select {}
 }
 
 func assertProcessSIGKILL(t *testing.T, err error) {
@@ -1724,10 +1743,7 @@ func TestPublicInitialCheckoutBaseCommitCrashHelper(t *testing.T) {
 	if os.Getenv("FILECLOUD_INITIAL_COMMIT_HELPER") != "1" {
 		t.Skip("subprocess helper")
 	}
-	kill := func() error {
-		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
-		return nil
-	}
+	kill := func() error { return killTestProcess() }
 	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}
 	if os.Getenv("FILECLOUD_INITIAL_COMMIT_POINT") == "before" {
 		config.beforeCheckoutBaseCommit = kill
@@ -1872,7 +1888,7 @@ func TestPublicDeepCreateZeroIdentityPreserved(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
 			publisherDir, publisherTree := newClientPaths(t)
-			parts := []string{strings.Repeat("a", 240), strings.Repeat("b", 240), strings.Repeat("c", 240), strings.Repeat("d", 240), strings.Repeat("e", 54)}
+			parts := []string{strings.Repeat("a", 240), strings.Repeat("b", 240), strings.Repeat("c", 240), strings.Repeat("d", 240), strings.Repeat("e", 16)}
 			parent := filepath.Join(append([]string{publisherTree}, parts...)...)
 			if err := os.MkdirAll(parent, 0o700); err != nil {
 				t.Fatal(err)
@@ -1913,18 +1929,33 @@ func TestPublicDeepCreateZeroIdentityPreserved(t *testing.T) {
 				t.Fatal(errors.Join(err, closeErr))
 			}
 			relativeParent, _ := splitFSActionPath(path)
-			internal := filepath.Join(worktree, filepath.FromSlash(relativeParent), name)
-			if kind == "File" {
-				if err := os.WriteFile(internal, []byte("unknown"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			mtime := time.Date(2025, 8, 9, 10, 11, 12, 0, time.UTC)
-			if err := os.Chtimes(internal, mtime, mtime); err != nil {
+			root, err := openWorktreeRoot(worktree, func(*os.File) error { return nil })
+			if err != nil {
 				t.Fatal(err)
 			}
-			before, err := os.Stat(internal)
+			actionParent, err := openFSActionParent(root, relativeParent, 0, 0)
 			if err != nil {
+				t.Fatalf("open deep action parent %q for %q: %v", relativeParent, name, errors.Join(err, root.Close()))
+			}
+			flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
+			if kind == "Directory" {
+				flags |= unix.O_DIRECTORY
+			} else {
+				flags = unix.O_RDWR | unix.O_CLOEXEC | unix.O_NOFOLLOW
+			}
+			fd, err := unix.Openat(int(actionParent.Fd()), name, flags, 0)
+			if err != nil {
+				t.Fatal(errors.Join(err, actionParent.Close(), root.Close()))
+			}
+			file := os.NewFile(uintptr(fd), name)
+			var writeErr error
+			if kind == "File" {
+				_, writeErr = file.Write([]byte("unknown"))
+			}
+			mtime := time.Date(2025, 8, 9, 10, 11, 12, 0, time.UTC)
+			mtimeErr := setFileMtime(file, mtime)
+			before, statErr := file.Stat()
+			if err := errors.Join(writeErr, mtimeErr, statErr, file.Close(), actionParent.Close(), root.Close()); err != nil {
 				t.Fatal(err)
 			}
 			leaf, err := recoveryVisibleLeaf(relativeParent, actionID, 1)
@@ -1936,19 +1967,32 @@ func TestPublicDeepCreateZeroIdentityPreserved(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), leaf) {
 				t.Fatalf("deep rollback error=%v leaf=%q", err, leaf)
 			}
-			recovered := filepath.Join(worktree, filepath.FromSlash(relativeParent), leaf)
-			after, err := os.Stat(recovered)
-			if err != nil || !os.SameFile(before, after) || !after.ModTime().UTC().Equal(mtime) || (kind == "Directory") != after.IsDir() {
-				t.Fatalf("preserved identity before=%v after=%v err=%v", before, after, err)
-			}
-			if kind == "File" {
-				if data, err := os.ReadFile(recovered); err != nil || string(data) != "unknown" {
-					t.Fatalf("preserved data=%q err=%v", data, err)
-				}
-			}
-			root, err := openWorktreeRoot(worktree, func(*os.File) error { return nil })
+			root, err = openWorktreeRoot(worktree, func(*os.File) error { return nil })
 			if err != nil {
 				t.Fatal(err)
+			}
+			actionParent, err = openFSActionParent(root, relativeParent, 0, 0)
+			if err != nil {
+				t.Fatalf("open deep recovery parent %q: %v", relativeParent, errors.Join(err, root.Close()))
+			}
+			fd, err = unix.Openat(int(actionParent.Fd()), leaf, flags, 0)
+			if err != nil {
+				t.Fatal(errors.Join(err, actionParent.Close(), root.Close()))
+			}
+			file = os.NewFile(uintptr(fd), leaf)
+			after, statErr := file.Stat()
+			var data []byte
+			var readErr error
+			if kind == "File" {
+				data, readErr = io.ReadAll(file)
+			}
+			if closeErr := errors.Join(file.Close(), actionParent.Close()); statErr != nil || readErr != nil || closeErr != nil ||
+				!os.SameFile(before, after) || !after.ModTime().UTC().Equal(mtime) || (kind == "Directory") != after.IsDir() {
+				t.Fatalf("preserved identity before=%v after=%v data=%q stat=%v read=%v close=%v",
+					before, after, data, statErr, readErr, closeErr)
+			}
+			if kind == "File" && string(data) != "unknown" {
+				t.Fatalf("preserved data=%q, want unknown", data)
 			}
 			_, scanErr := scanWorktree(root)
 			if err := errors.Join(scanErr, root.Close()); err != nil {
@@ -2801,7 +2845,7 @@ func TestPublicSyncTransactionCrashHelper(t *testing.T) {
 	}
 	fault := func(point string) error {
 		if point == os.Getenv("FILECLOUD_PUBLIC_TRANSACTION_POINT") {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return killTestProcess()
 		}
 		return nil
 	}
@@ -2911,7 +2955,7 @@ func TestPublicUnbindFSActionCrashHelper(t *testing.T) {
 	fault := func(point string, action fsAction) error {
 		if point == os.Getenv("FILECLOUD_PUBLIC_CRASH_POINT") && action.Phase == fsPhaseRollback &&
 			action.Op == os.Getenv("FILECLOUD_PUBLIC_CRASH_OP") && action.ExpectedKind == os.Getenv("FILECLOUD_PUBLIC_CRASH_KIND") {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return killTestProcess()
 		}
 		return nil
 	}
@@ -2993,7 +3037,7 @@ func TestPublicSyncFSActionCrashHelper(t *testing.T) {
 			matchedFaults++
 			matchIndex, _ := strconv.Atoi(os.Getenv("FILECLOUD_PUBLIC_CRASH_MATCH_INDEX"))
 			if matchIndex <= 1 || matchedFaults == matchIndex {
-				_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+				return killTestProcess()
 			}
 		}
 		return nil
@@ -3078,7 +3122,7 @@ func TestPublicFSActionCrashHelper(t *testing.T) {
 			matches = matches && action.Target == target
 		}
 		if matches {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return killTestProcess()
 		}
 		return nil
 	}
@@ -3174,8 +3218,7 @@ func TestFSActionCrashHelper(t *testing.T) {
 		if at != point {
 			return nil
 		}
-		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
-		return nil
+		return killTestProcess()
 	}
 	_ = executeFSAction(ctx, db, root, action, fault)
 	os.Exit(98)

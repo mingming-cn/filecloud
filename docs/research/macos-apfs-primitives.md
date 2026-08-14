@@ -1,6 +1,6 @@
 # macOS/APFS 文件系统原语 spike
 
-状态：实现与自动化门禁已落地；当前开发会话没有 macOS/APFS 主机，因此下列 APFS 运行结论必须由显式 1B 门禁在目标主机产生证明，不能由 Linux 交叉编译代替。
+状态：实现与自动化门禁已落地，并已在 macOS/APFS 实机通过完整 1B 门禁。后续平台或文件系统变更仍必须重新运行显式门禁，不能用交叉编译代替。
 
 ## 平台实现
 
@@ -9,6 +9,7 @@
 | no-follow | 每个路径段使用目录 fd + `openat(O_NOFOLLOW)`；扫描先 `fstatat(AT_SYMLINK_NOFOLLOW)`，普通文件以 `O_NONBLOCK` 打开后复核身份 | symlink、父身份变化或跨设备路径立即失败 |
 | 文件身份 | 打开的 fd 与路径均用 `(st_dev, st_ino, type, nlink)` 比较 | 任何不一致中止整轮，不收养未知 inode |
 | no-replace | checkout/cache 使用 `renameatx_np(..., RENAME_EXCL)`；服务端不可变对象发布使用同目录 `link` | 绑定通过 `fgetattrlist(ATTR_VOL_CAPABILITIES)` 要求 `VOL_CAP_INT_RENAME_EXCL` 的 valid/support 位同时存在；门禁分别实测 rename 与 hard-link 目标已存在时不覆盖 |
+| 名称大小写 | 应用始终按 Unicode 默认大小写折叠拒绝结构碰撞；APFS 卷可配置为大小写敏感或不敏感 | 门禁实测并记录 `case-sensitive-distinct` 或 `case-insensitive-alias`；需要两个物理别名共存的测试只在前者运行，后者由卷原生排他 lookup 覆盖 |
 | 同目录/跨目录 rename | 源、目标均使用已验证父目录 fd 和 leaf name | `EXDEV` 或父身份变化失败，不退化为 copy-and-replace |
 | 文件与父目录持久化 | 文件 `fsync` 后 rename，再同步受影响父目录 | 自动化只声明进程崩溃恢复；Apple 未给出 APFS 目录 fsync 的断电保证 |
 | 绑定/数据目录锁 | `flock(LOCK_EX|LOCK_NB)` | 要求 `VOL_CAP_INT_FLOCK` 的 valid/support 位；门禁用独立进程验证排他性 |
@@ -23,12 +24,15 @@
 2. rename 前后已打开文件保持同一 `(device, inode)`。
 3. 目标已存在时 `RENAME_EXCL` 返回 `EEXIST` 且不覆盖目标。
 4. 目标已存在时对象发布使用的 hard link 返回 exists 且不覆盖目标。
-5. 同目录 no-replace rename 成功。
-6. APFS 目录 fd 的 `Sync` 成功。
-7. 独立进程无法取得已经持有的排他 `flock`。
-8. 活动路径安装新 inode 后，旧 fd 写入仍修改旧 inode，不修改活动路径。
+5. 大小写变体 lookup 被实测并记录为卷的敏感/不敏感模式，且不覆盖已有文件。
+6. 同目录 no-replace rename 成功。
+7. APFS 目录 fd 的 `Sync` 成功。
+8. 独立进程无法取得已经持有的排他 `flock`。
+9. 活动路径安装新 inode 后，旧 fd 写入仍修改旧 inode，不修改活动路径。
 
-该测试输出 `filesystem-primitives` 类型的 `FILECLOUD_ATTESTATION`。macOS 1B 顶层门禁还会在同一个已验证 APFS 根上执行完整 1A 对象、扫描、checkout、故障注入、传输恢复、权限、资源限制和同步收敛矩阵；任何测试失败、非 helper skip、证明缺失/重复/平台标签错误都会使门禁失败。
+该测试输出 `filesystem-primitives` 类型的 `FILECLOUD_ATTESTATION`。macOS 1B 顶层门禁还会在同一个已验证 APFS 根上执行完整 1A 对象、扫描、checkout、故障注入、传输恢复、权限、资源限制和同步收敛矩阵；任何测试失败、证明缺失/重复或平台标签错误都会使门禁失败。非 helper skip 只有 5 个需要物理共存大小写别名的精确测试名可在 Darwin 放行，并由同次门禁的 `casefoldLookup=case-insensitive-alias` 实测证明补位；大小写敏感 APFS 不触发这些 skip。
+
+2026-08-14 的验收记录：macOS 26.5.1（Darwin 25.5.0，arm64）、Go 1.26.5、本地大小写不敏感 APFS；完整门禁耗时 496.76 秒，required-pass 与 109 条结构化证明全部通过，`casefoldLookup=case-insensitive-alias`。
 
 运行命令：
 

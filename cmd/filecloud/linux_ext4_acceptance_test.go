@@ -156,11 +156,18 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		FailurePoint: "between_create_identity", OldHead: id, CurrentHead: id,
 		ConfirmedInputDigests: []string{digest}, PreservedInputDigests: []string{digest},
 	}
+	primitives := platformAttestation{
+		Kind: "filesystem-primitives", Scenario: "primitives", Platform: "darwin", Filesystem: "apfs",
+		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, NoReplaceLink: true,
+		CasefoldLookup: "case-insensitive-alias", SameDirectoryRename: true, DirectorySync: true,
+		CrossProcessLock: true, OldFDWritesDetached: true, Warning: "old fd boundary",
+	}
 	for _, test := range []struct {
-		name         string
-		attestations []platformAttestation
-		required     map[string]string
-		wantErr      bool
+		name                 string
+		attestations         []platformAttestation
+		required             map[string]string
+		platform, filesystem string
+		wantErr              bool
 	}{
 		{name: "valid convergence", attestations: []platformAttestation{valid}, required: map[string]string{"stable": "convergence"}},
 		{name: "duplicate content is set semantics", attestations: []platformAttestation{func() platformAttestation {
@@ -171,6 +178,8 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		}()}, required: map[string]string{"stable": "convergence"}},
 		{name: "valid empty convergence", attestations: []platformAttestation{{Kind: "convergence", Scenario: "empty", Platform: "linux", Filesystem: "ext4", Head: id, SyncBase: id, HeadRoot: root, BaseRoot: root, Snapshot: root, ReachableObjects: 2}}, required: map[string]string{"empty": "convergence"}},
 		{name: "valid recovery", attestations: []platformAttestation{recovery}, required: map[string]string{"recover": "recovery"}},
+		{name: "valid APFS primitives", attestations: []platformAttestation{primitives}, required: map[string]string{"primitives": "filesystem-primitives"}, platform: "darwin", filesystem: "apfs"},
+		{name: "unknown APFS casefold lookup", attestations: []platformAttestation{func() platformAttestation { value := primitives; value.CasefoldLookup = "unknown"; return value }()}, required: map[string]string{"primitives": "filesystem-primitives"}, platform: "darwin", filesystem: "apfs", wantErr: true},
 		{name: "recovery Head drift", attestations: []platformAttestation{func() platformAttestation { value := recovery; value.CurrentHead = root; return value }()}, required: map[string]string{"recover": "recovery"}, wantErr: true},
 		{name: "recovery lost input", attestations: []platformAttestation{func() platformAttestation { value := recovery; value.PreservedInputDigests = nil; return value }()}, required: map[string]string{"recover": "recovery"}, wantErr: true},
 		{name: "unknown scenario", attestations: []platformAttestation{valid}, required: map[string]string{"other": "convergence"}, wantErr: true},
@@ -179,7 +188,11 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		{name: "missing preserved input", attestations: []platformAttestation{func() platformAttestation { value := valid; value.PreservedInputDigests = nil; return value }()}, required: map[string]string{"stable": "convergence"}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := validatePlatformAttestations(test.attestations, test.required, "linux", "ext4")
+			platform, filesystem := test.platform, test.filesystem
+			if platform == "" {
+				platform, filesystem = "linux", "ext4"
+			}
+			err := validatePlatformAttestations(test.attestations, test.required, platform, filesystem)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("validatePlatformAttestations() error=%v wantErr=%v", err, test.wantErr)
 			}
@@ -285,8 +298,10 @@ func validatePlatformAttestations(attestations []platformAttestation, required m
 				return fmt.Errorf("platform recovery attestation %q is invalid", attestation.Scenario)
 			}
 		case "filesystem-primitives":
+			validCasefold := attestation.CasefoldLookup == "case-insensitive-alias" ||
+				attestation.CasefoldLookup == "case-sensitive-distinct"
 			if !attestation.NoFollow || !attestation.StableFileIdentity || !attestation.NoReplaceRename || !attestation.NoReplaceLink ||
-				!attestation.SameDirectoryRename || !attestation.DirectorySync || !attestation.CrossProcessLock ||
+				!validCasefold || !attestation.SameDirectoryRename || !attestation.DirectorySync || !attestation.CrossProcessLock ||
 				!attestation.OldFDWritesDetached || attestation.Warning == "" {
 				return fmt.Errorf("platform filesystem-primitives attestation %q is incomplete", attestation.Scenario)
 			}
@@ -345,7 +360,7 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 	platform, filesystem string, environment []string,
 ) {
 	t.Helper()
-	command := exec.CommandContext(t.Context(), "go", "test", "-json", "./...", "-count=1", "-timeout=10m")
+	command := exec.CommandContext(t.Context(), "go", "test", "-json", "./...", "-count=1", "-timeout=20m")
 	command.Dir = filepath.Join("..", "..")
 	command.Env = append(os.Environ(),
 		append([]string{
@@ -379,7 +394,21 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 		"TestMacOSAPFSAcceptanceMatrix":                  true,
 		"TestMacOSAPFSLockHelper":                        true,
 	}
+	darwinCasefoldSkips := make(map[string]bool)
+	if platform == "darwin" {
+		for _, test := range []string{
+			"TestLibraryBindImportRejectsUnsupportedAndCollidingPaths/casefold",
+			"TestLibrarySyncLongConflictNamesConverge/root_fallback_casefold_alias",
+			"TestLibrarySyncCasefoldAliasRaceRelocatesCapturedPromotion",
+			"TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget",
+			"TestLibrarySyncCasefoldAliasRelocationCrashMatrix",
+		} {
+			allowedSkips[test] = true
+			darwinCasefoldSkips[test] = true
+		}
+	}
 	var attestations []platformAttestation
+	actualCasefoldSkips := make(map[string]bool)
 	collector := newPlatformAttestationCollector()
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	for {
@@ -394,8 +423,13 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 		if event.Action == "fail" {
 			t.Fatalf("platform test failed: package=%s test=%s\n%s", event.Package, event.Test, output)
 		}
-		if event.Action == "skip" && !allowedSkips[event.Test] {
-			t.Fatalf("platform test skipped: package=%s test=%s\n%s", event.Package, event.Test, output)
+		if event.Action == "skip" {
+			if !allowedSkips[event.Test] {
+				t.Fatalf("platform test skipped: package=%s test=%s\n%s", event.Package, event.Test, output)
+			}
+			if darwinCasefoldSkips[event.Test] {
+				actualCasefoldSkips[event.Test] = true
+			}
 		}
 		key := platformTestKey{packagePath: event.Package, test: event.Test}
 		if event.Action == "pass" {
@@ -426,6 +460,17 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 	}
 	if err := validatePlatformAttestations(attestations, requiredPlatformAttestations(platform, filesystem), platform, filesystem); err != nil {
 		t.Fatalf("platform acceptance attestations: %v\n%s", err, output)
+	}
+	if len(actualCasefoldSkips) != 0 {
+		caseInsensitiveProof := false
+		for _, attestation := range attestations {
+			caseInsensitiveProof = caseInsensitiveProof ||
+				attestation.Kind == "filesystem-primitives" && attestation.CasefoldLookup == "case-insensitive-alias"
+		}
+		if len(actualCasefoldSkips) != len(darwinCasefoldSkips) || !caseInsensitiveProof {
+			t.Fatalf("platform casefold skips=%v proof=%t, want all %d skips with case-insensitive proof",
+				actualCasefoldSkips, caseInsensitiveProof, len(darwinCasefoldSkips))
+		}
 	}
 	for _, attestation := range attestations {
 		line, err := acceptance.Encode(attestation)

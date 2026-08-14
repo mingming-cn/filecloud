@@ -380,10 +380,13 @@ func TestObjectStorePublicationCrashHelper(t *testing.T) {
 	}
 	defer closeObjectStore(t, store)
 	store.objectPublicationFault = func(actual string) error {
-		if actual == point {
-			return syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		if actual != point {
+			return nil
 		}
-		return nil
+		if err := syscall.Kill(os.Getpid(), syscall.SIGKILL); err != nil {
+			return err
+		}
+		select {}
 	}
 	data := []byte(_objectCrashNewBlock)
 	if _, err := store.PutObject(t.Context(), _objectCrashOwnerID, _objectCrashLibraryID,

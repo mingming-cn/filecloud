@@ -691,7 +691,10 @@ func TestHeadUpdateCrashHelper(t *testing.T) {
 	}
 	defer closeStore(t, store)
 	kill := func() error {
-		return syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		if err := syscall.Kill(os.Getpid(), syscall.SIGKILL); err != nil {
+			return err
+		}
+		select {}
 	}
 	config := Config{}
 	if point == "before" {
