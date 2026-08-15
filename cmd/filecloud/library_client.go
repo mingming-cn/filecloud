@@ -67,6 +67,7 @@ type libraryClientConfig struct {
 	fsActionFault                   fsActionFault
 	fsTransactionFault              func(string) error
 	fallbackOccupied                func(string) bool
+	bindingLockHeld                 bool
 }
 
 func normalizeLibraryClientConfig(config libraryClientConfig) libraryClientConfig {
@@ -141,7 +142,7 @@ func runLibraryWithConfig(ctx context.Context, args []string, stdin io.Reader, s
 	}
 	config = normalizeLibraryClientConfig(config)
 	if len(args) == 0 {
-		return errors.New("usage: filecloud library <bind|sync|unbind> [options]")
+		return errors.New("usage: filecloud library <bind|sync|watch|unbind> [options]")
 	}
 	switch args[0] {
 	case "bind":
@@ -153,6 +154,8 @@ func runLibraryWithConfig(ctx context.Context, args []string, stdin io.Reader, s
 		return bindLibrary(ctx, options, stdout, config)
 	case "sync":
 		return runLibrarySync(ctx, args[1:], stdout, stderr, config)
+	case "watch":
+		return runLibraryWatch(ctx, args[1:], stdout, stderr, config)
 	case "unbind":
 		return runLibraryUnbind(ctx, args[1:], stdout, stderr, config)
 	default:
@@ -734,6 +737,70 @@ func confirmExistingBinding(ctx context.Context, db *sql.DB, options bindOptions
 	return err
 }
 
+func runLibraryWatch(ctx context.Context, args []string, stdout, stderr io.Writer, config libraryClientConfig) (retErr error) {
+	flags := newFlagSet("library watch", stderr)
+	clientDir := flags.String("client-dir", "", "Filecloud client state directory")
+	worktree := flags.String("worktree", "", "Worktree directory")
+	interval := flags.Duration("interval", 0, "Synchronization interval")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *clientDir == "" || *worktree == "" || *interval <= 0 || flags.NArg() != 0 {
+		return errors.New("usage: filecloud library watch --client-dir path --worktree path --interval duration")
+	}
+	canonicalClientDir, err := canonicalStateDir(*clientDir)
+	if err != nil {
+		return err
+	}
+	if err := checkStateDirFilesystem(canonicalClientDir, config.checkFilesystem); err != nil {
+		return err
+	}
+	canonicalWorktree, err := canonicalExistingPath(*worktree)
+	if err != nil {
+		return err
+	}
+	databasePath := filepath.Join(canonicalClientDir, _clientDatabaseName)
+	locks, err := tryLockUnbind(ctx, canonicalClientDir, databasePath, canonicalWorktree, config)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, locks.Close()) }()
+	config.bindingLockHeld = true
+	syncArgs := []string{"--client-dir", canonicalClientDir, "--worktree", canonicalWorktree}
+	for {
+		started := time.Now()
+		roundCtx := context.WithoutCancel(ctx)
+		stopRound := func() {}
+		if deadline, ok := ctx.Deadline(); ok {
+			roundCtx, stopRound = context.WithDeadline(roundCtx, deadline)
+		}
+		err := runLibrarySync(roundCtx, syncArgs, stdout, stderr, config)
+		stopRound()
+		if err != nil {
+			if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+		remaining := *interval - time.Since(started)
+		if remaining <= 0 {
+			if _, err := fmt.Fprintf(stderr, "warning: synchronization exceeded watch interval by %s; next round postponed\n", -remaining); err != nil {
+				return fmt.Errorf("write watch delay warning: %w", err)
+			}
+			remaining = *interval
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil
+		case <-timer.C:
+		}
+	}
+}
+
 func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer, config libraryClientConfig) (retErr error) {
 	flags := newFlagSet("library sync", stderr)
 	clientDir := flags.String("client-dir", "", "Filecloud client state directory")
@@ -759,11 +826,13 @@ func runLibrarySync(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	databasePath := filepath.Join(canonicalClientDir, _clientDatabaseName)
-	locks, err := lockUnbind(ctx, canonicalClientDir, databasePath, canonicalWorktree, config)
-	if err != nil {
-		return err
+	if !config.bindingLockHeld {
+		locks, err := tryLockUnbind(ctx, canonicalClientDir, databasePath, canonicalWorktree, config)
+		if err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, locks.Close()) }()
 	}
-	defer func() { retErr = errors.Join(retErr, locks.Close()) }()
 	db, err := openClientDB(databasePath, false)
 	if err != nil {
 		return err
@@ -1010,6 +1079,14 @@ func runLibraryUnbind(ctx context.Context, args []string, stdout, stderr io.Writ
 }
 
 func lockUnbind(ctx context.Context, clientDir, databasePath, worktree string, config libraryClientConfig) (*clientLocks, error) {
+	return lockUnbindMode(ctx, clientDir, databasePath, worktree, config, true)
+}
+
+func tryLockUnbind(ctx context.Context, clientDir, databasePath, worktree string, config libraryClientConfig) (*clientLocks, error) {
+	return lockUnbindMode(ctx, clientDir, databasePath, worktree, config, false)
+}
+
+func lockUnbindMode(ctx context.Context, clientDir, databasePath, worktree string, config libraryClientConfig, wait bool) (*clientLocks, error) {
 	for {
 		serverURL, libraryID, err := readWorktreeScope(ctx, databasePath, worktree)
 		if err != nil {
@@ -1020,7 +1097,7 @@ func lockUnbind(ctx context.Context, clientDir, databasePath, worktree string, c
 			names = append(names, lockName("library\x00"+serverURL+"\x00"+libraryID))
 			sort.Strings(names)
 		}
-		locks, err := lockClientKeys(ctx, clientDir, names, config)
+		locks, err := lockClientKeysMode(ctx, clientDir, names, config, wait)
 		if err != nil {
 			return nil, err
 		}
@@ -1071,7 +1148,11 @@ func lockBinding(ctx context.Context, clientDir, worktree, serverURL, libraryID 
 	return lockClientKeys(ctx, clientDir, bindingLockNames(worktree, serverURL, libraryID), config)
 }
 
-func lockClientKeys(ctx context.Context, clientDir string, names []string, config libraryClientConfig) (_ *clientLocks, retErr error) {
+func lockClientKeys(ctx context.Context, clientDir string, names []string, config libraryClientConfig) (*clientLocks, error) {
+	return lockClientKeysMode(ctx, clientDir, names, config, true)
+}
+
+func lockClientKeysMode(ctx context.Context, clientDir string, names []string, config libraryClientConfig, wait bool) (_ *clientLocks, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("lock client state: %w", err)
 	}
@@ -1113,8 +1194,17 @@ func lockClientKeys(ctx context.Context, clientDir string, names []string, confi
 		if index == 0 && config.beforeFlock != nil {
 			config.beforeFlock()
 		}
-		if err := flockContext(ctx, file); err != nil {
-			return nil, err
+		if wait {
+			if err := flockContext(ctx, file); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := fscompat.Flock(int(file.Fd()), fscompat.LOCK_EX|fscompat.LOCK_NB); err != nil {
+			if errors.Is(err, fscompat.EWOULDBLOCK) || errors.Is(err, fscompat.EAGAIN) {
+				return nil, errors.New("binding synchronization is already running")
+			}
+			return nil, fmt.Errorf("lock client state: %w", err)
 		}
 	}
 	return locks, nil
