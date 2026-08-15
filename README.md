@@ -1,6 +1,6 @@
 # filecloud
 
-面向多设备的内容寻址文件同步系统。当前已实现单节点服务端，以及 Linux/ext4、macOS/APFS、Windows/NTFS 共用同一契约的 1B 跨平台验收门禁；1C 运维能力仍按第一阶段计划推进。
+面向多设备的内容寻址文件同步系统。当前已实现单节点服务端、Linux/ext4、macOS/APFS、Windows/NTFS 共用的 1B 跨平台验收门禁，以及 watch、离线 GC、完整性检查、健康检查、优雅停止和部署性能基线组成的 1C 运维闭环。
 
 ## 文档
 
@@ -12,6 +12,7 @@
 - [HTTP API 契约](./docs/design/http-api.md)
 - [第一阶段实施计划](./docs/design/phase-1-plan.md)
 - [第一阶段验收规范](./docs/design/acceptance-tests.md)
+- [1C 部署性能基线](./docs/operations/performance-baseline.md)
 - [架构决策](./docs/adr/)
 
 ## 验证
@@ -36,5 +37,13 @@ PowerShell 使用相同入口：
 $env:FILECLOUD_RUN_1B=1
 go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -timeout=30m -v
 ```
+
+完整 1C 运维正确性门禁与部署性能基线：
+
+```bash
+./scripts/acceptance-1c.sh
+```
+
+性能测试会创建 10000 个小文件，并完整读取一个 10 GiB 稀疏文件，默认回归测试不会运行这些昂贵场景。
 
 绑定只接受本地 ext4、APFS 或固定 NTFS。NFS、SMB、FAT/exFAT、网络映射盘和无法确认必要原子性的卷会在创建客户端状态或访问远端前明确拒绝。

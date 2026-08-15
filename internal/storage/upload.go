@@ -12,7 +12,7 @@ const (
 	_defaultUploadGlobalConcurrency = 8
 	_defaultUploadUserConcurrency   = 2
 	_defaultUploadRequestTimeout    = time.Minute
-	_defaultUploadBudgetBytes       = int64(10 << 30)
+	_defaultUploadBudgetBytes       = int64(12 << 30)
 	_defaultUploadBudgetWindow      = time.Hour
 	_minimumFreeDiskBytes           = uint64(1 << 30)
 )
