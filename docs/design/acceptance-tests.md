@@ -143,7 +143,9 @@ $env:FILECLOUD_RUN_1B=1
 go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -timeout=30m -v
 ```
 
-门禁在仓库所在挂载创建专用 `TMPDIR`，通过 held worktree fd、`statfs` 和 `/proc/self/mountinfo` 的设备号及最深挂载点共同确认 fstype 精确为 `ext4`；无法确认、ext2、ext3 或其他文件系统直接失败。随后在该根下执行完整 `go test -json ./...`，任何测试失败或非子进程 helper 的 skip 都使门禁失败；关键场景清单还必须逐项产生 pass，因此测试被删除、重命名或环境不满足时不能空匹配通过。correctness worktree、对象发布和 Head 更新的 crash data dir 均来自同一个已验证 ext4 根。
+门禁在仓库所在挂载创建专用 `TMPDIR`，通过 held worktree fd、`statfs` 和 `/proc/self/mountinfo` 的设备号及最深挂载点共同确认 fstype 精确为 `ext4`；无法确认、ext2、ext3 或其他文件系统直接失败。随后在该根下执行完整 `go test -json ./...`，任何测试失败或非子进程 helper 的具名测试 skip 都使门禁失败；`go test -json` 为无测试文件包生成的 package-level skip 没有测试名，不属于场景 skip。关键场景清单还必须逐项产生 pass，因此测试被删除、重命名或环境不满足时不能空匹配通过。correctness worktree、对象发布和 Head 更新的 crash data dir 均来自同一个已验证 ext4 根。
+
+2026-08-15 的验收记录：Linux 7.1.8-zen1-3-zen（x86_64）、Go 1.26.5、本地 ext4；完整统一门禁、required-pass 与 112 条结构化证明全部通过，固定收敛 Root 为 `746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599`，Head 为 `6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`。
 
 稳定绑定、同步、传输恢复和 checkout 崩溃恢复场景输出以 `FILECLOUD_ATTESTATION` 开头的严格 JSON 记录。门禁按精确白名单拒绝缺失、重复、未知、无法完整解码或带未知字段的记录，并分别验证 `Head == Sync Base`、`Head Root == Sync Base Root ==` 独立重扫的工作树快照、完整 Head parent 历史对象可达、确认输入摘要集合完整保留、journal 清空且无未登记内部路径。双空场景允许确认输入集合为空；100 MiB 场景以流式 SHA-256 验证内容，不在 Oracle 中重复缓存整文件。完整 bind/sync checkout 文件系统动作矩阵的每个动作和崩溃边界各自产生证明，顶层矩阵测试名也在 required-pass 清单中。对象发布和 Head 更新矩阵在每个真实子进程 `SIGKILL` 点重开存储，输出旧 Head 与当前 Head，并逐对象验证旧 Head 的 Commit、Directory、File 和 Block 仍可读。三平台门禁均精确要求 112 条结构化证明：既有收敛、可读性和 bind/sync `between_create_identity` 恢复证明，加上一条固定向量证明、两条固定双设备收敛证明和一条平台文件系统原语证明。固定向量由生产规范化、冲突命名和合并函数实际计算，并与冻结 ObjectId map 比较；固定收敛使用相同设备 ID、整秒 mtime 和提交时钟，要求两端及三平台均得到 Root `746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599` 与 Head `6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`。这些进程测试只证明进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
 

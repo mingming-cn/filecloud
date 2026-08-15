@@ -138,6 +138,30 @@ type platformTestEvent struct {
 	Output  string
 }
 
+func platformSkipAllowed(event platformTestEvent, allowed map[platformTestKey]bool) bool {
+	return event.Test == "" || allowed[platformTestKey{packagePath: event.Package, test: event.Test}]
+}
+
+func TestPlatformSkipAllowed(t *testing.T) {
+	allowed := map[platformTestKey]bool{{packagePath: "example/helpers", test: "TestCrashHelper"}: true}
+	for _, test := range []struct {
+		name  string
+		event platformTestEvent
+		want  bool
+	}{
+		{name: "package without test files", event: platformTestEvent{Action: "skip", Package: "example/no-tests"}, want: true},
+		{name: "registered helper", event: platformTestEvent{Action: "skip", Package: "example/helpers", Test: "TestCrashHelper"}, want: true},
+		{name: "same name from another package", event: platformTestEvent{Action: "skip", Package: "example/other", Test: "TestCrashHelper"}, want: false},
+		{name: "unknown named test", event: platformTestEvent{Action: "skip", Package: "example/helpers", Test: "TestUnexpected"}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := platformSkipAllowed(test.event, allowed); got != test.want {
+				t.Fatalf("platformSkipAllowed()=%t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 type platformTestKey struct {
 	packagePath string
 	test        string
@@ -420,19 +444,20 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 		required[platformTestKey{packagePath: packagePath, test: scenario.test}] = scenario
 	}
 	passed := make(map[platformTestKey]bool, len(required))
-	allowedSkips := map[string]bool{
-		"TestHeadUpdateCrashHelper":                      true,
-		"TestObjectStorePublicationCrashHelper":          true,
-		"TestPublicInitialCheckoutBaseCommitCrashHelper": true,
-		"TestPublicSyncTransactionCrashHelper":           true,
-		"TestPublicUnbindFSActionCrashHelper":            true,
-		"TestPublicSyncFSActionCrashHelper":              true,
-		"TestPublicFSActionCrashHelper":                  true,
-		"TestFSActionCrashHelper":                        true,
-		"TestCrossPlatformAcceptanceMatrix":              true,
-		"TestLinuxExt4LockHelper":                        true,
-		"TestMacOSAPFSLockHelper":                        true,
-		"TestWindowsNTFSLockHelper":                      true,
+	commandPackage := module + "cmd/filecloud"
+	allowedSkips := map[platformTestKey]bool{
+		{packagePath: module + "internal/library", test: "TestHeadUpdateCrashHelper"}:             true,
+		{packagePath: module + "internal/storage", test: "TestObjectStorePublicationCrashHelper"}: true,
+		{packagePath: commandPackage, test: "TestPublicInitialCheckoutBaseCommitCrashHelper"}:     true,
+		{packagePath: commandPackage, test: "TestPublicSyncTransactionCrashHelper"}:               true,
+		{packagePath: commandPackage, test: "TestPublicUnbindFSActionCrashHelper"}:                true,
+		{packagePath: commandPackage, test: "TestPublicSyncFSActionCrashHelper"}:                  true,
+		{packagePath: commandPackage, test: "TestPublicFSActionCrashHelper"}:                      true,
+		{packagePath: commandPackage, test: "TestFSActionCrashHelper"}:                            true,
+		{packagePath: commandPackage, test: "TestCrossPlatformAcceptanceMatrix"}:                  true,
+		{packagePath: commandPackage, test: "TestLinuxExt4LockHelper"}:                            true,
+		{packagePath: commandPackage, test: "TestMacOSAPFSLockHelper"}:                            true,
+		{packagePath: commandPackage, test: "TestWindowsNTFSLockHelper"}:                          true,
 	}
 	casefoldSkips := make(map[string]bool)
 	if platform == "darwin" || platform == "windows" {
@@ -443,7 +468,7 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 			"TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget",
 			"TestLibrarySyncCasefoldAliasRelocationCrashMatrix",
 		} {
-			allowedSkips[test] = true
+			allowedSkips[platformTestKey{packagePath: commandPackage, test: test}] = true
 			casefoldSkips[test] = true
 		}
 	}
@@ -464,7 +489,7 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 			t.Fatalf("platform test failed: package=%s test=%s\n%s", event.Package, event.Test, output)
 		}
 		if event.Action == "skip" {
-			if !allowedSkips[event.Test] {
+			if !platformSkipAllowed(event, allowedSkips) {
 				t.Fatalf("platform test skipped: package=%s test=%s\n%s", event.Package, event.Test, output)
 			}
 			if casefoldSkips[event.Test] {
