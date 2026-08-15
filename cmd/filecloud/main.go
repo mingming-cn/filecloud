@@ -52,7 +52,7 @@ func mainCode() int {
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: filecloud <init|serve|user|login|logout|library> [options]")
+		return errors.New("usage: filecloud <init|serve|gc|user|login|logout|library> [options]")
 	}
 	switch args[0] {
 	case "init":
@@ -125,6 +125,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			SourceIPKDFLimit: *sourceIPKDFCapacity,
 			UsernameKDFLimit: *usernameKDFCapacity,
 		}, uploadConfig, headConfig)
+	case "gc":
+		return runGarbageCollection(ctx, args[1:], stdout, stderr)
 	case "user":
 		return runUser(ctx, args[1:], stdin, stdout, stderr)
 	case "login":
@@ -136,6 +138,40 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runGarbageCollection(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr error) {
+	flags := flag.NewFlagSet("gc", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dataDir := flags.String("data-dir", "", "Filecloud data directory")
+	dryRun := flags.Bool("dry-run", false, "Report candidates without deleting objects")
+	gracePeriod := flags.Duration("grace-period", storage.MinimumGarbageCollectionGracePeriod, "Minimum age of unpublished objects eligible for deletion")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *dataDir == "" || flags.NArg() != 0 {
+		return errors.New("usage: filecloud gc --data-dir path [--dry-run] [--grace-period duration]")
+	}
+	if *gracePeriod < storage.MinimumGarbageCollectionGracePeriod {
+		return fmt.Errorf("gc grace period must be at least %s", storage.MinimumGarbageCollectionGracePeriod)
+	}
+	collector, err := storage.OpenGarbageCollector(ctx, *dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, collector.Close()) }()
+	report, err := collector.Collect(ctx, storage.GarbageCollectionOptions{
+		DryRun: *dryRun, GracePeriod: *gracePeriod, Now: time.Now(),
+	})
+	if err != nil {
+		return err
+	}
+	for _, stats := range report.Objects {
+		if _, err := fmt.Fprintf(stdout, "%s objects=%d bytes=%d\n", stats.Type, stats.Count, stats.Bytes); err != nil {
+			return fmt.Errorf("write gc report: %w", err)
+		}
+	}
+	return nil
 }
 
 func runUser(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {

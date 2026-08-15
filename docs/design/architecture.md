@@ -287,7 +287,7 @@ JCS 本身不做 Unicode normalization，因此名称必须先按 Unicode 15.1 N
 
 ## GC 与完整性
 
-完整历史永久可达，因此已发布 Commit 及其祖先都必须作为 GC roots。GC 标记所有 roots 的目录、文件和 blocks；未发布上传残留经过安全宽限期后才可删除。第一阶段 GC 是管理员手工离线命令，必须取得与 `serve` 互斥的数据目录独占锁，先支持 `--dry-run`。
+完整历史永久可达，因此已发布 Commit 及其祖先都必须作为 GC roots。GC 标记所有 roots 的目录、文件和 blocks；未发布上传残留经过安全宽限期后才可删除。第一阶段 GC 是管理员手工离线命令，必须取得与 `serve` 互斥的数据目录独占锁。管理员使用 `filecloud gc --data-dir <path> --dry-run` 预览，再去掉 `--dry-run` 执行；默认宽限期为 24 小时，可用 `--grace-period` 显式延长。
 
 Head 发布验证当前 Root；合并提交还验证第二 parent 首次引入发布历史的子图，但不重复扫描已经发布的永久历史。完整性检查独立于 GC，但同样是离线管理员命令并取得与 `serve` 互斥的数据目录独占锁；它遍历每个 Head 历史，重算元数据和 block 摘要并报告缺失/损坏，第一阶段不自动修复或改写 Head。
 

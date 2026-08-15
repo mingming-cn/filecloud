@@ -447,6 +447,7 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 	commandPackage := module + "cmd/filecloud"
 	allowedSkips := map[platformTestKey]bool{
 		{packagePath: module + "internal/library", test: "TestHeadUpdateCrashHelper"}:             true,
+		{packagePath: module + "internal/storage", test: "TestGarbageCollectorCrashHelper"}:       true,
 		{packagePath: module + "internal/storage", test: "TestObjectStorePublicationCrashHelper"}: true,
 		{packagePath: commandPackage, test: "TestPublicInitialCheckoutBaseCommitCrashHelper"}:     true,
 		{packagePath: commandPackage, test: "TestPublicSyncTransactionCrashHelper"}:               true,
