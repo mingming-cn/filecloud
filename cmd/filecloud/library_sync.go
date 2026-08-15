@@ -3457,7 +3457,7 @@ func openRollbackParent(root *openedWorktree, path string) (*os.File, string, bo
 	}
 	currentPath := root.path
 	for _, component := range components[:len(components)-1] {
-		next, openErr := fscompat.Openat(current, component, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+		next, openErr := openWorktreeDirectoryAt(current, component)
 		fscompat.Close(current)
 		if errors.Is(openErr, fscompat.ENOENT) {
 			return nil, "", false, nil

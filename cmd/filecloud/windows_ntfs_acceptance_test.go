@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/mingming-cn/filecloud/internal/acceptance"
@@ -58,6 +59,106 @@ func TestWindowsNTFSAcceptanceMatrix(t *testing.T) {
 // TestWindowsNTFSPrimitives exercises the handle-relative boundary. It is
 // gated because it needs a real local fixed NTFS volume and can be rejected by
 // host policy before the test body runs.
+func TestWindowsNTFSRenameVectors(t *testing.T) {
+	if os.Getenv("FILECLOUD_RUN_1B_NTFS") != "1" {
+		t.Skip("Windows/NTFS primitive gate is not enabled")
+	}
+	path, err := os.MkdirTemp(platformTestTempDir(t), ".windows-ntfs-rename-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(path) })
+	root, err := openWorktreeRoot(path, requireNTFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := os.WriteFile(filepath.Join(path, "source"), []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	longTarget := strings.Repeat("a", 240)
+	if err := renameNoReplace(int(root.directory.Fd()), "source", int(root.directory.Fd()), longTarget); err != nil {
+		t.Fatalf("rename to 240-character leaf: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(path, "directory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	childPath := filepath.Join(path, "directory", "child")
+	if err := os.WriteFile(childPath, []byte("child"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held, err := openTestHeldFile(childPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := renameNoReplace(int(root.directory.Fd()), "directory", int(root.directory.Fd()), "renamed-directory"); err == nil {
+		held.Close()
+		t.Fatal("renamed directory containing an open descendant")
+	}
+	if data, err := os.ReadFile(childPath); err != nil || string(data) != "child" {
+		held.Close()
+		t.Fatalf("occupied directory rename changed child=%q err=%v", data, err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := renameNoReplace(int(root.directory.Fd()), "directory", int(root.directory.Fd()), "renamed-directory"); err != nil {
+		t.Fatalf("rename directory after closing descendant: %v", err)
+	}
+}
+
+func TestWindowsNTFSRejectsCaseSensitiveDescendant(t *testing.T) {
+	path := t.TempDir()
+	root, err := openWorktreeRoot(path, func(*os.File) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := os.Mkdir(filepath.Join(path, "child"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	recoveryName := syncRecoveryPrefix + "child"
+	original := validateWorktreeDirectoryHandle
+	defer func() { validateWorktreeDirectoryHandle = original }()
+	marker := errors.New("case-sensitive NTFS worktree directories are unsupported")
+	calls := 0
+	validateWorktreeDirectoryHandle = func(int) error {
+		calls++
+		if calls == 2 {
+			return marker
+		}
+		return nil
+	}
+	if _, err := scanWorktree(root); !errors.Is(err, marker) {
+		t.Fatalf("scan case-sensitive child error=%v calls=%d", err, calls)
+	}
+	if err := os.Mkdir(filepath.Join(path, recoveryName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	validateWorktreeDirectoryHandle = func(int) error { return marker }
+	assertRejected := func(name string, file *os.File, err error) {
+		t.Helper()
+		if file != nil {
+			file.Close()
+		}
+		if !errors.Is(err, marker) {
+			t.Fatalf("%s case-sensitive child error=%v", name, err)
+		}
+	}
+	parent, err := openFSActionParent(root, "child", 0, 0)
+	assertRejected("action parent", parent, err)
+	parent, _, err = openCheckoutParent(root, "child/file", nil)
+	assertRejected("checkout parent", parent, err)
+	parent, _, _, err = openRollbackParent(root, "child/file")
+	assertRejected("rollback parent", parent, err)
+	parent, _, err = openRestorePromotionTargetParent(root, syncRecovery{
+		worktree: root.path, name: recoveryName, kind: "Directory", completed: true,
+	}, recoveryName+"/file")
+	assertRejected("restore promotion parent", parent, err)
+	file, err := root.openRelative("child/file")
+	assertRejected("relative reopen", file, err)
+}
+
 func TestWindowsNTFSMatrixWiresFullScenarioSet(t *testing.T) {
 	required := map[string]bool{}
 	for _, scenario := range platformMatrixScenarios() {
@@ -113,7 +214,7 @@ func TestWindowsNTFSPrimitives(t *testing.T) {
 	if data, err := os.ReadFile(filepath.Join(path, "target")); err != nil || string(data) != "target" {
 		t.Fatalf("no-replace rename changed target=%q err=%v", data, err)
 	}
-	if err := os.Symlink("target", filepath.Join(path, "link")); err != nil {
+	if err := createTestSymlink("target", filepath.Join(path, "link")); err != nil {
 		t.Fatalf("create NTFS reparse-point fixture: %v", err)
 	}
 	if fd, err := fscompat.Openat(int(root.directory.Fd()), "link", fscompat.O_RDONLY|fscompat.O_NOFOLLOW, 0); err == nil {
@@ -209,8 +310,10 @@ func verifyOccupiedRenameRecovery(t *testing.T, parent string) {
 	}
 	root, err := openWorktreeRoot(worktree, requireNTFS)
 	if err != nil {
+		db.Close()
 		t.Fatal(err)
 	}
+	worktree = root.path
 	if err := bindFSJournalRoot(ctx, db, worktree, root); err != nil {
 		t.Fatal(err)
 	}

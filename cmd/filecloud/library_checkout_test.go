@@ -515,7 +515,7 @@ func TestLibraryBindCheckoutRecoversTemporaryIdentityWindow(t *testing.T) {
 				t.Fatal(err)
 			}
 			if kind == "symlink" {
-				if err := os.Symlink("outside", temp); err != nil {
+				if err := createTestSymlink("outside", temp); err != nil {
 					t.Fatal(err)
 				}
 			} else if err := createTestFIFO(temp); err != nil {
@@ -527,7 +527,7 @@ func TestLibraryBindCheckoutRecoversTemporaryIdentityWindow(t *testing.T) {
 			}
 			assertPendingCheckout(t, clientDir, target)
 			info, statErr := os.Lstat(temp)
-			if statErr != nil || (kind == "symlink" && info.Mode()&os.ModeSymlink == 0) || (kind == "fifo" && !isTestFIFO(info)) {
+			if statErr != nil || (kind == "symlink" && !isTestReparse(info)) || (kind == "fifo" && !isTestFIFO(info)) {
 				t.Fatalf("rejected %s changed: info=%v err=%v", kind, info, statErr)
 			}
 		})
@@ -883,7 +883,7 @@ func TestLibraryBindCheckoutRecoversInstalledTargetsBeforeCompletion(t *testing.
 		if err := os.Chtimes(replacement, mtime, mtime); err != nil {
 			t.Fatal(err)
 		}
-		replacementInfo, err := os.Stat(replacement)
+		replacementIdentity, err := testPathStat(replacement)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -908,8 +908,10 @@ func TestLibraryBindCheckoutRecoversInstalledTargetsBeforeCompletion(t *testing.
 		}
 		data, readErr := os.ReadFile(targetPath)
 		info, statErr := os.Stat(targetPath)
-		if readErr != nil || statErr != nil || !bytes.Equal(data, files["top.txt"]) || !info.ModTime().UTC().Equal(mtime) || !os.SameFile(replacementInfo, info) {
-			t.Fatalf("recovered replacement changed: data=%q info=%v read=%v stat=%v", data, info, readErr, statErr)
+		targetIdentity, identityErr := testPathStat(targetPath)
+		if readErr != nil || statErr != nil || identityErr != nil || !bytes.Equal(data, files["top.txt"]) ||
+			!info.ModTime().UTC().Equal(mtime) || targetIdentity.Dev != replacementIdentity.Dev || targetIdentity.Ino != replacementIdentity.Ino {
+			t.Fatalf("recovered replacement changed: data=%q info=%v read=%v stat=%v identity=%v", data, info, readErr, statErr, identityErr)
 		}
 		assertPendingCheckout(t, clientDir, target)
 		assertNoBinding(t, clientDir, worktree)
@@ -1130,6 +1132,9 @@ func TestLibraryCheckoutPendingUnbindAllowsMissingWorktree(t *testing.T) {
 }
 
 func TestLibraryUnbindMissingWorktreeResolvesSymlinkAlias(t *testing.T) {
+	if !testCanTraverseSymlinkAlias() {
+		return
+	}
 	for _, pending := range []bool{false, true} {
 		name := "binding"
 		if pending {
@@ -1143,7 +1148,7 @@ func TestLibraryUnbindMissingWorktreeResolvesSymlinkAlias(t *testing.T) {
 				t.Fatal(err)
 			}
 			alias := filepath.Join(t.TempDir(), "alias")
-			if err := os.Symlink(realParent, alias); err != nil {
+			if err := createTestSymlink(realParent, alias); err != nil {
 				t.Fatal(err)
 			}
 			aliasWorktree := filepath.Join(alias, "missing", "worktree")
@@ -1205,7 +1210,7 @@ func TestLibraryCheckoutCacheRejectsIntermediateSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(clientDir, "objects")); err != nil {
+	if err := createTestSymlink(outside, filepath.Join(clientDir, "objects")); err != nil {
 		t.Fatal(err)
 	}
 	err := runTest(t.Context(), bindArgs(clientDir, environment.server.URL, testClientLibraryID, worktree, testOtherDeviceID),
@@ -1665,7 +1670,7 @@ func TestLibraryBindCheckoutPinsHeadAndRejectsSymlinkParent(t *testing.T) {
 		args := bindArgs(clientDir, environment.server.URL, testClientLibraryID, worktree, testOtherDeviceID)
 		err := runLibraryWithConfig(t.Context(), args[1:], strings.NewReader(environment.token+"\n"), io.Discard, io.Discard,
 			libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }, beforeCheckoutMaterialize: func() error {
-				return os.Symlink(outside, filepath.Join(worktree, "nested"))
+				return createTestSymlink(outside, filepath.Join(worktree, "nested"))
 			}})
 		if err == nil {
 			t.Fatal("checkout followed a symlink parent")

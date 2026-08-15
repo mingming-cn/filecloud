@@ -409,6 +409,9 @@ func openFSActionParent(root *openedWorktree, relative string, expectedDevice, e
 		return nil, fmt.Errorf("open filesystem action parent %q: %w", relative, err)
 	}
 	parent := os.NewFile(uintptr(fd), relative)
+	if err := validateWorktreeDirectoryHandle(fd); err != nil {
+		return nil, errors.Join(err, parent.Close())
+	}
 	var stat fscompat.Stat_t
 	if err := fscompat.Fstat(fd, &stat); err != nil {
 		return nil, errors.Join(err, parent.Close())
@@ -420,13 +423,25 @@ func openFSActionParent(root *openedWorktree, relative string, expectedDevice, e
 	return parent, nil
 }
 
+func openWorktreeDirectoryAt(parent int, name string) (int, error) {
+	fd, err := fscompat.Openat(parent, name, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	if err := validateWorktreeDirectoryHandle(fd); err != nil {
+		fscompat.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
 func openFSActionParentFallback(root *openedWorktree, relative string) (int, error) {
 	current, err := fscompat.Dup(int(root.directory.Fd()))
 	if err != nil {
 		return -1, err
 	}
 	for _, component := range strings.Split(relative, "/") {
-		next, openErr := fscompat.Openat(current, component, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+		next, openErr := openWorktreeDirectoryAt(current, component)
 		fscompat.Close(current)
 		if openErr != nil {
 			return -1, openErr
@@ -876,7 +891,7 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 				return err
 			}
 		}
-		flags := fscompat.O_RDONLY | fscompat.O_NOFOLLOW | fscompat.O_CLOEXEC
+		flags := fscompat.O_RDONLY | fscompat.O_NOFOLLOW | fscompat.O_CLOEXEC | fscompat.O_WRITEATTR
 		if value.ExpectedKind == "Directory" {
 			flags |= fscompat.O_DIRECTORY
 		}
@@ -888,6 +903,12 @@ func completeFSAction(ctx context.Context, db *sql.DB, root *openedWorktree, val
 		}
 		if err != nil {
 			return err
+		}
+		if value.ExpectedKind == "Directory" {
+			if err := validateWorktreeDirectoryHandle(fd); err != nil {
+				fscompat.Close(fd)
+				return err
+			}
 		}
 		file := os.NewFile(uintptr(fd), value.Source)
 		err = setOpenFileMtime(file, value.ExpectedMtime)
@@ -1881,8 +1902,7 @@ func openRestorePromotionTargetParent(root *openedWorktree, recovery syncRecover
 	if recovery.kind != "Directory" || components[0] != recovery.name {
 		return nil, "", errors.New("filesystem restore promotion descendant has no directory recovery owner")
 	}
-	fd, err := fscompat.Openat(int(root.directory.Fd()), recovery.name,
-		fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+	fd, err := openWorktreeDirectoryAt(int(root.directory.Fd()), recovery.name)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1893,8 +1913,7 @@ func openRestorePromotionTargetParent(root *openedWorktree, recovery syncRecover
 	}
 	current := fd
 	for _, component := range components[1 : len(components)-1] {
-		next, openErr := fscompat.Openat(current, component,
-			fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+		next, openErr := openWorktreeDirectoryAt(current, component)
 		fscompat.Close(current)
 		if openErr != nil {
 			return nil, "", openErr

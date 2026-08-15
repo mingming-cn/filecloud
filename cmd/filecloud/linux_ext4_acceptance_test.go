@@ -375,8 +375,8 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 		"TestWindowsNTFSAcceptanceMatrix":                true,
 		"TestWindowsNTFSLockHelper":                      true,
 	}
-	darwinCasefoldSkips := make(map[string]bool)
-	if platform == "darwin" {
+	casefoldSkips := make(map[string]bool)
+	if platform == "darwin" || platform == "windows" {
 		for _, test := range []string{
 			"TestLibraryBindImportRejectsUnsupportedAndCollidingPaths/casefold",
 			"TestLibrarySyncLongConflictNamesConverge/root_fallback_casefold_alias",
@@ -385,7 +385,7 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 			"TestLibrarySyncCasefoldAliasRelocationCrashMatrix",
 		} {
 			allowedSkips[test] = true
-			darwinCasefoldSkips[test] = true
+			casefoldSkips[test] = true
 		}
 	}
 	var attestations []platformAttestation
@@ -408,7 +408,7 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 			if !allowedSkips[event.Test] {
 				t.Fatalf("platform test skipped: package=%s test=%s\n%s", event.Package, event.Test, output)
 			}
-			if darwinCasefoldSkips[event.Test] {
+			if casefoldSkips[event.Test] {
 				actualCasefoldSkips[event.Test] = true
 			}
 		}
@@ -448,9 +448,9 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 			caseInsensitiveProof = caseInsensitiveProof ||
 				attestation.Kind == "filesystem-primitives" && attestation.CasefoldLookup == "case-insensitive-alias"
 		}
-		if len(actualCasefoldSkips) != len(darwinCasefoldSkips) || !caseInsensitiveProof {
+		if len(actualCasefoldSkips) != len(casefoldSkips) || !caseInsensitiveProof {
 			t.Fatalf("platform casefold skips=%v proof=%t, want all %d skips with case-insensitive proof",
-				actualCasefoldSkips, caseInsensitiveProof, len(darwinCasefoldSkips))
+				actualCasefoldSkips, caseInsensitiveProof, len(casefoldSkips))
 		}
 	}
 	for _, attestation := range attestations {

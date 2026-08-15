@@ -213,7 +213,7 @@ stateDiagram-v2
 3. 把该步骤标为 `Completed`。重启根据路径组合幂等完成或回滚，不能依赖动作恰好执行一次。create 的 kernel 动作与 identity UPDATE 之间存在不可消除窗口；若重启看到 identity 为零但精确内部 leaf 已存在，禁止收养、打开写入或删除该 inode。实现必须在同一事务中持久化 follow-up rollback rename Intent、原 action 的 `rolled_back` outcome 和 pending `rolling_back`，再 no-replace 移到普通可见 recovery leaf并同步父目录。若可见名已存在（任意类型），不得触碰任一 inode；当前 rollback action 以 `collision` 完成并在同一事务持久化带 ` 2`、` 3` 等有界后缀的 successor Intent，直到找到可用 leaf。
 4. 全部路径完成后，单事务更新路径索引和 Sync Base，再标记 checkout 完成；只有这一步后才能清理内部名称。unbind 可清理 rolled-back journal，但不得删除上述可见 recovery 内容。
 
-替换前先按 journal 把当前目标原子改为恢复名，再重新计算捕获 FileId。若不同于本轮扫描值，恢复 inode 直接改名为最终可见冲突路径，远端内容再安装到原路径；Unix 上仍持有旧 fd 的进程会继续写入这个可见冲突 inode，不需要猜测“何时稳定”。若捕获内容未变，恢复名保留到 Sync Base 事务提交后再清理；此后通过旧 fd 的延迟写不在第一阶段强保证内：Linux/ext4 与 macOS/APFS 都会让旧 fd 继续引用旧 inode，活动路径保持 checkout 后的新 inode；旧 inode 无目录项时，最后一个 fd 关闭后延迟写可能消失。用户必须避免同步期间持续写入工作目录。Windows 因占用无法 rename 时整轮失败并保留原文件；不允许退化为 copy-and-replace。当前实现接受经平台检查的本地 Linux/ext4 和 macOS/APFS；APFS 支持声明仍要求目标主机显式通过 1B 门禁。Windows/NTFS 属于未来平台工作，不声明支持。
+替换前先按 journal 把当前目标原子改为恢复名，再重新计算捕获 FileId。若不同于本轮扫描值，恢复 inode 直接改名为最终可见冲突路径，远端内容再安装到原路径；Unix 上仍持有旧 fd 的进程会继续写入这个可见冲突 inode，不需要猜测“何时稳定”。若捕获内容未变，恢复名保留到 Sync Base 事务提交后再清理；此后通过旧 fd 的延迟写不在第一阶段强保证内：Linux/ext4 与 macOS/APFS 都会让旧 fd 继续引用旧 inode，活动路径保持 checkout 后的新 inode；旧 inode 无目录项时，最后一个 fd 关闭后延迟写可能消失。用户必须避免同步期间持续写入工作目录。Windows 因占用无法 rename 时整轮失败并保留原文件；不允许退化为 copy-and-replace。当前实现接受经平台检查的本地 Linux/ext4、macOS/APFS 和 Windows/NTFS；APFS 与 NTFS 支持声明都要求目标主机显式通过对应的 1B 门禁。Windows 占用文件无法 rename 时整轮失败并保留原文件，不退化为 copy-and-replace。
 
 所有远端路径持久化成功且冲突内容已物化后，更新 Sync Base，保留冲突路径为本地未发布变化并立即开始下一轮发布。
 
@@ -261,7 +261,7 @@ JCS 本身不做 Unicode normalization，因此名称必须先按 Unicode 15.1 N
 
 ## 支持的文件系统
 
-1A 只支持本地 ext4；1B 已增加 macOS/APFS 平台实现与验收门禁，APFS 支持声明以目标主机实际通过门禁为准，NTFS 尚未实现。Linux 绑定通过 held fd、`statfs` 和 `/proc/self/mountinfo` 精确确认本地 ext4；Darwin 绑定通过 held fd 的 `fstatfs` 要求 `Fstypename=apfs`、`MNT_LOCAL`，并通过 `fgetattrlist(ATTR_VOL_CAPABILITIES)` 要求 `VOL_CAP_INT_RENAME_EXCL` 与 `VOL_CAP_INT_FLOCK` 同时 valid/supported。无法确认时拒绝，不静默降级。NFS、SMB、FAT/exFAT、网络映射盘及跨文件系统工作目录第一阶段不支持。
+1A 只支持本地 ext4；1B 已增加 macOS/APFS 与 Windows/NTFS 平台实现和验收门禁，两者的支持声明都以目标主机实际通过对应门禁为准。Linux 绑定通过 held fd、`statfs` 和 `/proc/self/mountinfo` 精确确认本地 ext4；Darwin 绑定通过 held fd 的 `fstatfs` 要求 `Fstypename=apfs`、`MNT_LOCAL`，并通过 `fgetattrlist(ATTR_VOL_CAPABILITIES)` 要求 `VOL_CAP_INT_RENAME_EXCL` 与 `VOL_CAP_INT_FLOCK` 同时 valid/supported；Windows 绑定通过 held handle 要求本地 fixed NTFS、所需 volume capabilities 和非 case-sensitive 目录，并在每个后代目录遍历时重复 case-sensitivity 检查。无法确认时拒绝，不静默降级。NFS、SMB、FAT/exFAT、网络映射盘及跨文件系统工作目录第一阶段不支持。
 
 平台 spike 必须验证 no-follow/reparse point、文件身份、原子 no-replace、同目录 rename、父目录持久化、跨进程锁和占用文件行为。文档中的 `fsync` 表示目标平台可提供的最强持久化原语；若平台无法兑现相同崩溃语义，必须在验收矩阵中明确较弱边界。
 

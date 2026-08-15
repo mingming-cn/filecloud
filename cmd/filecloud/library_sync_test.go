@@ -653,10 +653,12 @@ func TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject(t *testing.T)
 						t.Fatal(err)
 					}
 				}
-				var err error
-				held, err = os.Open(filepath.Join(root, "item/nested/new.txt"))
-				if err != nil {
-					t.Fatal(err)
+				if testCanRenameDirectoryWithHeldDescendant() {
+					var err error
+					held, err = openTestHeldFile(filepath.Join(root, "item/nested/new.txt"), false)
+					if err != nil {
+						t.Fatal(err)
+					}
 				}
 			}, assertResult: func(t *testing.T, root string) {
 				matches := conflicts(t, root, "item")
@@ -674,15 +676,17 @@ func TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject(t *testing.T)
 						t.Fatalf("directory %q info=%v err=%v", path, info, err)
 					}
 				}
-				heldInfo, heldErr := held.Stat()
-				pathInfo, pathErr := os.Stat(filepath.Join(matches[0], "nested/new.txt"))
-				if heldErr != nil || pathErr != nil || !os.SameFile(heldInfo, pathInfo) {
-					t.Fatalf("held descendant identity held=%v/%v path=%v/%v", heldInfo, heldErr, pathInfo, pathErr)
+				if held != nil {
+					heldInfo, heldErr := held.Stat()
+					pathInfo, pathErr := os.Stat(filepath.Join(matches[0], "nested/new.txt"))
+					if heldErr != nil || pathErr != nil || !os.SameFile(heldInfo, pathInfo) {
+						t.Fatalf("held descendant identity held=%v/%v path=%v/%v", heldInfo, heldErr, pathInfo, pathErr)
+					}
+					if err := held.Close(); err != nil {
+						t.Fatal(err)
+					}
+					held = nil
 				}
-				if err := held.Close(); err != nil {
-					t.Fatal(err)
-				}
-				held = nil
 			}},
 		{name: "local file remote directory", base: func(t *testing.T, root string) { write(t, root, "item.txt", "base") },
 			remote: func(t *testing.T, root string) {
@@ -2308,11 +2312,27 @@ func TestLibrarySyncConflictPromotionPreservesOpenFileIdentity(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(subscriberTree, relative), []byte("local"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			held, err := os.OpenFile(filepath.Join(subscriberTree, relative), os.O_RDWR, 0)
+			held, err := openTestHeldFile(filepath.Join(subscriberTree, relative), true)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer held.Close()
+			writeAfterPromotion := true
+			if strings.Contains(relative, "/") && !testCanRenameDirectoryWithHeldDescendant() {
+				if err := syncTestWorktree(t, subscriberDir, subscriberTree); err == nil {
+					held.Close()
+					t.Fatal("sync renamed a directory containing an open descendant")
+				}
+				if data, err := os.ReadFile(filepath.Join(subscriberTree, relative)); err != nil || string(data) != "local" {
+					held.Close()
+					t.Fatalf("occupied directory sync changed local file=%q err=%v", data, err)
+				}
+				if err := held.Close(); err != nil {
+					t.Fatal(err)
+				}
+				return
+			} else {
+				defer held.Close()
+			}
 			if err := syncTestWorktree(t, subscriberDir, subscriberTree); err != nil {
 				t.Fatal(err)
 			}
@@ -2322,14 +2342,17 @@ func TestLibrarySyncConflictPromotionPreservesOpenFileIdentity(t *testing.T) {
 			if err != nil || len(matches) != 1 {
 				t.Fatalf("conflict copies=%v err=%v", matches, err)
 			}
-			if _, err := held.WriteAt([]byte("after"), 0); err != nil {
-				t.Fatal(err)
-			}
-			if err := held.Sync(); err != nil {
-				t.Fatal(err)
+			if writeAfterPromotion {
+				if _, err := held.WriteAt([]byte("after"), 0); err != nil {
+					t.Fatal(err)
+				}
+				if err := held.Sync(); err != nil {
+					t.Fatal(err)
+				}
 			}
 			data, err := os.ReadFile(matches[0])
-			if err != nil || !strings.HasPrefix(string(data), "after") {
+			if err != nil || writeAfterPromotion && !strings.HasPrefix(string(data), "after") ||
+				!writeAfterPromotion && string(data) != "local" {
 				t.Fatalf("promoted inode=%q err=%v", data, err)
 			}
 			assertNoSyncInternalPaths(t, subscriberTree)
@@ -2368,9 +2391,9 @@ func TestLibrarySyncPromotionCrashMatrix(t *testing.T) {
 					t.Fatal(err)
 				}
 				var held *os.File
-				if point == "after_completed" {
+				if point == "after_completed" && (!strings.Contains(relative, "/") || testCanRenameDirectoryWithHeldDescendant()) {
 					var openErr error
-					held, openErr = os.OpenFile(filepath.Join(subscriberTree, relative), os.O_RDWR, 0)
+					held, openErr = openTestHeldFile(filepath.Join(subscriberTree, relative), true)
 					if openErr != nil {
 						t.Fatal(openErr)
 					}
@@ -2432,6 +2455,9 @@ func TestLibrarySyncPromotionCrashMatrix(t *testing.T) {
 }
 
 func TestLibrarySyncMutationBeforeFirstPromotionCrashMatrix(t *testing.T) {
+	if !testCanInheritHeldFile() {
+		return
+	}
 	for _, relative := range []string{"base", "nested/base"} {
 		for _, point := range []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"} {
 			t.Run(relative+"/"+point, func(t *testing.T) {
@@ -2462,7 +2488,7 @@ func TestLibrarySyncMutationBeforeFirstPromotionCrashMatrix(t *testing.T) {
 				if err := os.WriteFile(path, []byte("local"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				held, err := os.OpenFile(path, os.O_RDWR, 0)
+				held, err := openTestHeldFile(path, true)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2561,6 +2587,9 @@ func TestLibrarySyncMutationBeforeFirstPromotionCrashMatrix(t *testing.T) {
 
 func TestLibrarySyncLatePromotionCrashMatrix(t *testing.T) {
 	for _, relative := range []string{"base", "nested/base"} {
+		if strings.Contains(relative, "/") && !testCanRenameDirectoryWithHeldDescendant() {
+			continue
+		}
 		for _, point := range []string{"before_intent_commit", "after_intent_commit", "after_action", "after_parent_sync", "after_completed"} {
 			t.Run(relative+"/"+point, func(t *testing.T) {
 				environment, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
@@ -2589,7 +2618,7 @@ func TestLibrarySyncLatePromotionCrashMatrix(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(subscriberTree, relative), []byte("local"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				held, err := os.OpenFile(filepath.Join(subscriberTree, relative), os.O_RDWR, 0)
+				held, err := openTestHeldFile(filepath.Join(subscriberTree, relative), true)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2719,7 +2748,7 @@ func TestLibrarySyncLatePromotionPushesContiguousOccupiedChain(t *testing.T) {
 			if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			held, err := os.OpenFile(subscriberPath, os.O_RDWR, 0)
+			held, err := openTestHeldFile(subscriberPath, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2916,7 +2945,7 @@ func TestLibraryRejectsOrphanPromotionBeforeReplay(t *testing.T) {
 				db.Close()
 				t.Fatal(err)
 			}
-			held, err := os.Open(forgedPath)
+			held, err := openTestHeldFile(forgedPath, false)
 			if err != nil {
 				db.Close()
 				t.Fatal(err)
@@ -3290,7 +3319,7 @@ func TestDanglingPromotionLinkageRejectedWithEmptyJournal(t *testing.T) {
 			if err != nil || len(matches) != 1 {
 				t.Fatalf("promotion target=%v err=%v", matches, err)
 			}
-			held, err := os.Open(matches[0])
+			held, err := openTestHeldFile(matches[0], false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3687,7 +3716,7 @@ func TestLibrarySyncCheckoutPathFullCASRejectsStaleRows(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			held, err := os.OpenFile(filepath.Join(subscriberTree, "base"), os.O_RDWR, 0)
+			held, err := openTestHeldFile(filepath.Join(subscriberTree, "base"), true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3823,7 +3852,7 @@ func TestLibrarySyncMutationAfterRecoveryRenameIsVisible(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	held, err := os.OpenFile(filepath.Join(subscriberTree, "base"), os.O_RDWR, 0)
+	held, err := openTestHeldFile(filepath.Join(subscriberTree, "base"), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3987,7 +4016,7 @@ func TestLibrarySyncCasefoldAliasRaceRelocatesCapturedPromotion(t *testing.T) {
 				if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				held, err := os.OpenFile(subscriberPath, os.O_RDWR, 0)
+				held, err := openTestHeldFile(subscriberPath, true)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -4108,7 +4137,7 @@ func TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget(t *testing.T) {
 				if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				held, err := os.Open(subscriberPath)
+				held, err := openTestHeldFile(subscriberPath, false)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -4210,7 +4239,7 @@ func TestLibrarySyncCasefoldAliasRelocationCrashMatrix(t *testing.T) {
 			if err := os.WriteFile(subscriberPath, []byte("local"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			held, err := os.OpenFile(subscriberPath, os.O_RDWR, 0)
+			held, err := openTestHeldFile(subscriberPath, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -4278,7 +4307,7 @@ func TestLibrarySyncLateConflictBeforeFinalizeRequiresRerun(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(subscriberTree, "base"), []byte("local"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	held, err := os.OpenFile(filepath.Join(subscriberTree, "base"), os.O_RDWR, 0)
+	held, err := openTestHeldFile(filepath.Join(subscriberTree, "base"), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6011,7 +6040,7 @@ func TestLibrarySyncRemoteApplyPreservesOpenFileModification(t *testing.T) {
 	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
 		t.Fatal(err)
 	}
-	held, err := os.OpenFile(filepath.Join(subscriberTree, "base"), os.O_RDWR, 0)
+	held, err := openTestHeldFile(filepath.Join(subscriberTree, "base"), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6544,7 +6573,7 @@ func TestLibrarySyncFinalizedCleanupDetectsHeldFileWrite(t *testing.T) {
 	if err := syncTestWorktree(t, publisherDir, publisherTree); err != nil {
 		t.Fatal(err)
 	}
-	held, err := os.OpenFile(filepath.Join(subscriberTree, "base"), os.O_RDWR, 0)
+	held, err := openTestHeldFile(filepath.Join(subscriberTree, "base"), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6701,7 +6730,7 @@ func TestLegacyEmptyIndexDerivesTrackedUnsupportedPathsFromSyncBase(t *testing.T
 		name    string
 		replace func(string) error
 	}{
-		{"symlink", func(path string) error { return os.Symlink("target", path) }},
+		{"symlink", func(path string) error { return createTestSymlink("target", path) }},
 		{"fifo", func(path string) error { return createTestFIFO(path) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -6834,6 +6863,9 @@ func assertFailedScanState(t *testing.T, environment libraryCLIEnvironment, clie
 }
 
 func TestSyncWarnsAndIgnoresUntrackedUnsupportedPath(t *testing.T) {
+	if !testHasFIFO() {
+		return
+	}
 	_, clientDir, worktree, _, _, puts, _ := newSyncPair(t)
 	if err := createTestFIFO(filepath.Join(worktree, "pipe")); err != nil {
 		t.Fatal(err)

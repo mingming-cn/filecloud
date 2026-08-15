@@ -307,7 +307,7 @@ func TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly(t *testing.T) {
 		t.Fatalf("empty Directory bytes = %q, want %q", got, emptyBytes)
 	}
 	info, err := os.Stat(filepath.Join(clientDir, _clientDatabaseName))
-	if err != nil || info.Mode().Perm() != 0o600 {
+	if err != nil || !testModeMatches(info, 0o600) {
 		t.Fatalf("client database mode = %v, err=%v", info.Mode().Perm(), err)
 	}
 
@@ -733,7 +733,7 @@ func TestLibraryBindRetainsIntentAndRecoversAfterFinalizeFailure(t *testing.T) {
 	}
 	for _, name := range append([]string{_clientDatabaseName}, bindingLockNames(worktree, environment.server.URL, testClientLibraryID)...) {
 		info, err := os.Stat(filepath.Join(clientDir, name))
-		if err != nil || info.Mode().Perm() != 0o600 {
+		if err != nil || !testModeMatches(info, 0o600) {
 			t.Fatalf("%s mode = %v, err=%v", name, info.Mode().Perm(), err)
 		}
 	}
@@ -1111,7 +1111,7 @@ func TestLibraryBindRejectsWorktreeReplacementBeforeCAS(t *testing.T) {
 							return err
 						}
 						if replacement == "symlink" {
-							return os.Symlink(original, worktree)
+							return createTestSymlink(original, worktree)
 						}
 						return os.Mkdir(worktree, 0o700)
 					},

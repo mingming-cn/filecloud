@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"time"
 	"unsafe"
 
@@ -29,10 +30,11 @@ const (
 	O_NONBLOCK          = 0
 	// O_DELETE requests DELETE access without changing POSIX callers on Unix.
 	// NT rename and disposition operations require it on the source handle.
-	O_DELETE = 0x40000
-	S_IFMT   = 0xf000
-	S_IFREG  = 0x8000
-	S_IFDIR  = 0x4000
+	O_DELETE    = 0x40000
+	O_WRITEATTR = 0x80000
+	S_IFMT      = 0xf000
+	S_IFREG     = 0x8000
+	S_IFDIR     = 0x4000
 )
 
 var (
@@ -81,6 +83,9 @@ func Open(path string, flags int, mode uint32) (int, error) {
 	if flags&O_DELETE != 0 {
 		access |= windows.DELETE
 	}
+	if flags&O_WRITEATTR != 0 {
+		access |= windows.GENERIC_WRITE
+	}
 	disposition := uint32(windows.OPEN_EXISTING)
 	if flags&O_CREAT != 0 && flags&O_EXCL != 0 {
 		disposition = windows.CREATE_NEW
@@ -88,16 +93,13 @@ func Open(path string, flags int, mode uint32) (int, error) {
 	if flags&O_CREAT != 0 && flags&O_EXCL == 0 {
 		disposition = windows.OPEN_ALWAYS
 	}
-	attributes := uint32(windows.FILE_ATTRIBUTE_NORMAL)
-	if flags&O_DIRECTORY != 0 {
-		attributes |= windows.FILE_FLAG_BACKUP_SEMANTICS
-	}
+	attributes := uint32(windows.FILE_ATTRIBUTE_NORMAL | windows.FILE_FLAG_BACKUP_SEMANTICS)
 	if flags&O_NOFOLLOW != 0 {
 		attributes |= windows.FILE_FLAG_OPEN_REPARSE_POINT
 	}
 	h, err := windows.CreateFile(name, access, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, disposition, attributes, 0)
 	if err != nil {
-		return -1, err
+		return -1, fmt.Errorf("CreateFile %q: %w", path, err)
 	}
 	if err := rejectReparse(h); err != nil {
 		windows.CloseHandle(h)
@@ -110,7 +112,7 @@ func Open(path string, flags int, mode uint32) (int, error) {
 // resolves name relative to RootDirectory and OBJ_DONT_REPARSE prevents an
 // intermediate junction or symlink from escaping that verified parent.
 func Openat(dirfd int, path string, flags int, mode uint32) (int, error) {
-	name, err := windows.NewNTUnicodeString(path)
+	name, err := windows.NewNTUnicodeString(filepath.FromSlash(path))
 	if err != nil {
 		return -1, err
 	}
@@ -120,6 +122,9 @@ func Openat(dirfd int, path string, flags int, mode uint32) (int, error) {
 	}
 	if flags&O_DELETE != 0 {
 		access |= windows.DELETE
+	}
+	if flags&O_WRITEATTR != 0 {
+		access |= windows.GENERIC_WRITE
 	}
 	if flags&O_DIRECTORY != 0 {
 		access |= windows.FILE_LIST_DIRECTORY | windows.GENERIC_WRITE
@@ -142,7 +147,7 @@ func Openat(dirfd int, path string, flags int, mode uint32) (int, error) {
 	var status windows.IO_STATUS_BLOCK
 	if err := windows.NtCreateFile(&h, access, &oa, &status, nil, 0,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, disposition, options, 0, 0); err != nil {
-		return -1, NormalizeError(err)
+		return -1, fmt.Errorf("NtCreateFile %q: %w", path, NormalizeError(err))
 	}
 	if err := rejectReparse(h); err != nil {
 		windows.CloseHandle(h)
@@ -209,11 +214,11 @@ func Dup(fd int) (int, error) {
 	return int(duplicate), nil
 }
 
-// OpenDirectoryEnumeration opens '.' relative to the verified parent instead
-// of duplicating a handle with an existing directory cursor. Windows directory
-// enumeration state is handle-local and does not support Unix Seek(0) reset.
+// OpenDirectoryEnumeration duplicates the verified directory handle. Windows
+// starts a fresh directory query for a newly wrapped duplicate and does not
+// support the Unix Seek(0) reset used by the Unix implementation.
 func OpenDirectoryEnumeration(fd int, name string) (*os.File, error) {
-	directory, err := Openat(fd, ".", O_RDONLY|O_DIRECTORY|O_NOFOLLOW, 0)
+	directory, err := Dup(fd)
 	if err != nil {
 		return nil, err
 	}
@@ -264,6 +269,7 @@ func Fchmod(fd int, mode uint32) error {
 	}
 	return nil
 }
+func SyncFile(fd int) error      { return windows.FlushFileBuffers(windows.Handle(fd)) }
 func SyncDirectory(fd int) error { return windows.FlushFileBuffers(windows.Handle(fd)) }
 
 func Flock(fd int, operation int) error {
@@ -281,8 +287,11 @@ func Flock(fd int, operation int) error {
 // compares with errors.Is (for example ERROR_FILE_NOT_FOUND and ERROR_SHARING_VIOLATION).
 func NormalizeError(err error) error {
 	var status windows.NTStatus
-	if errors.As(err, &status) {
-		return status.Errno()
+	if !errors.As(err, &status) {
+		return err
 	}
-	return err
+	if status == windows.STATUS_OBJECT_NAME_COLLISION || status == windows.STATUS_OBJECT_NAME_EXISTS {
+		return EEXIST
+	}
+	return status.Errno()
 }

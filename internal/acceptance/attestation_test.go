@@ -8,6 +8,7 @@ import (
 func TestActivePlatformRequiresExplicitGate(t *testing.T) {
 	t.Setenv("FILECLOUD_RUN_1A", "")
 	t.Setenv("FILECLOUD_RUN_1B_APFS", "")
+	t.Setenv("FILECLOUD_RUN_1B_NTFS", "")
 	if platform, filesystem, enabled := ActivePlatform(); enabled || platform != "" || filesystem != "" {
 		t.Fatalf("inactive platform = %q/%q enabled=%t", platform, filesystem, enabled)
 	}

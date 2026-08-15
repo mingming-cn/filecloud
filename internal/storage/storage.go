@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -232,7 +233,7 @@ func ensureLayout(dataDir string, syncDir func(string) error) error {
 }
 
 func openDB(path string) (*sql.DB, error) {
-	u := &url.URL{Scheme: "file", Path: path}
+	u := &url.URL{Scheme: "file", Path: sqliteURLPath(path)}
 	query := u.Query()
 	query.Add("_pragma", "foreign_keys(1)")
 	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", _busyTimeoutMillis))
@@ -247,6 +248,14 @@ func openDB(path string) (*sql.DB, error) {
 		return nil, errors.Join(fmt.Errorf("ping metadata database: %w", err), db.Close())
 	}
 	return db, nil
+}
+
+func sqliteURLPath(path string) string {
+	value := filepath.ToSlash(path)
+	if filepath.VolumeName(path) != "" && !strings.HasPrefix(value, "/") {
+		return "/" + value
+	}
+	return value
 }
 
 type migration struct {

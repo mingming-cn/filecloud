@@ -187,7 +187,7 @@ func TestScanCanonicalMtimeIgnoresSubsecondPrecisionButNotContent(t *testing.T) 
 
 func TestScanTrackedSymlinkIsFatal(t *testing.T) {
 	root, path := newScannerTestRoot(t, nil)
-	if err := os.Symlink("target", path("tracked")); err != nil {
+	if err := createTestSymlink("target", path("tracked")); err != nil {
 		t.Fatal(err)
 	}
 	_, err := scanWorktreeWithConfig(root, worktreeScanConfig{trackedPaths: map[string]bool{"tracked": true},
@@ -198,6 +198,9 @@ func TestScanTrackedSymlinkIsFatal(t *testing.T) {
 }
 
 func TestScanIgnoresUntrackedFIFOWithWarning(t *testing.T) {
+	if !testHasFIFO() {
+		return
+	}
 	root, path := newScannerTestRoot(t, map[string]string{"file": "data"})
 	if err := createTestFIFO(path("pipe")); err != nil {
 		t.Fatal(err)

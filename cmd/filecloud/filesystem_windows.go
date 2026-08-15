@@ -56,16 +56,25 @@ func requireNTFS(directory *os.File) error {
 	if flags&_requiredNTFSVolumeFlags != _requiredNTFSVolumeFlags {
 		return fmt.Errorf("unsupported NTFS capabilities 0x%x; reparse points, hard links, persistent ACLs, and Unicode are required", flags)
 	}
+	if err := validateWorktreeDirectoryHandle(int(directory.Fd())); err != nil {
+		return err
+	}
+	if err := fscompat.SyncDirectory(int(directory.Fd())); err != nil {
+		return fmt.Errorf("verify NTFS directory persistence: %w", err)
+	}
+	return nil
+}
+
+var validateWorktreeDirectoryHandle = validateNTFSWorktreeDirectoryHandle
+
+func validateNTFSWorktreeDirectoryHandle(fd int) error {
 	var caseInfo uint32
-	if err := windows.GetFileInformationByHandleEx(windows.Handle(directory.Fd()), windows.FileCaseSensitiveInfo,
+	if err := windows.GetFileInformationByHandleEx(windows.Handle(fd), windows.FileCaseSensitiveInfo,
 		(*byte)(unsafe.Pointer(&caseInfo)), uint32(unsafe.Sizeof(caseInfo))); err != nil {
 		return fmt.Errorf("inspect NTFS case-sensitivity: %w", err)
 	}
 	if caseInfo&windows.FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0 {
 		return errors.New("case-sensitive NTFS worktree directories are unsupported")
-	}
-	if err := fscompat.SyncDirectory(int(directory.Fd())); err != nil {
-		return fmt.Errorf("verify NTFS directory persistence: %w", err)
 	}
 	return nil
 }

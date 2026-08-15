@@ -57,8 +57,8 @@ func TestInitCreatesLayoutAndSchemaIdempotently(t *testing.T) {
 		if !info.IsDir() {
 			t.Errorf("%s is not a directory", name)
 		}
-		if got := info.Mode().Perm(); got != 0o700 {
-			t.Errorf("%s mode = %o, want 700", name, got)
+		if !testModeMatches(info, 0o700) {
+			t.Errorf("%s mode = %o, want 700", name, info.Mode().Perm())
 		}
 	}
 	for _, name := range []string{_databaseName, _lockName} {
@@ -66,8 +66,8 @@ func TestInitCreatesLayoutAndSchemaIdempotently(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat %s: %v", name, err)
 		}
-		if got := info.Mode().Perm(); got != 0o600 {
-			t.Errorf("%s mode = %o, want 600", name, got)
+		if !testModeMatches(info, 0o600) {
+			t.Errorf("%s mode = %o, want 600", name, info.Mode().Perm())
 		}
 	}
 
@@ -175,8 +175,8 @@ func TestInitRepairsPermissiveModes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat %s: %v", item.path, err)
 		}
-		if got := info.Mode().Perm(); got != item.want {
-			t.Errorf("%s mode = %o, want %o", item.path, got, item.want)
+		if !testModeMatches(info, item.want) {
+			t.Errorf("%s mode = %o, want %o", item.path, info.Mode().Perm(), item.want)
 		}
 	}
 }

@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"time"
 	"unsafe"
@@ -38,7 +39,7 @@ func renameNoReplace(sourceParent int, source string, targetParent int, target s
 	}
 	name = name[:len(name)-1]
 	var prototype _fileRenameInformation
-	size := int(unsafe.Offsetof(prototype.FileName)) + len(name)*2
+	size := max(int(unsafe.Sizeof(prototype)), int(unsafe.Offsetof(prototype.FileName))+len(name)*2)
 	buffer := make([]byte, size)
 	info := (*_fileRenameInformation)(unsafe.Pointer(&buffer[0]))
 	info.RootDirectory = windows.Handle(targetParent)
@@ -49,7 +50,10 @@ func renameNoReplace(sourceParent int, source string, targetParent int, target s
 	if errors.Is(err, windows.STATUS_OBJECT_NAME_COLLISION) || errors.Is(err, windows.STATUS_OBJECT_NAME_EXISTS) {
 		return fscompat.EEXIST
 	}
-	return fscompat.NormalizeError(err)
+	if err != nil {
+		return fmt.Errorf("rename %q to %q (%d UTF-16 units): %w", source, target, len(name), fscompat.NormalizeError(err))
+	}
+	return nil
 }
 
 func filesystemMtimeNS(value time.Time) int64 { return value.UnixNano() }

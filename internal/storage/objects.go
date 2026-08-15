@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mingming-cn/filecloud/internal/fscompat"
 	"github.com/mingming-cn/filecloud/internal/object"
 )
 
@@ -359,9 +360,9 @@ func (s *Store) mkdirObjectPath(path string) error {
 }
 
 func syncDirectory(path string) error {
-	directory, err := os.Open(path)
+	fd, err := fscompat.Open(path, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("open object directory: %w", err)
 	}
-	return errors.Join(directory.Sync(), directory.Close())
+	return errors.Join(fscompat.SyncDirectory(fd), fscompat.Close(fd))
 }

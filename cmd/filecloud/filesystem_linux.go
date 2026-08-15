@@ -17,6 +17,8 @@ func requireSupportedFilesystem(directory *os.File) error {
 	return requireExt4(directory)
 }
 
+var validateWorktreeDirectoryHandle = func(int) error { return nil }
+
 func requireExt4(directory *os.File) error {
 	var info syscall.Statfs_t
 	if err := syscall.Fstatfs(int(directory.Fd()), &info); err != nil {

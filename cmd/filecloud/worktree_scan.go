@@ -145,6 +145,9 @@ func readDirectoryNames(directory *os.File, count int) ([]string, error) {
 }
 
 func (session *scanSession) scanDirectory(directory *os.File, relative string) (string, error) {
+	if err := validateWorktreeDirectoryHandle(int(directory.Fd())); err != nil {
+		return "", fmt.Errorf("inspect worktree directory %q: %w", relative, err)
+	}
 	before, err := stateOf(directory)
 	if err != nil {
 		return "", fmt.Errorf("inspect directory %q: %w", relative, err)
@@ -281,13 +284,14 @@ func inspectAt(directory *os.File, name, path string) (fileState, string, error)
 }
 
 func openListedAt(directory *os.File, listed listedEntry, path string) (*os.File, fileState, error) {
-	flags := fscompat.O_RDONLY | fscompat.O_NOFOLLOW | fscompat.O_CLOEXEC
+	var fd int
+	var err error
 	if listed.kind == "Directory" {
-		flags |= fscompat.O_DIRECTORY
+		fd, err = openWorktreeDirectoryAt(int(directory.Fd()), listed.name)
 	} else {
-		flags |= fscompat.O_NONBLOCK
+		fd, err = fscompat.Openat(int(directory.Fd()), listed.name,
+			fscompat.O_RDONLY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC|fscompat.O_NONBLOCK, 0)
 	}
-	fd, err := fscompat.Openat(int(directory.Fd()), listed.name, flags, 0)
 	if err != nil {
 		return nil, fileState{}, fmt.Errorf("open worktree path %q without following links: %w", path, err)
 	}
@@ -612,13 +616,14 @@ func (root *openedWorktree) openRelative(relative string) (*os.File, error) {
 	}
 	components := strings.Split(relative, "/")
 	for index, component := range components {
-		flags := fscompat.O_RDONLY | fscompat.O_NOFOLLOW | fscompat.O_CLOEXEC
+		var next int
+		var openErr error
 		if index < len(components)-1 {
-			flags |= fscompat.O_DIRECTORY
+			next, openErr = openWorktreeDirectoryAt(current, component)
 		} else {
-			flags |= fscompat.O_NONBLOCK
+			next, openErr = fscompat.Openat(current, component,
+				fscompat.O_RDONLY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC|fscompat.O_NONBLOCK, 0)
 		}
-		next, openErr := fscompat.Openat(current, component, flags, 0)
 		fscompat.Close(current)
 		if openErr != nil {
 			return nil, fmt.Errorf("reopen worktree path %q: %w", relative, openErr)

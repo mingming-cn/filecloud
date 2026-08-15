@@ -24,6 +24,8 @@ func requireSupportedFilesystem(directory *os.File) error {
 	return requireAPFS(directory)
 }
 
+var validateWorktreeDirectoryHandle = func(int) error { return nil }
+
 func requireAPFS(directory *os.File) error {
 	filesystem, local, err := apfsFilesystemForDirectory(directory)
 	if err != nil {

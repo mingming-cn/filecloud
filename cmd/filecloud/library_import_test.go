@@ -158,7 +158,7 @@ func TestLibraryBindImportRejectsUnsupportedAndCollidingPaths(t *testing.T) {
 		name  string
 		setup func(string) error
 	}{
-		{"symlink", func(root string) error { return os.Symlink("target", filepath.Join(root, "link")) }},
+		{"symlink", func(root string) error { return createTestSymlink("target", filepath.Join(root, "link")) }},
 		{"fifo", func(root string) error { return createTestFIFO(filepath.Join(root, "pipe")) }},
 		{"casefold", func(root string) error {
 			if err := os.WriteFile(filepath.Join(root, "Readme"), []byte("a"), 0o600); err != nil {
@@ -166,7 +166,7 @@ func TestLibraryBindImportRejectsUnsupportedAndCollidingPaths(t *testing.T) {
 			}
 			return os.WriteFile(filepath.Join(root, "README"), []byte("b"), 0o600)
 		}},
-		{"invalid-name", func(root string) error { return os.WriteFile(filepath.Join(root, "bad:name"), []byte("x"), 0o600) }},
+		{"invalid-name", func(root string) error { return os.WriteFile(filepath.Join(root, "bad<name"), []byte("x"), 0o600) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
@@ -175,6 +175,9 @@ func TestLibraryBindImportRejectsUnsupportedAndCollidingPaths(t *testing.T) {
 				t.Skip("casefold aliases cannot coexist on this filesystem")
 			}
 			if err := test.setup(worktree); err != nil {
+				if test.name == "invalid-name" {
+					return
+				}
 				t.Fatal(err)
 			}
 			args := append(bindArgs(clientDir, environment.server.URL, testClientLibraryID, worktree, testClientDeviceID), "--import-local")

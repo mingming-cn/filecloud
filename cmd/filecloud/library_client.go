@@ -2791,8 +2791,8 @@ func openWorktreeRoot(path string, checkFilesystem func(*os.File) error) (*opene
 }
 
 func (root *openedWorktree) validateIdentity() error {
-	current := string(filepath.Separator)
-	for _, component := range strings.Split(strings.TrimPrefix(root.path, string(filepath.Separator)), string(filepath.Separator)) {
+	current := filepath.VolumeName(root.path) + string(filepath.Separator)
+	for _, component := range strings.Split(strings.TrimPrefix(root.path, current), string(filepath.Separator)) {
 		if component == "" {
 			continue
 		}
@@ -2943,7 +2943,7 @@ func pathWithin(parent, child string) bool {
 }
 
 func openClientDB(path string, readOnly bool) (*sql.DB, error) {
-	u := &url.URL{Scheme: "file", Path: path}
+	u := &url.URL{Scheme: "file", Path: sqliteClientURLPath(path)}
 	query := u.Query()
 	query.Set("_busy_timeout", "5000")
 	query.Set("_synchronous", "full")
@@ -2966,6 +2966,14 @@ func openClientDB(path string, readOnly bool) (*sql.DB, error) {
 		return nil, errors.Join(fmt.Errorf("ping client database: %w", err), db.Close())
 	}
 	return db, nil
+}
+
+func sqliteClientURLPath(path string) string {
+	value := filepath.ToSlash(path)
+	if filepath.VolumeName(path) != "" && !strings.HasPrefix(value, "/") {
+		return "/" + value
+	}
+	return value
 }
 
 type sqliteErrorCoder interface{ Code() int }
@@ -3010,19 +3018,19 @@ func assertClientDBDurability(ctx context.Context, db *sql.DB) error {
 }
 
 func syncFile(path string) error {
-	file, err := os.Open(path)
+	fd, err := fscompat.Open(path, fscompat.O_RDWR|fscompat.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("open client state for sync: %w", err)
 	}
-	return errors.Join(file.Sync(), file.Close())
+	return errors.Join(fscompat.SyncFile(fd), fscompat.Close(fd))
 }
 
 func syncDirectory(path string) error {
-	directory, err := os.Open(path)
+	fd, err := fscompat.Open(path, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("open client state parent: %w", err)
 	}
-	return errors.Join(directory.Sync(), directory.Close())
+	return errors.Join(fscompat.SyncDirectory(fd), fscompat.Close(fd))
 }
 
 func validClientUUID(value string) bool {

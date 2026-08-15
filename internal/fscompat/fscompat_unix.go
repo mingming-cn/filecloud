@@ -26,6 +26,7 @@ const (
 	O_CLOEXEC           = unix.O_CLOEXEC
 	O_NONBLOCK          = unix.O_NONBLOCK
 	O_DELETE            = 0
+	O_WRITEATTR         = 0
 	S_IFMT              = unix.S_IFMT
 	S_IFREG             = unix.S_IFREG
 	S_IFDIR             = unix.S_IFDIR
@@ -55,6 +56,7 @@ func Unlinkat(dirfd int, path string, flags int) error  { return unix.Unlinkat(d
 func Ftruncate(fd int, size int64) error                { return unix.Ftruncate(fd, size) }
 func Fchmod(fd int, mode uint32) error                  { return unix.Fchmod(fd, mode) }
 func Flock(fd int, operation int) error                 { return unix.Flock(fd, operation) }
+func SyncFile(fd int) error                             { return unix.Fsync(fd) }
 func SyncDirectory(fd int) error                        { return unix.Fsync(fd) }
 
 // OpenDirectoryEnumeration returns a separate directory description so each

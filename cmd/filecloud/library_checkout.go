@@ -800,7 +800,7 @@ func installCheckoutDirectory(ctx context.Context, db *sql.DB, options bindOptio
 	}
 	defer parent.Close()
 
-	targetFD, targetErr := fscompat.Openat(int(parent.Fd()), targetName, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+	targetFD, targetErr := openWorktreeDirectoryAt(int(parent.Fd()), targetName)
 	if targetErr == nil {
 		target := os.NewFile(uintptr(targetFD), value.path)
 		defer target.Close()
@@ -837,7 +837,7 @@ func installCheckoutDirectory(ctx context.Context, db *sql.DB, options bindOptio
 			return errors.Join(errors.New("created checkout directory has no durable identity"), err)
 		}
 	}
-	tempFD, err := fscompat.Openat(int(parent.Fd()), tempName, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+	tempFD, err := openWorktreeDirectoryAt(int(parent.Fd()), tempName)
 	if err != nil {
 		return fmt.Errorf("open checkout temporary directory without following links: %w", err)
 	}
@@ -1059,7 +1059,7 @@ func openCheckoutParent(root *openedWorktree, path string, verify checkoutDirect
 	}
 	relative := ""
 	for _, component := range components[:len(components)-1] {
-		next, openErr := fscompat.Openat(current, component, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+		next, openErr := openWorktreeDirectoryAt(current, component)
 		fscompat.Close(current)
 		if openErr != nil {
 			return nil, "", fmt.Errorf("open checkout parent for %q: %w", path, openErr)
@@ -1092,7 +1092,7 @@ func setCheckoutMtime(ctx context.Context, db *sql.DB, options bindOptions, valu
 		return err
 	}
 	defer parent.Close()
-	fd, err := fscompat.Openat(int(parent.Fd()), name, fscompat.O_RDONLY|fscompat.O_DIRECTORY|fscompat.O_NOFOLLOW|fscompat.O_CLOEXEC, 0)
+	fd, err := openWorktreeDirectoryAt(int(parent.Fd()), name)
 	if err != nil {
 		return fmt.Errorf("open checkout directory for mtime %q: %w", value.path, err)
 	}

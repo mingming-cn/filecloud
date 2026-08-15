@@ -911,7 +911,7 @@ func TestFSActionRejectsSymlinkParentAndCrossMount(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(rootPath, "real"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("real", filepath.Join(rootPath, "link")); err != nil {
+	if err := createTestSymlink("real", filepath.Join(rootPath, "link")); err != nil {
 		t.Fatal(err)
 	}
 	root, err := openWorktreeRoot(rootPath, func(*os.File) error { return nil })
@@ -1428,10 +1428,11 @@ func assertCreateRolledBackState(t *testing.T, clientDir, worktree string) {
 }
 
 type exactPathState struct {
-	info       os.FileInfo
-	data       []byte
-	linkTarget string
-	nlink      uint64
+	info          os.FileInfo
+	data          []byte
+	linkTarget    string
+	device, inode uint64
+	nlink         uint64
 }
 
 func captureExactTree(t *testing.T, root string) map[string]exactPathState {
@@ -1447,7 +1448,7 @@ func captureExactTree(t *testing.T, root string) map[string]exactPathState {
 		}
 		state := exactPathState{info: info}
 		if stat, statErr := testPathStat(path); statErr == nil {
-			state.nlink = uint64(stat.Nlink)
+			state.device, state.inode, state.nlink = uint64(stat.Dev), stat.Ino, uint64(stat.Nlink)
 		}
 		if info.Mode().IsRegular() {
 			state.data, err = os.ReadFile(path)
@@ -1475,11 +1476,14 @@ func assertExactTree(t *testing.T, root string, before map[string]exactPathState
 	var changed []string
 	for path, want := range before {
 		got, ok := after[path]
-		if !ok || !os.SameFile(want.info, got.info) ||
+		if !ok || want.device != got.device || want.inode != got.inode ||
 			filesystemMtimeNS(want.info.ModTime()) != filesystemMtimeNS(got.info.ModTime()) ||
 			want.info.Mode() != got.info.Mode() || want.linkTarget != got.linkTarget ||
 			want.nlink != got.nlink || !bytes.Equal(want.data, got.data) {
-			changed = append(changed, fmt.Sprintf("%q: before=%v after=%v data=%q want=%q", path, want.info, got.info, got.data, want.data))
+			changed = append(changed, fmt.Sprintf("%q: before=%v after=%v same=%t mtime=%d/%d mode=%v/%v nlink=%d/%d link=%q/%q data=%q want=%q",
+				path, want.info, got.info, ok && want.device == got.device && want.inode == got.inode, filesystemMtimeNS(want.info.ModTime()),
+				filesystemMtimeNS(got.info.ModTime()), want.info.Mode(), got.info.Mode(), want.nlink, got.nlink,
+				want.linkTarget, got.linkTarget, got.data, want.data))
 		}
 	}
 	if len(changed) != 0 {
@@ -2035,7 +2039,7 @@ func installZeroIdentityReplacement(t *testing.T, internal, replacement string) 
 			t.Fatal(err)
 		}
 		if replacement == "symlink" {
-			if err := os.Symlink(outside, internal); err != nil {
+			if err := createTestSymlink(outside, internal); err != nil {
 				t.Fatal(err)
 			}
 		} else if err := os.Link(outside, internal); err != nil {
@@ -2074,6 +2078,9 @@ func assertZeroIdentityJournalsCleared(t *testing.T, clientDir, worktree string)
 
 func TestPublicCreateZeroIdentityTypeChangedEntryPreserved(t *testing.T) {
 	for _, test := range zeroIdentityReplacementCases {
+		if test.replacement == "symlink" && !testCanRenameReparsePoint() {
+			continue
+		}
 		t.Run(test.name, func(t *testing.T) {
 			environment, _, _, _ := importedRemoteCheckout(t)
 			clientDir, worktree := newClientPaths(t)
@@ -2308,6 +2315,9 @@ func TestPublicSyncZeroIdentityCreateAutoRollback(t *testing.T) {
 
 func TestPublicSyncZeroIdentityTypeChangedEntryPreserved(t *testing.T) {
 	for _, test := range zeroIdentityReplacementCases {
+		if test.replacement == "symlink" && !testCanRenameReparsePoint() {
+			continue
+		}
 		t.Run(test.name, func(t *testing.T) {
 			_, publisherDir, publisherTree, subscriberDir, subscriberTree, _, _ := newSyncPair(t)
 			beforeBase := readTestBinding(t, subscriberDir, subscriberTree)
@@ -3210,7 +3220,7 @@ func TestFSActionRemoveIntentPreservesOldFDModification(t *testing.T) {
 	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	held, err := os.OpenFile(path, os.O_RDWR, 0)
+	held, err := openTestHeldFile(path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
