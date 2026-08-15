@@ -1,8 +1,8 @@
 # Windows/NTFS filesystem primitive spike
 
-Status: the Windows gate is intentionally opt-in and must run on a local fixed
-NTFS checkout. Linux-hosted cross compilation only validates declarations and
-linkage; it is not evidence for any NTFS behavioural claim.
+Status: the opt-in unified 1B gate has passed on a local fixed NTFS checkout.
+Future platform or filesystem changes must rerun it; cross compilation only
+validates declarations and linkage, not NTFS behaviour.
 
 ## Binding boundary
 
@@ -21,8 +21,7 @@ the verified worktree.
 
 ## Required runtime proof
 
-`TestWindowsNTFSPrimitives` and `TestCrossPlatformAcceptanceMatrix` are expected
-to record the following before an NTFS claim is made:
+`TestWindowsNTFSPrimitives` and `TestCrossPlatformAcceptanceMatrix` record:
 
 1. Reparse points cannot be traversed while scanning, checkout, or recovery.
 2. Opened files retain a stable `(volume serial, file ID, type, link count)`
@@ -39,6 +38,12 @@ The gate is run only with:
 $env:FILECLOUD_RUN_1B=1
 go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -timeout=30m -v
 ```
+
+Acceptance record from 2026-08-15: the unified gate passed on a local fixed NTFS
+checkout at commit `754e0bb`, including every required scenario and all 112
+structured attestations. Deterministic convergence produced Root
+`746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599` and Head
+`6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`.
 
 ## Primary sources
 

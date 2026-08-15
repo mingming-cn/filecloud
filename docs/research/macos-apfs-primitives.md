@@ -32,7 +32,7 @@
 
 该测试输出 `filesystem-primitives` 类型的 `FILECLOUD_ATTESTATION`。macOS 1B 顶层门禁还会在同一个已验证 APFS 根上执行完整 1A 对象、扫描、checkout、故障注入、传输恢复、权限、资源限制和同步收敛矩阵；任何测试失败、证明缺失/重复或平台标签错误都会使门禁失败。非 helper skip 只有 5 个需要物理共存大小写别名的精确测试名可在 Darwin 放行，并由同次门禁的 `casefoldLookup=case-insensitive-alias` 实测证明补位；大小写敏感 APFS 不触发这些 skip。
 
-2026-08-14 的历史验收记录：macOS 26.5.1（Darwin 25.5.0，arm64）、Go 1.26.5、本地大小写不敏感 APFS；当时的门禁耗时 496.76 秒，required-pass 与旧契约的 109 条结构化证明全部通过，`casefoldLookup=case-insensitive-alias`。#25 将公共契约提升为 112 条证明后，必须在 APFS 实机重新运行下述命令；旧记录不能解释为新契约已通过。
+2026-08-15 的验收记录：macOS 26.5.1（Darwin 25.5.0，arm64）、Go 1.26.5、本地大小写不敏感 APFS；完整统一门禁、required-pass 与 112 条结构化证明全部通过，`casefoldLookup=case-insensitive-alias`。固定收敛 Root 为 `746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599`，Head 为 `6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`。
 
 运行命令：
 
