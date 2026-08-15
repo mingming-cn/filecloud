@@ -13,6 +13,7 @@
 - [第一阶段实施计划](./docs/design/phase-1-plan.md)
 - [第一阶段验收规范](./docs/design/acceptance-tests.md)
 - [1C 部署性能基线](./docs/operations/performance-baseline.md)
+- [分发、许可与平台支持范围](./docs/distribution.md)
 - [架构决策](./docs/adr/)
 
 ## 验证
@@ -47,3 +48,9 @@ go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -tim
 性能测试会创建 10000 个小文件，并完整读取一个 10 GiB 稀疏文件，默认回归测试不会运行这些昂贵场景。
 
 绑定只接受本地 ext4、APFS 或固定 NTFS。NFS、SMB、FAT/exFAT、网络映射盘和无法确认必要原子性的卷会在创建客户端状态或访问远端前明确拒绝。
+
+## 版本与分发
+
+开发构建可用 `filecloud version` 查看构建元数据。正式 `vMAJOR.MINOR.PATCH` tag 会在 1B/1C 门禁通过后生成 Linux amd64、macOS arm64 和 Windows amd64 归档，并对每个平台的成品二进制执行初始化、登录和同步冒烟测试。
+
+项目采用 [MIT License](./LICENSE)。正式归档同时提供基于实际编译依赖生成的第三方模块版本清单和原始许可文本。

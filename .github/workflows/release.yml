@@ -1,0 +1,173 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance-1b:
+    name: 1B acceptance (${{ matrix.goos }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+          - os: macos-latest
+            goos: darwin
+          - os: windows-latest
+            goos: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run native filesystem and cross-platform object acceptance
+        shell: bash
+        run: FILECLOUD_RUN_1B=1 go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -timeout=30m -v
+
+  acceptance-1c:
+    name: 1C operations and performance acceptance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run 1C acceptance
+        run: ./scripts/acceptance-1c.sh
+
+  licenses:
+    name: Generate third-party license material
+    needs: [acceptance-1b, acceptance-1c]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Generate notices from compiled dependencies
+        run: go run ./tools/notices --output dist/licenses
+      - name: Upload license material
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-material
+          path: dist/licenses
+          if-no-files-found: error
+
+  build:
+    name: Build and smoke test (${{ matrix.goos }})
+    needs: licenses
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            executable: filecloud
+            archive: tar.gz
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            executable: filecloud
+            archive: tar.gz
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            executable: filecloud.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Download license material
+        uses: actions/download-artifact@v4
+        with:
+          name: license-material
+          path: dist/licenses
+      - name: Build versioned binary
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must match vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          commit=$(git rev-parse HEAD)
+          build_date=$(git show -s --format=%cI HEAD)
+          mkdir -p dist/bin
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main._version=$VERSION -X main._commit=$commit -X main._buildDate=$build_date" \
+            -o "dist/bin/$EXECUTABLE" ./cmd/filecloud
+      - name: Smoke test released binary
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: go run ./tools/release-smoke --binary "dist/bin/$EXECUTABLE" --version "$VERSION"
+      - name: Package binary and legal material
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXECUTABLE: ${{ matrix.executable }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          package="filecloud-$VERSION-$GOOS-$GOARCH"
+          mkdir -p "dist/$package"
+          cp "dist/bin/$EXECUTABLE" "dist/$package/"
+          cp LICENSE docs/distribution.md "dist/$package/"
+          cp dist/licenses/THIRD_PARTY_NOTICES.md "dist/$package/"
+          cp -R dist/licenses/third_party_licenses "dist/$package/"
+          if [ "$ARCHIVE" = "zip" ]; then
+            tar -C dist -a -cf "dist/$package.zip" "$package"
+          else
+            tar -C dist -czf "dist/$package.tar.gz" "$package"
+          fi
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: filecloud-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/filecloud-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: filecloud-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        run: cd dist && sha256sum filecloud-* > SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: gh release create "$VERSION" dist/* --verify-tag --title "Filecloud $VERSION" --notes-file docs/distribution.md

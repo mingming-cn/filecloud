@@ -47,6 +47,26 @@ func TestRunInitAndArguments(t *testing.T) {
 	}
 }
 
+func TestRunVersion(t *testing.T) {
+	originalVersion, originalCommit, originalBuildDate := _version, _commit, _buildDate
+	t.Cleanup(func() {
+		_version, _commit, _buildDate = originalVersion, originalCommit, originalBuildDate
+	})
+	_version, _commit, _buildDate = "v1.2.3", "0123456789abcdef", "2026-08-16T00:00:00Z"
+
+	var stdout bytes.Buffer
+	if err := run(t.Context(), []string{"version"}, strings.NewReader(""), &stdout, io.Discard); err != nil {
+		t.Fatalf("run version: %v", err)
+	}
+	want := "{\"Version\":\"v1.2.3\",\"Commit\":\"0123456789abcdef\",\"BuildDate\":\"2026-08-16T00:00:00Z\"}\n"
+	if stdout.String() != want {
+		t.Fatalf("version output = %q, want %q", stdout.String(), want)
+	}
+	if err := run(t.Context(), []string{"version", "extra"}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: filecloud version") {
+		t.Fatalf("version with extra argument error = %v, want usage", err)
+	}
+}
+
 func TestRunLogsStructuredCommandLifecycleWithoutSensitivePaths(t *testing.T) {
 	sensitivePath := filepath.Join(t.TempDir(), "private", "metadata.db")
 	var logs bytes.Buffer

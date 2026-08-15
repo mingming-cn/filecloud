@@ -27,6 +27,12 @@ import (
 	"github.com/mingming-cn/filecloud/internal/storage"
 )
 
+var (
+	_version   = "dev"
+	_commit    = "unknown"
+	_buildDate = "unknown"
+)
+
 const (
 	_defaultListen              = "127.0.0.1:8080"
 	_defaultGlobalKDFCapacity   = 2
@@ -54,7 +60,7 @@ func mainCode() int {
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
 	if len(args) == 0 {
-		return errors.New("usage: filecloud <init|serve|gc|integrity|user|login|logout|library> [options]")
+		return errors.New("usage: filecloud <version|init|serve|gc|integrity|user|login|logout|library> [options]")
 	}
 	command := args[0]
 	logger := log.New(stderr, "", 0)
@@ -68,6 +74,15 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}()
 
 	switch command {
+	case "version":
+		if len(args) != 1 {
+			return errors.New("usage: filecloud version")
+		}
+		return json.NewEncoder(stdout).Encode(struct {
+			Version   string
+			Commit    string
+			BuildDate string
+		}{Version: _version, Commit: _commit, BuildDate: _buildDate})
 	case "init":
 		flags := flag.NewFlagSet("init", flag.ContinueOnError)
 		flags.SetOutput(stderr)

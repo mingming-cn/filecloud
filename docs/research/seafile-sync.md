@@ -107,7 +107,7 @@ FUSE `readdir/getattr` 读取本地 RepoTree 元数据，`read` 才通过 FileCa
 
 Seafile 项目 README 声明：服务端核心 AGPLv3、桌面同步 daemon GPLv2、Android GPLv3、iOS Apache 2.0；GitHub API 对部分仓库显示 `NOASSERTION`，应以各仓库实际 LICENSE 和法律审查为准。[官方仓库说明](https://github.com/haiwen/seafile#license)
 
-本项目采用 clean-room 方式复用公开思想、行为和协议研究结论，不复制 GPL/AGPL 源码、对象编码或具体实现。项目自身许可证尚未确定，发布前必须决定。
+本项目采用 clean-room 方式复用公开思想、行为和协议研究结论，不复制或链接 GPL/AGPL 源码、对象编码或具体实现。项目自身采用 MIT License；该许可选择不改变上述 clean-room 边界。
 
 ## 对本项目的取舍
 
