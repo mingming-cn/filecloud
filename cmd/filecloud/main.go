@@ -52,7 +52,7 @@ func mainCode() int {
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: filecloud <init|serve|gc|user|login|logout|library> [options]")
+		return errors.New("usage: filecloud <init|serve|gc|integrity|user|login|logout|library> [options]")
 	}
 	switch args[0] {
 	case "init":
@@ -127,6 +127,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		}, uploadConfig, headConfig)
 	case "gc":
 		return runGarbageCollection(ctx, args[1:], stdout, stderr)
+	case "integrity":
+		return runIntegrity(ctx, args[1:], stdout, stderr)
 	case "user":
 		return runUser(ctx, args[1:], stdin, stdout, stderr)
 	case "login":
@@ -170,6 +172,44 @@ func runGarbageCollection(ctx context.Context, args []string, stdout, stderr io.
 		if _, err := fmt.Fprintf(stdout, "%s objects=%d bytes=%d\n", stats.Type, stats.Count, stats.Bytes); err != nil {
 			return fmt.Errorf("write gc report: %w", err)
 		}
+	}
+	return nil
+}
+
+func runIntegrity(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr error) {
+	if len(args) == 0 || args[0] != "check" {
+		return errors.New("usage: filecloud integrity check --data-dir path")
+	}
+	flags := flag.NewFlagSet("integrity check", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dataDir := flags.String("data-dir", "", "Filecloud data directory")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *dataDir == "" || flags.NArg() != 0 {
+		return errors.New("usage: filecloud integrity check --data-dir path")
+	}
+	checker, err := storage.OpenIntegrityChecker(ctx, *dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, checker.Close()) }()
+	report, err := checker.Check(ctx)
+	if err != nil {
+		return err
+	}
+	for _, issue := range report.Issues {
+		if _, err := fmt.Fprintf(stdout, "library=%s owner=%s object=%s id=%s state=%s\n",
+			issue.LibraryID, issue.OwnerUserID, issue.ObjectType, issue.ObjectID, issue.State); err != nil {
+			return fmt.Errorf("write integrity issue: %w", err)
+		}
+	}
+	if _, err := fmt.Fprintf(stdout, "integrity libraries=%d objects=%d issues=%d\n",
+		report.Libraries, report.Objects, len(report.Issues)); err != nil {
+		return fmt.Errorf("write integrity summary: %w", err)
+	}
+	if len(report.Issues) != 0 {
+		return fmt.Errorf("integrity check found %d issues", len(report.Issues))
 	}
 	return nil
 }

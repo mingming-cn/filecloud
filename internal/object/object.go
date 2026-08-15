@@ -20,7 +20,14 @@ import (
 
 const (
 	// MaxBlockSize is the protocol block boundary.
-	MaxBlockSize    = 4 << 20
+	MaxBlockSize = 4 << 20
+	// MaxCommitSize is the largest encoded Commit accepted by the protocol.
+	MaxCommitSize = 64 << 10
+	// MaxFileObjectSize is the largest encoded File accepted by the protocol.
+	MaxFileObjectSize = 20 << 20
+	// MaxDirectoryObjectSize is the largest encoded Directory accepted by the protocol.
+	MaxDirectoryObjectSize = 32 << 20
+
 	_maxFileSize    = 1 << 40
 	_maxBlocks      = 262144
 	_maxEntries     = 100000

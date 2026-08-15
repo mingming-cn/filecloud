@@ -35,9 +35,9 @@ const (
 	_pageTokenKeySize    = 32
 	_maxObjectCheckBody  = 1 << 20
 	_maxObjectCheckCount = 1000
-	_maxCommitBody       = 64 << 10
-	_maxFileBody         = 20 << 20
-	_maxDirectoryBody    = 32 << 20
+	_maxCommitBody       = object.MaxCommitSize
+	_maxFileBody         = object.MaxFileObjectSize
+	_maxDirectoryBody    = object.MaxDirectoryObjectSize
 )
 
 // Config contains deterministic handler seams.
