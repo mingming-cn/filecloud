@@ -27,6 +27,15 @@ import (
 
 func platformMatrixScenarios() []platformMatrixScenario {
 	return []platformMatrixScenario{
+		{category: "fixed vectors", packagePath: "./internal/object", test: "TestCanonicalMetadataVectors"},
+		{category: "fixed vectors", packagePath: "./internal/object", test: "TestBlockVectors"},
+		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestCanonicalProtocolObjectIDs"},
+		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestConflictCopyNameAttestedNormalVectors"},
+		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestConflictCopyNameLongExtensionOrdinalOneFixedVector"},
+		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestConflictFallbackAttestedVectors"},
+		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestLibrarySyncLongFallbackCandidateHistoryFixedReplayVector"},
+		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestCrossPlatformFixedObjectIDs"},
+		{category: "fixed convergence", packagePath: "./cmd/filecloud", test: "TestCrossPlatformDeterministicConvergence"},
 		{category: "correctness oracle", packagePath: "./cmd/filecloud", test: "TestPlatformCorrectnessLoop"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindConcurrentInitializationAdoptsWinner"},
@@ -95,6 +104,33 @@ type platformMatrixScenario struct {
 	test        string
 }
 
+func TestPlatformMatrixWiresFullScenarioSet(t *testing.T) {
+	required := make(map[string]bool)
+	for _, scenario := range platformMatrixScenarios() {
+		required[scenario.test] = true
+	}
+	for _, test := range []string{
+		"TestCanonicalMetadataVectors",
+		"TestBlockVectors",
+		"TestConflictFallbackAttestedVectors",
+		"TestLibrarySyncLongFallbackCandidateHistoryFixedReplayVector",
+		"TestCrossPlatformFixedObjectIDs",
+		"TestCrossPlatformDeterministicConvergence",
+		"TestPlatformCorrectnessLoop",
+		"TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly",
+		"TestScanRegularFileRetriesConcurrentRewrite",
+		"TestFSActionSubprocessCrashMatrix",
+		"TestPublicBindSubprocessCrashMatrix",
+		"TestPublicSyncSubprocessCrashMatrix",
+		"TestLibrarySyncInterrupted100MiBUploadSendsOnlyMissingBlocks",
+		"TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject",
+	} {
+		if !required[test] {
+			t.Fatalf("cross-platform matrix omitted %s", test)
+		}
+	}
+}
+
 type platformTestEvent struct {
 	Action  string
 	Package string
@@ -126,10 +162,14 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		ConfirmedInputDigests: []string{digest}, PreservedInputDigests: []string{digest},
 	}
 	primitives := platformAttestation{
-		Kind: "filesystem-primitives", Scenario: "primitives", Platform: "darwin", Filesystem: "apfs",
+		Kind: "filesystem-primitives", Scenario: "filesystem primitives", Platform: "darwin", Filesystem: "apfs",
 		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, NoReplaceLink: true,
 		CasefoldLookup: "case-insensitive-alias", SameDirectoryRename: true, DirectorySync: true,
 		CrossProcessLock: true, OldFDWritesDetached: true, Warning: "old fd boundary",
+	}
+	vectors := platformAttestation{
+		Kind: "fixed-vectors", Scenario: "cross-platform fixed vectors", Platform: "linux", Filesystem: "ext4",
+		VectorIDs: expectedCrossPlatformVectorIDs(),
 	}
 	for _, test := range []struct {
 		name                 string
@@ -147,8 +187,15 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		}()}, required: map[string]string{"stable": "convergence"}},
 		{name: "valid empty convergence", attestations: []platformAttestation{{Kind: "convergence", Scenario: "empty", Platform: "linux", Filesystem: "ext4", Head: id, SyncBase: id, HeadRoot: root, BaseRoot: root, Snapshot: root, ReachableObjects: 2}}, required: map[string]string{"empty": "convergence"}},
 		{name: "valid recovery", attestations: []platformAttestation{recovery}, required: map[string]string{"recover": "recovery"}},
-		{name: "valid APFS primitives", attestations: []platformAttestation{primitives}, required: map[string]string{"primitives": "filesystem-primitives"}, platform: "darwin", filesystem: "apfs"},
-		{name: "unknown APFS casefold lookup", attestations: []platformAttestation{func() platformAttestation { value := primitives; value.CasefoldLookup = "unknown"; return value }()}, required: map[string]string{"primitives": "filesystem-primitives"}, platform: "darwin", filesystem: "apfs", wantErr: true},
+		{name: "valid APFS primitives", attestations: []platformAttestation{primitives}, required: map[string]string{"filesystem primitives": "filesystem-primitives"}, platform: "darwin", filesystem: "apfs"},
+		{name: "unknown APFS casefold lookup", attestations: []platformAttestation{func() platformAttestation { value := primitives; value.CasefoldLookup = "unknown"; return value }()}, required: map[string]string{"filesystem primitives": "filesystem-primitives"}, platform: "darwin", filesystem: "apfs", wantErr: true},
+		{name: "valid fixed vectors", attestations: []platformAttestation{vectors}, required: map[string]string{"cross-platform fixed vectors": "fixed-vectors"}},
+		{name: "fixed vector drift", attestations: []platformAttestation{func() platformAttestation {
+			value := vectors
+			value.VectorIDs = maps.Clone(value.VectorIDs)
+			value.VectorIDs["merge/directory"] = root
+			return value
+		}()}, required: map[string]string{"cross-platform fixed vectors": "fixed-vectors"}, wantErr: true},
 		{name: "recovery Head drift", attestations: []platformAttestation{func() platformAttestation { value := recovery; value.CurrentHead = root; return value }()}, required: map[string]string{"recover": "recovery"}, wantErr: true},
 		{name: "recovery lost input", attestations: []platformAttestation{func() platformAttestation { value := recovery; value.PreservedInputDigests = nil; return value }()}, required: map[string]string{"recover": "recovery"}, wantErr: true},
 		{name: "unknown scenario", attestations: []platformAttestation{valid}, required: map[string]string{"other": "convergence"}, wantErr: true},
@@ -266,6 +313,10 @@ func validatePlatformAttestations(attestations []platformAttestation, required m
 				slices.ContainsFunc(confirmed, func(id string) bool { return !object.ValidID(id) }) {
 				return fmt.Errorf("platform recovery attestation %q is invalid", attestation.Scenario)
 			}
+		case "fixed-vectors":
+			if !maps.Equal(attestation.VectorIDs, expectedCrossPlatformVectorIDs()) {
+				return fmt.Errorf("platform fixed-vectors attestation %q differs from the cross-platform contract", attestation.Scenario)
+			}
 		case "filesystem-primitives":
 			validCasefold := attestation.CasefoldLookup == "case-insensitive-alias" ||
 				attestation.CasefoldLookup == "case-sensitive-distinct"
@@ -333,6 +384,15 @@ func (c *platformAttestationCollector) close() error {
 	return nil
 }
 
+func platformMatrixEnvironment() []string {
+	return []string{
+		"FILECLOUD_RUN_1B=1",
+		"FILECLOUD_RUN_1A=",
+		"FILECLOUD_RUN_1B_APFS=",
+		"FILECLOUD_RUN_1B_NTFS=",
+	}
+}
+
 func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platformMatrixScenario,
 	platform, filesystem string, environment []string,
 ) {
@@ -369,10 +429,9 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 		"TestPublicSyncFSActionCrashHelper":              true,
 		"TestPublicFSActionCrashHelper":                  true,
 		"TestFSActionCrashHelper":                        true,
-		"TestLinuxExt4AcceptanceMatrix":                  true,
-		"TestMacOSAPFSAcceptanceMatrix":                  true,
+		"TestCrossPlatformAcceptanceMatrix":              true,
+		"TestLinuxExt4LockHelper":                        true,
 		"TestMacOSAPFSLockHelper":                        true,
-		"TestWindowsNTFSAcceptanceMatrix":                true,
 		"TestWindowsNTFSLockHelper":                      true,
 	}
 	casefoldSkips := make(map[string]bool)
@@ -462,15 +521,117 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 	}
 }
 
+func TestCrossPlatformFixedObjectIDs(t *testing.T) {
+	got, err := computeCrossPlatformVectorIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := expectedCrossPlatformVectorIDs()
+	if !maps.Equal(got, want) {
+		t.Fatalf("cross-platform vector IDs=%v, want %v", got, want)
+	}
+	platform, filesystem, _ := acceptance.ActivePlatform()
+	emitPlatformAttestation(t, platformAttestation{
+		Kind: "fixed-vectors", Scenario: "cross-platform fixed vectors", Platform: platform, Filesystem: filesystem,
+		VectorIDs: got,
+	})
+}
+
+func computeCrossPlatformVectorIDs() (map[string]string, error) {
+	result := make(map[string]string, 7)
+	result["block/one-byte"] = object.ID([]byte("a"))
+
+	_, emptyFileID, err := object.Canonicalize("files", []byte(`{"Version":1,"Size":"0","Blocks":[],"Type":"File"}`))
+	if err != nil {
+		return nil, err
+	}
+	result["object/empty-file"] = emptyFileID
+	_, unicodeDirectoryID, err := object.Canonicalize("directories", []byte(`{"Entries":[{"Type":"File","Name":"Å.txt","ModifiedAt":"2026-08-09T00:00:00Z","Id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"Type":"Directory","Version":1}`))
+	if err != nil {
+		return nil, err
+	}
+	result["object/unicode-directory"] = unicodeDirectoryID
+
+	_, mtimeDirectoryID, err := canonicalDirectory("", []scanEntry{{name: "fixed.txt", kind: "File",
+		id: strings.Repeat("a", 64), modified: canonicalProtocolMtime(time.Date(2026, 2, 3, 12, 5, 6, 900_000_000,
+			time.FixedZone("+8", 8*60*60)))}})
+	if err != nil {
+		return nil, err
+	}
+	result["mtime/directory"] = mtimeDirectoryID
+	_, mtimeCommitID, err := canonicalCommit(testClientUserID, testClientDeviceID, mtimeDirectoryID,
+		[]string{strings.Repeat("b", 64)}, func() time.Time {
+			return time.Date(2026, 2, 3, 4, 5, 7, 800_000_000, time.UTC)
+		})
+	if err != nil {
+		return nil, err
+	}
+	result["mtime/commit"] = mtimeCommitID
+
+	seed := object.Commit{AuthorUserID: testClientUserID, DeviceID: testClientDeviceID, CreatedAt: "2025-02-03T04:05:06Z"}
+	conflictName, err := _conflictCopyName(strings.Repeat("界", 80)+".txt", "", seed, nil)
+	if err != nil {
+		return nil, err
+	}
+	_, conflictDirectoryID, err := canonicalDirectory("", []scanEntry{{name: conflictName, kind: "File",
+		id: strings.Repeat("c", 64), modified: "2026-02-03T04:05:06Z"}})
+	if err != nil {
+		return nil, err
+	}
+	result["conflict/directory"] = conflictDirectoryID
+
+	emptyData, emptyID, err := canonicalEmptyDirectory()
+	if err != nil {
+		return nil, err
+	}
+	localData, localID, err := canonicalDirectory("", []scanEntry{{name: "local.txt", kind: "File",
+		id: strings.Repeat("d", 64), modified: "2026-02-03T04:05:06Z"}})
+	if err != nil {
+		return nil, err
+	}
+	remoteData, remoteID, err := canonicalDirectory("", []scanEntry{{name: "remote.txt", kind: "File",
+		id: strings.Repeat("e", 64), modified: "2026-02-03T04:05:07Z"}})
+	if err != nil {
+		return nil, err
+	}
+	merger := &_treeMerger{
+		directories: map[string][]byte{emptyID: emptyData, localID: localData, remoteID: remoteData},
+		synthesized: make(map[string][]byte), active: make(map[string]bool), seen: make(map[string]bool),
+		budget: _newReplayBudget(), localSeed: seed, localSeedID: strings.Repeat("f", 64),
+		lineage: make(map[string]_conflictPromotion),
+	}
+	mergedID, err := merger.merge(emptyID, localID, remoteID, "", 0)
+	if err != nil {
+		return nil, err
+	}
+	result["merge/directory"] = mergedID
+	return result, nil
+}
+
+func expectedCrossPlatformVectorIDs() map[string]string {
+	return map[string]string{
+		"block/one-byte":           "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+		"object/empty-file":        "fe680f5ed33eb93ec5fb2eba2003164fe1d60401cc74edd895042aeb17220032",
+		"object/unicode-directory": "ed45fcac78692b7aef42e4a4cdd131b2fca7bde0f02b80c3fa6d5eaf5da27e92",
+		"mtime/directory":          "b53e9e0a56bec96806fb3df7c03b9ac609514a640f4959ff5e1d40b210049b39",
+		"mtime/commit":             "9fdc5eae97573252943f980fdeea40022078064e3c977d2d194561b8fbb0002b",
+		"conflict/directory":       "4c4f5c0368f699b0b1c2dcc5bcf8245f5850bba8e68a85038272ef1482baa84c",
+		"merge/directory":          "46fd9a1f6679629303c712ce883d20252ea078e6f7983ebeb1afdaab340f8ce8",
+	}
+}
+
 func TestRequiredPlatformAttestationCounts(t *testing.T) {
-	if got := len(requiredPlatformAttestations("linux", "ext4")); got != 108 {
-		t.Fatalf("Linux/ext4 attestations=%d, want 108", got)
-	}
-	if got := len(requiredPlatformAttestations("darwin", "apfs")); got != 109 {
-		t.Fatalf("macOS/APFS attestations=%d, want 109", got)
-	}
-	if got := len(requiredPlatformAttestations("windows", "ntfs")); got != 109 {
-		t.Fatalf("Windows/NTFS attestations=%d, want 109", got)
+	for _, test := range []struct {
+		platform   string
+		filesystem string
+	}{
+		{platform: "linux", filesystem: "ext4"},
+		{platform: "darwin", filesystem: "apfs"},
+		{platform: "windows", filesystem: "ntfs"},
+	} {
+		if got := len(requiredPlatformAttestations(test.platform, test.filesystem)); got != 112 {
+			t.Fatalf("%s/%s attestations=%d, want 112", test.platform, test.filesystem, got)
+		}
 	}
 }
 
@@ -538,12 +699,10 @@ func requiredPlatformAttestations(platform, filesystem string) map[string]string
 	} {
 		result["object publication "+point] = "server-readability"
 	}
-	if platform == "darwin" && filesystem == "apfs" {
-		result["macOS APFS primitives"] = "filesystem-primitives"
-	}
-	if platform == "windows" && filesystem == "ntfs" {
-		result["Windows NTFS primitives"] = "filesystem-primitives"
-	}
+	result["cross-platform fixed vectors"] = "fixed-vectors"
+	result["deterministic convergence first client"] = "convergence"
+	result["deterministic convergence second client"] = "convergence"
+	result["filesystem primitives"] = "filesystem-primitives"
 	for _, category := range []struct{ op, kind string }{
 		{fsOpCreateFile, "File"}, {fsOpCreateDirectory, "Directory"},
 		{fsOpMtime, "File"}, {fsOpMtime, "Directory"},
@@ -561,9 +720,73 @@ func requiredPlatformAttestations(platform, filesystem string) map[string]string
 	return result
 }
 
+func TestCrossPlatformDeterministicConvergence(t *testing.T) {
+	if _, _, enabled := acceptance.ActivePlatform(); !enabled {
+		t.Skip("set FILECLOUD_RUN_1B=1 to run deterministic cross-platform convergence")
+	}
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	publisherDir, publisherTree := newPlatformClientPaths(t)
+	subscriberDir, subscriberTree := newPlatformClientPaths(t)
+	runFixed := func(args []string, stdin string, now time.Time) error {
+		if len(args) > 0 && args[0] == "library" {
+			args = args[1:]
+		}
+		return runLibraryWithConfig(t.Context(), args, strings.NewReader(stdin), io.Discard, io.Discard,
+			libraryClientConfig{now: func() time.Time { return now }})
+	}
+	writeFixed := func(path, content string, modified time.Time) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	baseTime := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	writeFixed(filepath.Join(publisherTree, "shared.txt"), "fixed base", baseTime)
+	publisherArgs := append(bindArgs(publisherDir, environment.server.URL, testClientLibraryID, publisherTree, testClientDeviceID), "--import-local")
+	if err := runFixed(publisherArgs, environment.token+"\n", time.Date(2026, 8, 9, 11, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("bind deterministic publisher: %v", err)
+	}
+	if err := runFixed(bindArgs(subscriberDir, environment.server.URL, testClientLibraryID, subscriberTree, testOtherDeviceID),
+		environment.token+"\n", time.Date(2026, 8, 9, 11, 1, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("bind deterministic subscriber: %v", err)
+	}
+
+	remoteTime := time.Date(2026, 8, 9, 10, 2, 0, 0, time.UTC)
+	writeFixed(filepath.Join(publisherTree, "remote.txt"), "fixed remote", remoteTime)
+	if err := runFixed([]string{"sync", "--client-dir", publisherDir, "--worktree", publisherTree}, "",
+		time.Date(2026, 8, 9, 11, 2, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("publish deterministic remote change: %v", err)
+	}
+	localTime := time.Date(2026, 8, 9, 10, 3, 0, 0, time.UTC)
+	writeFixed(filepath.Join(subscriberTree, "local.txt"), "fixed local", localTime)
+	if err := runFixed([]string{"sync", "--client-dir", subscriberDir, "--worktree", subscriberTree}, "",
+		time.Date(2026, 8, 9, 11, 3, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("merge deterministic changes: %v", err)
+	}
+	if err := runFixed([]string{"sync", "--client-dir", publisherDir, "--worktree", publisherTree}, "",
+		time.Date(2026, 8, 9, 11, 4, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("download deterministic merge: %v", err)
+	}
+
+	confirmed := platformConfirmedInputs("fixed base", "fixed remote", "fixed local")
+	first := assertPlatformConverged(t, "deterministic convergence first client", environment, publisherDir, publisherTree, confirmed)
+	second := assertPlatformConverged(t, "deterministic convergence second client", environment, subscriberDir, subscriberTree, confirmed)
+	const wantRoot = "746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599"
+	const wantHead = "6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53"
+	if first.SyncBase != second.SyncBase || first.SyncBaseRoot != second.SyncBaseRoot ||
+		first.SyncBase != wantHead || first.SyncBaseRoot != wantRoot {
+		t.Fatalf("deterministic convergence first=%s/%s second=%s/%s, want %s/%s",
+			first.SyncBase, first.SyncBaseRoot, second.SyncBase, second.SyncBaseRoot, wantHead, wantRoot)
+	}
+}
+
 func TestPlatformCorrectnessLoop(t *testing.T) {
 	if _, _, enabled := acceptance.ActivePlatform(); !enabled {
-		t.Skip("set FILECLOUD_RUN_1A=1 or FILECLOUD_RUN_1B_APFS=1 to run the platform correctness loop")
+		t.Skip("set FILECLOUD_RUN_1B=1 to run the platform correctness loop")
 	}
 	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
 	publisherDir, publisherTree := newPlatformClientPaths(t)

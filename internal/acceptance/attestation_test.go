@@ -6,12 +6,19 @@ import (
 )
 
 func TestActivePlatformRequiresExplicitGate(t *testing.T) {
+	t.Setenv("FILECLOUD_RUN_1B", "")
 	t.Setenv("FILECLOUD_RUN_1A", "")
 	t.Setenv("FILECLOUD_RUN_1B_APFS", "")
 	t.Setenv("FILECLOUD_RUN_1B_NTFS", "")
 	if platform, filesystem, enabled := ActivePlatform(); enabled || platform != "" || filesystem != "" {
 		t.Fatalf("inactive platform = %q/%q enabled=%t", platform, filesystem, enabled)
 	}
+	t.Setenv("FILECLOUD_RUN_1B", "1")
+	platform, filesystem, enabled := ActivePlatform()
+	if !enabled || platform == "" || filesystem == "" {
+		t.Fatalf("unified platform = %q/%q enabled=%t", platform, filesystem, enabled)
+	}
+	t.Setenv("FILECLOUD_RUN_1B", "")
 	t.Setenv("FILECLOUD_RUN_1B_APFS", "1")
 	if platform, filesystem, enabled := ActivePlatform(); !enabled || platform != "darwin" || filesystem != "apfs" {
 		t.Fatalf("APFS platform = %q/%q enabled=%t", platform, filesystem, enabled)

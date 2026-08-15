@@ -17,15 +17,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// TestWindowsNTFSAcceptanceMatrix is an explicit real-host gate. It deliberately
+// TestCrossPlatformAcceptanceMatrix is an explicit real-host gate. It deliberately
 // does not run in ordinary Windows test invocations because its child suite
 // creates worktrees and injects process failures on the verified NTFS volume.
-func TestWindowsNTFSAcceptanceMatrix(t *testing.T) {
+func TestCrossPlatformAcceptanceMatrix(t *testing.T) {
 	if os.Getenv("FILECLOUD_PLATFORM_MATRIX_CHILD") == "1" {
-		t.Skip("Windows/NTFS acceptance child suite does not recurse")
+		t.Skip("cross-platform acceptance child suite does not recurse")
 	}
-	if os.Getenv("FILECLOUD_RUN_1B_NTFS") != "1" {
-		t.Skip("set FILECLOUD_RUN_1B_NTFS=1 to run the Windows/NTFS acceptance matrix")
+	if os.Getenv("FILECLOUD_RUN_1B") != "1" {
+		t.Skip("set FILECLOUD_RUN_1B=1 to run the cross-platform acceptance matrix")
 	}
 	root, err := os.MkdirTemp(".", ".windows-ntfs-matrix-")
 	if err != nil {
@@ -47,12 +47,7 @@ func TestWindowsNTFSAcceptanceMatrix(t *testing.T) {
 	if err := opened.Close(); err != nil {
 		t.Fatal(err)
 	}
-	runPlatformMatrix(t, root, platformMatrixScenarios(), "windows", "ntfs", []string{
-		"FILECLOUD_RUN_1A=",
-		"FILECLOUD_RUN_1B_APFS=",
-		"FILECLOUD_RUN_1B_NTFS=1",
-		"FILECLOUD_WINDOWS_NTFS_ROOT=" + root,
-	})
+	runPlatformMatrix(t, root, platformMatrixScenarios(), "windows", "ntfs", platformMatrixEnvironment())
 	t.Logf("verified local NTFS worktree=%s", root)
 }
 
@@ -60,8 +55,8 @@ func TestWindowsNTFSAcceptanceMatrix(t *testing.T) {
 // gated because it needs a real local fixed NTFS volume and can be rejected by
 // host policy before the test body runs.
 func TestWindowsNTFSRenameVectors(t *testing.T) {
-	if os.Getenv("FILECLOUD_RUN_1B_NTFS") != "1" {
-		t.Skip("Windows/NTFS primitive gate is not enabled")
+	if os.Getenv("FILECLOUD_RUN_1B") != "1" {
+		t.Skip("cross-platform filesystem primitive gate is not enabled")
 	}
 	path, err := os.MkdirTemp(platformTestTempDir(t), ".windows-ntfs-rename-")
 	if err != nil {
@@ -159,30 +154,9 @@ func TestWindowsNTFSRejectsCaseSensitiveDescendant(t *testing.T) {
 	assertRejected("relative reopen", file, err)
 }
 
-func TestWindowsNTFSMatrixWiresFullScenarioSet(t *testing.T) {
-	required := map[string]bool{}
-	for _, scenario := range platformMatrixScenarios() {
-		required[scenario.test] = true
-	}
-	for _, test := range []string{
-		"TestPlatformCorrectnessLoop",
-		"TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly",
-		"TestScanRegularFileRetriesConcurrentRewrite",
-		"TestFSActionSubprocessCrashMatrix",
-		"TestPublicBindSubprocessCrashMatrix",
-		"TestPublicSyncSubprocessCrashMatrix",
-		"TestLibrarySyncInterrupted100MiBUploadSendsOnlyMissingBlocks",
-		"TestLibrarySyncStructuralConflictsPreserveCompleteLocalObject",
-	} {
-		if !required[test] {
-			t.Fatalf("Windows NTFS matrix omitted %s", test)
-		}
-	}
-}
-
 func TestWindowsNTFSPrimitives(t *testing.T) {
-	if os.Getenv("FILECLOUD_RUN_1B_NTFS") != "1" {
-		t.Skip("set FILECLOUD_RUN_1B_NTFS=1 to run the Windows/NTFS primitive spike")
+	if os.Getenv("FILECLOUD_RUN_1B") != "1" {
+		t.Skip("set FILECLOUD_RUN_1B=1 to run the filesystem primitive contract")
 	}
 	path := acceptance.Root()
 	if path == "" {
@@ -282,7 +256,7 @@ func TestWindowsNTFSPrimitives(t *testing.T) {
 		t.Fatalf("flush NTFS parent directory: %v", err)
 	}
 	line, err := acceptance.Encode(acceptance.Attestation{
-		Kind: "filesystem-primitives", Scenario: "Windows NTFS primitives", Platform: runtime.GOOS, Filesystem: "ntfs",
+		Kind: "filesystem-primitives", Scenario: "filesystem primitives", Platform: runtime.GOOS, Filesystem: "ntfs",
 		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, NoReplaceLink: true,
 		CasefoldLookup: "case-insensitive-alias", SameDirectoryRename: true, DirectorySync: true,
 		CrossProcessLock: true, OccupiedRenamePreserved: true,

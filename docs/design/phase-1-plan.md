@@ -55,12 +55,12 @@
 
 ## 1B：跨平台文件系统验证
 
-1. 在 APFS 和 NTFS 上执行与 1A 相同的对象、锁、扫描、checkout 和崩溃测试；macOS/APFS 已在目标 APFS 主机通过复用完整 1A 清单的门禁，NTFS 尚未实现。
+1. APFS 和 NTFS 与 ext4 执行相同的对象、锁、扫描、checkout 和崩溃测试；三平台均通过复用完整 1A 清单的实机门禁。
 2. spike 并冻结以下平台实现：no-follow/reparse point、文件身份、no-replace、父目录持久化、跨进程锁、占用文件 rename；macOS 结论见 [APFS 原语 spike](../research/macos-apfs-primitives.md)。
 3. 文件系统不满足必要原子性时明确拒绝绑定，不做静默降级。
 4. 第一阶段明确不支持 NFS、SMB、FAT/exFAT 和网络映射盘；后续必须独立验证后才能移出排除列表。
 
-1B 完成条件：Linux、macOS、Windows 使用同一对象向量生成相同 ObjectId，并通过各自平台验收矩阵。
+1B 完成条件：Linux、macOS、Windows 使用同一对象向量生成相同 ObjectId，并通过同名、同场景清单和同一结构化证明契约的实机验收矩阵。固定双设备并发场景还必须在三平台生成相同 Head、同步基线和工作目录 Snapshot。
 
 ## 1C：运维闭环
 

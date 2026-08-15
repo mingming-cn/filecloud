@@ -15,12 +15,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestMacOSAPFSAcceptanceMatrix(t *testing.T) {
+func TestCrossPlatformAcceptanceMatrix(t *testing.T) {
 	if os.Getenv("FILECLOUD_PLATFORM_MATRIX_CHILD") == "1" {
-		t.Skip("macOS/APFS acceptance child suite does not recurse")
+		t.Skip("cross-platform acceptance child suite does not recurse")
 	}
-	if os.Getenv("FILECLOUD_RUN_1B_APFS") != "1" {
-		t.Skip("set FILECLOUD_RUN_1B_APFS=1 to run the macOS/APFS acceptance matrix")
+	if os.Getenv("FILECLOUD_RUN_1B") != "1" {
+		t.Skip("set FILECLOUD_RUN_1B=1 to run the cross-platform acceptance matrix")
 	}
 	apfsTemp, err := os.MkdirTemp(".", ".macos-apfs-matrix-")
 	if err != nil {
@@ -50,16 +50,12 @@ func TestMacOSAPFSAcceptanceMatrix(t *testing.T) {
 		t.Fatalf("short Darwin test root does not match acceptance filesystem: acceptance device=%d short device=%d",
 			acceptanceStat.Dev, shortStat.Dev)
 	}
-	runPlatformMatrix(t, apfsTemp, platformMatrixScenarios(), "darwin", "apfs", []string{
-		"FILECLOUD_RUN_1A=",
-		"FILECLOUD_RUN_1B_APFS=1",
-		"FILECLOUD_LINUX_EXT4_ROOT=",
-	})
+	runPlatformMatrix(t, apfsTemp, platformMatrixScenarios(), "darwin", "apfs", platformMatrixEnvironment())
 }
 
 func TestMacOSAPFSPrimitives(t *testing.T) {
-	if os.Getenv("FILECLOUD_RUN_1B_APFS") != "1" {
-		t.Skip("set FILECLOUD_RUN_1B_APFS=1 to run the macOS/APFS primitive spike")
+	if os.Getenv("FILECLOUD_RUN_1B") != "1" {
+		t.Skip("set FILECLOUD_RUN_1B=1 to run the filesystem primitive contract")
 	}
 	rootPath := acceptance.Root()
 	if rootPath == "" {
@@ -180,7 +176,7 @@ func TestMacOSAPFSPrimitives(t *testing.T) {
 	}
 
 	emitPlatformAttestation(t, platformAttestation{
-		Kind: "filesystem-primitives", Scenario: "macOS APFS primitives", Platform: runtime.GOOS, Filesystem: "apfs",
+		Kind: "filesystem-primitives", Scenario: "filesystem primitives", Platform: runtime.GOOS, Filesystem: "apfs",
 		NoFollow: true, StableFileIdentity: true, NoReplaceRename: true, NoReplaceLink: true, CasefoldLookup: casefoldLookup,
 		SameDirectoryRename: true,
 		DirectorySync:       true, CrossProcessLock: true, OldFDWritesDetached: true,

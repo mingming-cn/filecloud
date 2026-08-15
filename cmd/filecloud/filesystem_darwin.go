@@ -31,8 +31,8 @@ func requireAPFS(directory *os.File) error {
 	if err != nil {
 		return fmt.Errorf("inspect worktree filesystem: %w", err)
 	}
-	if filesystem != "apfs" || !local {
-		return fmt.Errorf("unsupported worktree filesystem %s (local=%t); local macOS APFS is required", filesystem, local)
+	if err := validateSupportedFilesystemPolicy("darwin", filesystem, local); err != nil {
+		return err
 	}
 	supported, valid, err := volumeInterfaceCapabilities(directory)
 	if err != nil {

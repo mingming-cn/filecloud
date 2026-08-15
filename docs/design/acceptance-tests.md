@@ -128,46 +128,36 @@ SQLite WAL 与 `synchronous=FULL` 的同步发生在 COMMIT 内部；SQLite 不�
 
 NFS、SMB、FAT/exFAT 和网络映射盘必须拒绝绑定，除非后续 ADR 和相同级别测试明确支持。
 
-## 1A 可执行门禁
+## 跨平台可执行门禁
 
-1A 必须在 Linux 主机的本地 ext4 checkout 中显式运行，普通 `go test ./...` 中跳过重型矩阵不构成 1A 通过：
+1B 必须分别在 Linux/ext4、macOS/APFS 和 Windows/NTFS 的本地 checkout 中显式运行。三平台使用同一测试名、场景清单和证明 schema；普通 `go test ./...` 中跳过重型矩阵或交叉编译不构成通过：
 
 ```bash
-FILECLOUD_RUN_1A=1 go test ./cmd/filecloud \
-  -run '^TestLinuxExt4AcceptanceMatrix$' \
+FILECLOUD_RUN_1B=1 go test ./cmd/filecloud \
+  -run '^TestCrossPlatformAcceptanceMatrix$' \
   -count=1 -timeout=30m -v
+```
+
+```powershell
+$env:FILECLOUD_RUN_1B=1
+go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -timeout=30m -v
 ```
 
 门禁在仓库所在挂载创建专用 `TMPDIR`，通过 held worktree fd、`statfs` 和 `/proc/self/mountinfo` 的设备号及最深挂载点共同确认 fstype 精确为 `ext4`；无法确认、ext2、ext3 或其他文件系统直接失败。随后在该根下执行完整 `go test -json ./...`，任何测试失败或非子进程 helper 的 skip 都使门禁失败；关键场景清单还必须逐项产生 pass，因此测试被删除、重命名或环境不满足时不能空匹配通过。correctness worktree、对象发布和 Head 更新的 crash data dir 均来自同一个已验证 ext4 根。
 
-稳定绑定、同步、传输恢复和 checkout 崩溃恢复场景输出以 `FILECLOUD_ATTESTATION` 开头的严格 JSON 记录。门禁按精确白名单拒绝缺失、重复、未知、无法完整解码或带未知字段的记录，并分别验证 `Head == Sync Base`、`Head Root == Sync Base Root ==` 独立重扫的工作树快照、完整 Head parent 历史对象可达、确认输入摘要集合完整保留、journal 清空且无未登记内部路径。双空场景允许确认输入集合为空；100 MiB 场景以流式 SHA-256 验证内容，不在 Oracle 中重复缓存整文件。完整 bind/sync checkout 文件系统动作矩阵的每个动作和崩溃边界各自产生证明，顶层矩阵测试名也在 required-pass 清单中。对象发布和 Head 更新矩阵在每个真实子进程 `SIGKILL` 点重开存储，输出旧 Head 与当前 Head，并逐对象验证旧 Head 的 Commit、Directory、File 和 Block 仍可读。当前 Linux 门禁精确要求 108 条结构化证明：既有 104 条收敛/可读性证明，加上 bind/sync 的 File/Directory `between_create_identity` 恢复证明。后者断言 Head 与 Sync Base 未推进、未知 inode 内容进入可见恢复路径、journal 清空且没有未登记内部路径。这些进程测试只证明 Linux 进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
+稳定绑定、同步、传输恢复和 checkout 崩溃恢复场景输出以 `FILECLOUD_ATTESTATION` 开头的严格 JSON 记录。门禁按精确白名单拒绝缺失、重复、未知、无法完整解码或带未知字段的记录，并分别验证 `Head == Sync Base`、`Head Root == Sync Base Root ==` 独立重扫的工作树快照、完整 Head parent 历史对象可达、确认输入摘要集合完整保留、journal 清空且无未登记内部路径。双空场景允许确认输入集合为空；100 MiB 场景以流式 SHA-256 验证内容，不在 Oracle 中重复缓存整文件。完整 bind/sync checkout 文件系统动作矩阵的每个动作和崩溃边界各自产生证明，顶层矩阵测试名也在 required-pass 清单中。对象发布和 Head 更新矩阵在每个真实子进程 `SIGKILL` 点重开存储，输出旧 Head 与当前 Head，并逐对象验证旧 Head 的 Commit、Directory、File 和 Block 仍可读。三平台门禁均精确要求 112 条结构化证明：既有收敛、可读性和 bind/sync `between_create_identity` 恢复证明，加上一条固定向量证明、两条固定双设备收敛证明和一条平台文件系统原语证明。固定向量由生产规范化、冲突命名和合并函数实际计算，并与冻结 ObjectId map 比较；固定收敛使用相同设备 ID、整秒 mtime 和提交时钟，要求两端及三平台均得到 Root `746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599` 与 Head `6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`。这些进程测试只证明进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
 
-## macOS/APFS 1B 可执行门禁
+## macOS/APFS 平台边界
 
-1B 必须在 macOS 主机的本地 APFS checkout 中显式运行；普通回归和 Darwin 交叉编译不构成 APFS 通过：
+macOS 门禁在仓库所在挂载创建专用根，通过 held worktree fd 的 `fstatfs` 确认 `Fstypename=apfs` 与 `MNT_LOCAL`，再通过 `fgetattrlist(ATTR_VOL_CAPABILITIES)` 要求 `VOL_CAP_INT_RENAME_EXCL` 和 `VOL_CAP_INT_FLOCK` 同时 valid/supported。无法确认、网络卷或缺失能力时直接失败。随后复用完整公共 required-pass 清单、全仓 `go test -json ./...`、故障注入点和结构化 Oracle。
 
-```bash
-FILECLOUD_RUN_1B_APFS=1 go test ./cmd/filecloud \
-  -run '^TestMacOSAPFSAcceptanceMatrix$' \
-  -count=1 -timeout=30m -v
-```
+APFS 的公共 `filesystem-primitives` 证明实测 no-follow、文件身份、`RENAME_EXCL` 与 hard link 不覆盖、卷的大小写 lookup 模式、同目录 rename、目录 fd 同步、独立进程排他锁和旧 fd 行为。旧 fd 在 pathname 被 checkout 替换后仍写入旧 inode，活动路径不受影响；若旧 inode 已无目录项，最后一个 fd 关闭后该延迟写可能消失，因此该行为属于明确警告边界，不是第一阶段绝对无损保证。详细 spike 与来源见 [macOS/APFS 文件系统原语 spike](../research/macos-apfs-primitives.md)。APFS 门禁证明进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
 
-门禁在仓库所在挂载创建专用根，通过 held worktree fd 的 `fstatfs` 确认 `Fstypename=apfs` 与 `MNT_LOCAL`，再通过 `fgetattrlist(ATTR_VOL_CAPABILITIES)` 要求 `VOL_CAP_INT_RENAME_EXCL` 和 `VOL_CAP_INT_FLOCK` 同时 valid/supported。无法确认、网络卷或缺失能力时直接失败。随后复用 1A 的完整 required-pass 清单、全仓 `go test -json ./...`、故障注入点和结构化 Oracle，不维护缩减的 APFS 套件。
-
-APFS 还必须产生额外的 `filesystem-primitives` 证明，因此精确要求 109 条结构化证明；该证明实测 no-follow、文件身份、`RENAME_EXCL` 与 hard link 不覆盖、卷的大小写 lookup 模式、同目录 rename、目录 fd 同步、独立进程排他锁和旧 fd 行为。旧 fd 在 pathname 被 checkout 替换后仍写入旧 inode，活动路径不受影响；若旧 inode 已无目录项，最后一个 fd 关闭后该延迟写可能消失，因此该行为属于明确警告边界，不是第一阶段绝对无损保证。详细 spike 与来源见 [macOS/APFS 文件系统原语 spike](../research/macos-apfs-primitives.md)。APFS 门禁证明进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
-
-## Windows/NTFS 1B 可执行门禁
-
-Windows/NTFS 门禁必须在 Windows 主机的本地固定 NTFS checkout 中显式运行；普通回归和 Linux 交叉编译不构成 NTFS 通过：
-
-```powershell
-$env:FILECLOUD_RUN_1B_NTFS=1
-go test ./cmd/filecloud -run '^TestWindowsNTFSAcceptanceMatrix$' -count=1 -timeout=30m -v
-```
+## Windows/NTFS 平台边界
 
 绑定从已打开的目录句柄读取卷信息，只接受 `NTFS`、`DRIVE_FIXED` 和 reparse point、hard-link、persistent ACL、Unicode 能力齐全的卷；网络盘、映射盘及无法确认能力的卷直接拒绝。每个工作目录路径段必须由相对父句柄的 `NtCreateFile` 以 `OBJ_DONT_REPARSE` 和 `FILE_OPEN_REPARSE_POINT` 打开，禁止降级成全路径操作。门禁必须记录 no-follow、稳定文件 ID、no-replace rename、目录 flush、跨进程锁以及未共享 delete 的占用文件导致 rename 明确失败且源内容保留。详情和一手来源见 [Windows/NTFS 文件系统原语 spike](../research/windows-ntfs-primitives.md)。
 
-当前非 Windows 主机只能交叉编译该实现；实机 gate 的 skip 不能被解释为 NTFS 通过。
+非 Windows 主机只能交叉编译该实现；实机 gate 的 skip 不能被解释为 NTFS 通过。Linux/ext4 与 macOS/APFS 同理。
 
 ## 1C 运维命令
 

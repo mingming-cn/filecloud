@@ -21,7 +21,7 @@ the verified worktree.
 
 ## Required runtime proof
 
-`TestWindowsNTFSPrimitives` and `TestWindowsNTFSAcceptanceMatrix` are expected
+`TestWindowsNTFSPrimitives` and `TestCrossPlatformAcceptanceMatrix` are expected
 to record the following before an NTFS claim is made:
 
 1. Reparse points cannot be traversed while scanning, checkout, or recovery.
@@ -36,8 +36,8 @@ to record the following before an NTFS claim is made:
 The gate is run only with:
 
 ```powershell
-$env:FILECLOUD_RUN_1B_NTFS=1
-go test ./cmd/filecloud -run '^TestWindowsNTFSAcceptanceMatrix$' -count=1 -timeout=30m -v
+$env:FILECLOUD_RUN_1B=1
+go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -timeout=30m -v
 ```
 
 ## Primary sources

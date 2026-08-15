@@ -33,14 +33,14 @@ func requireNTFS(directory *os.File) error {
 		return fmt.Errorf("identify worktree volume: %w", err)
 	}
 	if windows.GetDriveType(root) != windows.DRIVE_FIXED {
-		return errors.New("unsupported worktree volume; local fixed NTFS is required")
+		return validateSupportedFilesystemPolicy("windows", "unknown", false)
 	}
 	substituted, err := substitutedDrive(windows.UTF16PtrToString(root))
 	if err != nil {
 		return fmt.Errorf("inspect worktree volume mapping: %w", err)
 	}
 	if substituted {
-		return errors.New("unsupported worktree volume; substituted drives are not accepted")
+		return validateSupportedFilesystemPolicy("windows", "ntfs", false)
 	}
 	var serial, maximum uint32
 	var flags uint32
@@ -50,8 +50,8 @@ func requireNTFS(directory *os.File) error {
 		return fmt.Errorf("inspect NTFS volume: %w", err)
 	}
 	name := windows.UTF16ToString(filesystem)
-	if !strings.EqualFold(name, "NTFS") {
-		return fmt.Errorf("unsupported worktree filesystem %q; local NTFS is required", name)
+	if err := validateSupportedFilesystemPolicy("windows", name, true); err != nil {
+		return err
 	}
 	if flags&_requiredNTFSVolumeFlags != _requiredNTFSVolumeFlags {
 		return fmt.Errorf("unsupported NTFS capabilities 0x%x; reparse points, hard links, persistent ACLs, and Unicode are required", flags)

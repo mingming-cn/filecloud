@@ -24,15 +24,15 @@ func requireExt4(directory *os.File) error {
 	if err := syscall.Fstatfs(int(directory.Fd()), &info); err != nil {
 		return fmt.Errorf("inspect worktree filesystem: %w", err)
 	}
-	if uint64(info.Type) != _ext4Magic {
-		return fmt.Errorf("unsupported worktree filesystem type 0x%x; local Linux ext4 is required", uint64(info.Type))
-	}
 	filesystem, err := mountedFilesystemForDirectory(directory)
 	if err != nil {
 		return fmt.Errorf("identify worktree filesystem: %w", err)
 	}
-	if filesystem != "ext4" {
-		return fmt.Errorf("unsupported worktree filesystem %s; local Linux ext4 is required", filesystem)
+	if err := validateSupportedFilesystemPolicy("linux", filesystem, true); err != nil {
+		return err
+	}
+	if uint64(info.Type) != _ext4Magic {
+		return fmt.Errorf("ext4 worktree has unexpected filesystem type 0x%x", uint64(info.Type))
 	}
 	return nil
 }

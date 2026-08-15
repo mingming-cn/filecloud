@@ -1,6 +1,6 @@
 # filecloud
 
-面向多设备的内容寻址文件同步系统。当前已实现单节点服务端、Linux/ext4 1A 与 macOS/APFS 1B 正确性闭环；Windows/NTFS 和 1C 运维能力仍按第一阶段计划推进。
+面向多设备的内容寻址文件同步系统。当前已实现单节点服务端，以及 Linux/ext4、macOS/APFS、Windows/NTFS 共用同一契约的 1B 跨平台验收门禁；1C 运维能力仍按第一阶段计划推进。
 
 ## 文档
 
@@ -22,25 +22,19 @@
 go test ./...
 ```
 
-Linux/ext4 1A 验收门禁必须在本地 ext4 checkout 中显式运行：
+1B 跨平台门禁在 Linux/ext4、macOS/APFS、Windows/NTFS 上使用同一测试名、场景清单和证明契约。必须在对应的本地文件系统 checkout 中显式运行；交叉编译不能代替实机门禁：
 
 ```bash
-FILECLOUD_RUN_1A=1 go test ./cmd/filecloud \
-  -run '^TestLinuxExt4AcceptanceMatrix$' \
+FILECLOUD_RUN_1B=1 go test ./cmd/filecloud \
+  -run '^TestCrossPlatformAcceptanceMatrix$' \
   -count=1 -timeout=30m -v
 ```
 
-macOS/APFS 1B 门禁必须在本地 APFS checkout 中显式运行；交叉编译不能代替该门禁：
-
-```bash
-FILECLOUD_RUN_1B_APFS=1 go test ./cmd/filecloud \
-  -run '^TestMacOSAPFSAcceptanceMatrix$' \
-  -count=1 -timeout=30m -v
-```
-
-Windows/NTFS 1B 门禁必须在本地固定 NTFS checkout 中显式运行；Linux 交叉编译不能代替该门禁：
+PowerShell 使用相同入口：
 
 ```powershell
-$env:FILECLOUD_RUN_1B_NTFS=1
-go test ./cmd/filecloud -run '^TestWindowsNTFSAcceptanceMatrix$' -count=1 -timeout=30m -v
+$env:FILECLOUD_RUN_1B=1
+go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -timeout=30m -v
 ```
+
+绑定只接受本地 ext4、APFS 或固定 NTFS。NFS、SMB、FAT/exFAT、网络映射盘和无法确认必要原子性的卷会在创建客户端状态或访问远端前明确拒绝。
