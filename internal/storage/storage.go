@@ -211,6 +211,34 @@ func (s *Store) ObjectsDir() string {
 	return s.objectsDir
 }
 
+// CheckReady verifies metadata access, object storage writes, and the held data-directory lock.
+func (s *Store) CheckReady(ctx context.Context) error {
+	if err := s.lock.check(); err != nil {
+		return fmt.Errorf("check data-directory lock: %w", err)
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1").Scan(&version); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	probe, err := os.CreateTemp(s.objectsDir, ".ready-*")
+	if err != nil {
+		return fmt.Errorf("create object storage probe: %w", err)
+	}
+	name := probe.Name()
+	if err := probe.Close(); err != nil {
+		return errors.Join(fmt.Errorf("close object storage probe: %w", err), removeReadyProbe(name))
+	}
+	return removeReadyProbe(name)
+}
+
+func removeReadyProbe(name string) error {
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("remove object storage probe: %w", err)
+	}
+	return nil
+}
+
 // Close closes the metadata database and releases the data-directory lock.
 func (s *Store) Close() error {
 	return errors.Join(s.db.Close(), s.lock.Close())

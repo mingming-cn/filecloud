@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -42,6 +44,37 @@ func TestRunInitAndArguments(t *testing.T) {
 				t.Fatalf("run(%q) error = %v, want %q", test.args, err, test.want)
 			}
 		})
+	}
+}
+
+func TestRunLogsStructuredCommandLifecycleWithoutSensitivePaths(t *testing.T) {
+	sensitivePath := filepath.Join(t.TempDir(), "private", "metadata.db")
+	var logs bytes.Buffer
+	err := run(t.Context(), []string{"serve", "--data-dir", sensitivePath, "--listen", "127.0.0.1:0"},
+		strings.NewReader(""), io.Discard, &logs)
+	if err == nil {
+		t.Fatal("serve with missing data directory unexpectedly succeeded")
+	}
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("log lines = %q, want start and completion", lines)
+	}
+	for index, line := range lines {
+		var event map[string]string
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode log line %d %q: %v", index, line, err)
+		}
+		for _, field := range []string{"time", "level", "command", "library", "phase", "error_category"} {
+			if _, ok := event[field]; !ok {
+				t.Errorf("log line %d missing %s: %v", index, field, event)
+			}
+		}
+		if event["command"] != "serve" {
+			t.Errorf("log command = %q, want serve", event["command"])
+		}
+	}
+	if strings.Contains(logs.String(), sensitivePath) || strings.Contains(logs.String(), "metadata.db") {
+		t.Fatalf("logs exposed internal path: %q", logs.String())
 	}
 }
 
@@ -126,6 +159,52 @@ func TestServeResourceLimitFlags(t *testing.T) {
 		command.stop()
 		t.Fatal("timed out waiting for serve with custom KDF capacities")
 	}
+}
+
+func TestRequestTrackerStopsNewWorkAndDrainsActiveRequest(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	requestDone := make(chan struct{})
+	tracker := newRequestTracker(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	go func() {
+		defer close(requestDone)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Errorf("request panic: %v", recovered)
+			}
+		}()
+		tracker.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}()
+	<-started
+
+	tracker.stop()
+	rejected := httptest.NewRecorder()
+	tracker.ServeHTTP(rejected, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rejected.Code != http.StatusServiceUnavailable {
+		t.Fatalf("request after stop status = %d, want %d", rejected.Code, http.StatusServiceUnavailable)
+	}
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Errorf("wait panic: %v", recovered)
+			}
+		}()
+		tracker.wait()
+	}()
+	select {
+	case <-waitDone:
+		t.Fatal("tracker drained before active request completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-requestDone
+	<-waitDone
 }
 
 func TestServeHealthLockConflictAndShutdown(t *testing.T) {

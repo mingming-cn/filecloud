@@ -110,6 +110,40 @@ func TestSessionPersistenceExpiryRevocationAndPasswordReset(t *testing.T) {
 	}
 }
 
+func TestSessionRevocationPersistsAcrossRestart(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := Init(t.Context(), dataDir); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	store, err := OpenForServe(t.Context(), dataDir)
+	if err != nil {
+		t.Fatalf("OpenForServe: %v", err)
+	}
+	now := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := store.CreateUser(t.Context(), User{ID: "owner", Username: "alice", PasswordHash: "hash"}, now); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	tokenHash := sha256.Sum256([]byte("restart-token"))
+	if err := store.CreateSession(t.Context(), "owner", tokenHash, "device", now, now.Add(time.Hour)); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if revoked, err := store.RevokeSession(t.Context(), tokenHash, now.Add(time.Minute)); err != nil || !revoked {
+		t.Fatalf("RevokeSession = %v, %v; want true, nil", revoked, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = OpenForServe(t.Context(), dataDir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer closeAccountStore(t, store)
+	if _, err := store.FindActiveSession(t.Context(), tokenHash, now.Add(2*time.Minute)); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("FindActiveSession after restart error = %v, want ErrSessionNotFound", err)
+	}
+}
+
 func openAccountStore(t *testing.T) *Store {
 	t.Helper()
 	dataDir := filepath.Join(t.TempDir(), "data")

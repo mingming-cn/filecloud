@@ -24,6 +24,7 @@ import (
 
 	"github.com/mingming-cn/filecloud/internal/auth"
 	"github.com/mingming-cn/filecloud/internal/object"
+	"github.com/mingming-cn/filecloud/internal/opslog"
 	"github.com/mingming-cn/filecloud/internal/storage"
 )
 
@@ -568,7 +569,7 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request, owner, libra
 	}
 	defer func() {
 		if err := file.Close(); err != nil {
-			h.logger.Printf("close object: %v", err)
+			opslog.Error(h.logger, "serve", libraryID, "close_object", err)
 		}
 	}()
 	w.Header().Set("Content-Type", contentType)
@@ -577,7 +578,7 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request, owner, libra
 	w.Header().Set("Cache-Control", "private, immutable")
 	w.WriteHeader(http.StatusOK)
 	if _, err := io.Copy(w, file); err != nil {
-		h.logger.Printf("write object response: %v", err)
+		opslog.Error(h.logger, "serve", libraryID, "write_object_response", err)
 	}
 }
 
@@ -900,11 +901,11 @@ func (h *handler) writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(value); err != nil {
-		h.logger.Printf("write JSON response: %v", err)
+		opslog.Error(h.logger, "serve", "", "write_library_response", err)
 	}
 }
 
 func (h *handler) internal(w http.ResponseWriter, operation string, err error) {
-	h.logger.Printf("%s: %v", operation, err)
+	opslog.Error(h.logger, "serve", "", strings.ReplaceAll(operation, " ", "_"), err)
 	h.writeError(w, http.StatusInternalServerError, 5000, "internal error")
 }

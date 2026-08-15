@@ -16,12 +16,14 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/mingming-cn/filecloud/internal/auth"
 	"github.com/mingming-cn/filecloud/internal/health"
 	libraryapi "github.com/mingming-cn/filecloud/internal/library"
+	"github.com/mingming-cn/filecloud/internal/opslog"
 	"github.com/mingming-cn/filecloud/internal/storage"
 )
 
@@ -50,11 +52,22 @@ func mainCode() int {
 	return 0
 }
 
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
 	if len(args) == 0 {
 		return errors.New("usage: filecloud <init|serve|gc|integrity|user|login|logout|library> [options]")
 	}
-	switch args[0] {
+	command := args[0]
+	logger := log.New(stderr, "", 0)
+	opslog.Info(logger, command, "", "start")
+	defer func() {
+		if retErr != nil {
+			opslog.Error(logger, command, "", "complete", retErr)
+			return
+		}
+		opslog.Info(logger, command, "", "complete")
+	}()
+
+	switch command {
 	case "init":
 		flags := flag.NewFlagSet("init", flag.ContinueOnError)
 		flags.SetOutput(stderr)
@@ -421,6 +434,55 @@ func noRedirectClient() *http.Client {
 	}
 }
 
+type requestTracker struct {
+	handler http.Handler
+	mu      sync.Mutex
+	stopped bool
+	active  int
+	allDone chan struct{}
+}
+
+func newRequestTracker(handler http.Handler) *requestTracker {
+	return &requestTracker{handler: handler, allDone: make(chan struct{})}
+}
+
+func (t *requestTracker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	t.mu.Lock()
+	if t.stopped {
+		t.mu.Unlock()
+		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+		return
+	}
+	t.active++
+	t.mu.Unlock()
+
+	defer func() {
+		t.mu.Lock()
+		t.active--
+		if t.stopped && t.active == 0 {
+			close(t.allDone)
+		}
+		t.mu.Unlock()
+	}()
+	t.handler.ServeHTTP(w, r)
+}
+
+func (t *requestTracker) stop() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped {
+		return
+	}
+	t.stopped = true
+	if t.active == 0 {
+		close(t.allDone)
+	}
+}
+
+func (t *requestTracker) wait() {
+	<-t.allDone
+}
+
 func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Writer, authConfig auth.HandlerConfig, uploadConfig storage.UploadConfig, headConfig libraryapi.HeadValidationConfig) (retErr error) {
 	store, err := storage.OpenForServe(ctx, dataDir)
 	if err != nil {
@@ -432,7 +494,7 @@ func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Write
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	logger := log.New(stderr, "filecloud: ", log.LstdFlags)
+	logger := log.New(stderr, "", 0)
 	sessions, err := auth.NewHandler(store, logger, authConfig)
 	if err != nil {
 		return errors.Join(err, listener.Close())
@@ -446,9 +508,10 @@ func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Write
 	mux.Handle("/v1/sessions/current", sessions)
 	mux.Handle("/v1/libraries", libraries)
 	mux.Handle("/v1/libraries/", libraries)
-	mux.Handle("/", health.NewHandler(store.DB(), store.ObjectsDir(), logger))
+	mux.Handle("/", health.NewHandler(store, logger))
+	requests := newRequestTracker(mux)
 	server := &http.Server{
-		Handler: mux, ErrorLog: logger,
+		Handler: requests, ErrorLog: log.New(opslog.RedactedWriter(logger, "serve", "", "http_server"), "", 0),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       _requestReadPeriod,
 	}
@@ -463,9 +526,18 @@ func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Write
 				shutdownErr <- fmt.Errorf("shutdown panic: %v", recovered)
 			}
 		}()
+		requests.stop()
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), _shutdownPeriod)
 		defer cancel()
-		shutdownErr <- server.Shutdown(shutdownCtx)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			opslog.Error(logger, "serve", "", "force_shutdown", err)
+			closeErr := server.Close()
+			requests.wait()
+			shutdownErr <- errors.Join(err, closeErr)
+			return
+		}
+		requests.wait()
+		shutdownErr <- nil
 	})
 	serveErr := server.Serve(listener)
 	if stopShutdown() {

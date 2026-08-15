@@ -15,7 +15,7 @@ import (
 )
 
 func TestHealthzDoesNotAccessStorage(t *testing.T) {
-	handler := NewHandler(nil, filepath.Join(t.TempDir(), "missing"), log.New(&bytes.Buffer{}, "", 0))
+	handler := NewHandler(nil, log.New(&bytes.Buffer{}, "", 0))
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
@@ -27,7 +27,7 @@ func TestReadyzChecksDatabaseAndObjectStorage(t *testing.T) {
 		store, _ := openStore(t)
 		defer closeStore(t, store)
 
-		response := serveRequest(NewHandler(store.DB(), store.ObjectsDir(), nil), "/readyz")
+		response := serveRequest(NewHandler(store, nil), "/readyz")
 		assertResponse(t, response, http.StatusOK, _successBody)
 	})
 
@@ -38,7 +38,7 @@ func TestReadyzChecksDatabaseAndObjectStorage(t *testing.T) {
 			t.Fatalf("close database: %v", err)
 		}
 
-		response := serveRequest(NewHandler(store.DB(), store.ObjectsDir(), nil), "/readyz")
+		response := serveRequest(NewHandler(store, nil), "/readyz")
 		assertUnavailable(t, response, filepath.Join(dataDir, "metadata.db"))
 	})
 
@@ -49,19 +49,20 @@ func TestReadyzChecksDatabaseAndObjectStorage(t *testing.T) {
 			t.Fatalf("remove objects directory: %v", err)
 		}
 
-		response := serveRequest(NewHandler(store.DB(), store.ObjectsDir(), nil), "/readyz")
+		response := serveRequest(NewHandler(store, nil), "/readyz")
 		assertUnavailable(t, response, store.ObjectsDir())
 	})
 }
 
 func TestHandlerLogsResponseWriteErrors(t *testing.T) {
 	var logs bytes.Buffer
-	handler := NewHandler(nil, "", log.New(&logs, "", 0))
+	handler := NewHandler(nil, log.New(&logs, "", 0))
 	response := &failingResponseWriter{header: make(http.Header)}
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
-	if !strings.Contains(logs.String(), "write health response: write JSON body: broken pipe") {
-		t.Fatalf("log = %q, want response write error", logs.String())
+	if !strings.Contains(logs.String(), `"phase":"write_health_response"`) ||
+		!strings.Contains(logs.String(), `"error_category":"unavailable"`) || strings.Contains(logs.String(), "broken pipe") {
+		t.Fatalf("log = %q, want redacted response write category", logs.String())
 	}
 }
 

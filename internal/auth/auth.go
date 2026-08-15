@@ -22,6 +22,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mingming-cn/filecloud/internal/opslog"
 	"github.com/mingming-cn/filecloud/internal/storage"
 	"golang.org/x/crypto/argon2"
 )
@@ -357,7 +358,7 @@ func RequireSession(store *storage.Store, now func() time.Time, logger *log.Logg
 			return
 		}
 		if err != nil {
-			logger.Printf("authenticate session: %v", err)
+			opslog.Error(logger, "serve", "", "authenticate_session", err)
 			writeAuthenticationJSON(w, http.StatusInternalServerError, 5000, "internal error", logger)
 			return
 		}
@@ -383,7 +384,7 @@ func writeAuthenticationJSON(w http.ResponseWriter, status, code int, message st
 		RetCode int
 		Message string
 	}{RetCode: code, Message: message}); err != nil {
-		logger.Printf("write JSON response: %v", err)
+		opslog.Error(logger, "serve", "", "write_authentication_response", err)
 	}
 }
 
@@ -586,11 +587,11 @@ func (h *handler) writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(value); err != nil {
-		h.logger.Printf("write JSON response: %v", err)
+		opslog.Error(h.logger, "serve", "", "write_session_response", err)
 	}
 }
 
 func (h *handler) internal(w http.ResponseWriter, operation string, err error) {
-	h.logger.Printf("%s: %v", operation, err)
+	opslog.Error(h.logger, "serve", "", strings.ReplaceAll(operation, " ", "_"), err)
 	h.writeError(w, http.StatusInternalServerError, 5000, "internal error")
 }

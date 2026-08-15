@@ -174,8 +174,9 @@ func TestLoginRejectsStoredHashParametersThatDifferFromHandlerConfig(t *testing.
 
 			response := request(handler, http.MethodPost, "/v1/sessions",
 				`{"Username":"alice","Password":"correct password","DeviceName":"laptop"}`, "")
-			if response.Code != http.StatusInternalServerError || !strings.Contains(logs.String(), "password hash parameters") {
-				t.Fatalf("mismatched %s response = %d %q, logs = %q; want internal integrity error",
+			if response.Code != http.StatusInternalServerError || !strings.Contains(logs.String(), `"phase":"verify_password_hash"`) ||
+				!strings.Contains(logs.String(), `"error_category":"internal"`) || strings.Contains(logs.String(), "password hash parameters") {
+				t.Fatalf("mismatched %s response = %d %q, logs = %q; want redacted integrity category",
 					test.name, response.Code, response.Body.String(), logs.String())
 			}
 		})
@@ -384,7 +385,8 @@ func TestJSONWriteErrorsAreLogged(t *testing.T) {
 	var logs bytes.Buffer
 	h := &handler{logger: log.New(&logs, "", 0)}
 	h.writeError(failingResponseWriter{header: make(http.Header)}, http.StatusBadRequest, 1000, "invalid request")
-	if !strings.Contains(logs.String(), "write JSON response: output unavailable") {
+	if !strings.Contains(logs.String(), `"phase":"write_session_response"`) ||
+		!strings.Contains(logs.String(), `"error_category":"unavailable"`) || strings.Contains(logs.String(), "output unavailable") {
 		t.Fatalf("logger output = %q", logs.String())
 	}
 }
