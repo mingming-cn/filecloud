@@ -1,6 +1,6 @@
 # 第一阶段验收规范
 
-状态：阶段 0 评审中。所有使用活动绑定并宣称稳定、收敛或恢复完成的端到端同步场景，必须记录平台、文件系统、服务端 Head、客户端 Sync Base、工作树快照和对象存储可达性。预期拒绝的场景记录 Head、Sync Base、工作树和内部路径未被错误推进；服务端故障场景记录旧 Head 的完整可读性；HTTP、对象向量和资源限制测试执行各自的专项 Oracle，不伪造不适用的客户端状态。只检查命令退出码不足以通过验收。
+状态：第一阶段验收基线。所有使用活动绑定并宣称稳定、收敛或恢复完成的端到端同步场景，必须记录平台、文件系统、服务端 Head、客户端 Sync Base、工作树快照和对象存储可达性。预期拒绝的场景记录 Head、Sync Base、工作树和内部路径未被错误推进；服务端故障场景记录旧 Head 的完整可读性；HTTP、对象向量和资源限制测试执行各自的专项 Oracle，不伪造不适用的客户端状态。只检查命令退出码不足以通过验收。
 
 ## 通用 Oracle
 
@@ -68,7 +68,7 @@
 
 删除/修改与类型冲突按上表处理：Remote 类型或删除占原路径，Local 完整对象或子树进入确定冲突路径；目录副本必须包含嵌套文件、空目录和规范 mtime。冲突 leaf 在 UTF-8 边界截短并覆盖 239/240/241 bytes、exact 1024-byte path、ordinal `9→10`/`99→100`、reserved/trailing name 与 case-fold 占用。原父路径无法容纳或运行时 normal ordinal 耗尽时，公开同步矩阵覆盖根冲突目录 absent、exact Directory 复用、exact File 碰撞、case-fold alias 与并发 alias、root ordinal 9999 耗尽、多个同 basename 请求，以及 File/Directory lineage 与 inode 保留；leaf ordinal 9999 由确定性合并器边界测试覆盖。运行时跨父转换还覆盖 root create、Intent、rename、两侧父同步和 Completed 后重启。初次 merge、连续 HeadConflict 和 pending/CAS replay 必须生成相同名称、DirectoryId 与 CommitId；重复同步不新增 Commit。
 
-mtime 固定向量覆盖同 FileId 取规范 UTC 最大值、DirectoryId 仅复用 Local/Remote 时取该侧值、两侧相同或新合成时取最大值；同一整秒内不同实际纳秒且内容不变不生成新对象或 Commit，保留 mtime 的字节变化仍发布新 FileId。结构目录冲突复用逐文件 promotion，并在 Linux/ext4 与 macOS/APFS 上对 Intent、action、父目录同步和 Completed 等公开持久阶段执行进程崩溃重启矩阵。该结论不覆盖物理断电；NTFS 的平台崩溃测试仍属后续工作。
+mtime 固定向量覆盖同 FileId 取规范 UTC 最大值、DirectoryId 仅复用 Local/Remote 时取该侧值、两侧相同或新合成时取最大值；同一整秒内不同实际纳秒且内容不变不生成新对象或 Commit，保留 mtime 的字节变化仍发布新 FileId。结构目录冲突复用逐文件 promotion；统一 1B 矩阵在 Linux/ext4、macOS/APFS 和 Windows/NTFS 上对 Intent、action、父目录同步和 Completed 等可执行持久阶段执行进程崩溃重启测试。需要物理共存大小写别名的 relocation 场景只在大小写敏感文件系统执行；大小写不敏感 APFS/NTFS 的精确跳过必须由同次门禁的文件系统原语证明补位。该结论不覆盖物理断电、控制器缓存或硬件故障。
 
 ## 扫描竞态
 
@@ -146,6 +146,8 @@ go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -tim
 门禁在仓库所在挂载创建专用 `TMPDIR`，通过 held worktree fd、`statfs` 和 `/proc/self/mountinfo` 的设备号及最深挂载点共同确认 fstype 精确为 `ext4`；无法确认、ext2、ext3 或其他文件系统直接失败。随后在该根下执行完整 `go test -json ./...`，任何测试失败或非子进程 helper 的具名测试 skip 都使门禁失败；`go test -json` 为无测试文件包生成的 package-level skip 没有测试名，不属于场景 skip。关键场景清单还必须逐项产生 pass，因此测试被删除、重命名或环境不满足时不能空匹配通过。correctness worktree、对象发布和 Head 更新的 crash data dir 均来自同一个已验证 ext4 根。
 
 2026-08-15 的验收记录：Linux 7.1.8-zen1-3-zen（x86_64）、Go 1.26.5、本地 ext4；完整统一门禁、required-pass 与 112 条结构化证明全部通过，固定收敛 Root 为 `746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599`，Head 为 `6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`。
+
+2026-08-16 在提交 `98b3030` 上复验：Linux 7.1.8-zen1-3-zen（x86_64）、Go 1.26.5、本地 ext4；修复 1B 与 1C 性能测试隔离后，完整统一门禁、required-pass 与 112 条结构化证明再次全部通过。APFS 与 NTFS 的当前 HEAD 支持声明仍需对应目标主机重新执行同一门禁；交叉编译不作为替代证据。
 
 稳定绑定、同步、传输恢复和 checkout 崩溃恢复场景输出以 `FILECLOUD_ATTESTATION` 开头的严格 JSON 记录。门禁按精确白名单拒绝缺失、重复、未知、无法完整解码或带未知字段的记录，并分别验证 `Head == Sync Base`、`Head Root == Sync Base Root ==` 独立重扫的工作树快照、完整 Head parent 历史对象可达、确认输入摘要集合完整保留、journal 清空且无未登记内部路径。双空场景允许确认输入集合为空；100 MiB 场景以流式 SHA-256 验证内容，不在 Oracle 中重复缓存整文件。完整 bind/sync checkout 文件系统动作矩阵的每个动作和崩溃边界各自产生证明，顶层矩阵测试名也在 required-pass 清单中。对象发布和 Head 更新矩阵在每个真实子进程 `SIGKILL` 点重开存储，输出旧 Head 与当前 Head，并逐对象验证旧 Head 的 Commit、Directory、File 和 Block 仍可读。三平台门禁均精确要求 112 条结构化证明：既有收敛、可读性和 bind/sync `between_create_identity` 恢复证明，加上一条固定向量证明、两条固定双设备收敛证明和一条平台文件系统原语证明。固定向量由生产规范化、冲突命名和合并函数实际计算，并与冻结 ObjectId map 比较；固定收敛使用相同设备 ID、整秒 mtime 和提交时钟，要求两端及三平台均得到 Root `746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599` 与 Head `6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`。这些进程测试只证明进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
 

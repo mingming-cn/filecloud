@@ -1,6 +1,6 @@
 # Filecloud 同步设计
 
-状态：阶段 0 评审中。
+状态：第一阶段实现基线。1A、1B、1C 已落地；平台支持声明仍以目标主机最近一次显式门禁记录为准。
 
 本文定义第一阶段的领域模型、持久化不变量、同步状态机、冲突语义和部署边界。HTTP 细节见 [HTTP API 契约](./http-api.md)，实施顺序见 [第一阶段计划](./phase-1-plan.md)。标记为不变量的承诺必须先通过状态机模型测试和 ext4/APFS/NTFS 文件系统 spike，才能转为冻结基线。
 
@@ -244,7 +244,7 @@ mtime 规则：只有一侧路径状态改变时采用该侧；双方 FileId 或
 
 协议 mtime 唯一形式是 UTC 整秒 `2006-01-02T15:04:05Z`；格式化先转 UTC 并 truncate 到秒，解析只接受 exact round-trip。扫描始终完整哈希内容，因此同一整秒内的文件系统亚秒差异不改变 DirectoryId/CommitId，而保留 mtime 的字节变化仍改变 FileId。rollback root 的原始时间是实际文件系统恢复证据，不进入协议 mtime helper；Linux 保留纳秒，Darwin 的 fd `futimes` 边界规范到微秒。
 
-合并 Candidate checkout 时，捕获的本地冲突文件从内部 recovery 直接以 journaled no-replace rename 提升到 Candidate 的固定冲突路径，保留 inode 和旧文件描述符身份。promotion 后再次变化的同一 inode 被提升到下一个确定后缀，固定 Candidate 路径从不可变对象恢复；Sync Base 只推进到固定 Candidate，并明确要求下一轮同步发布 late 可见副本。跨父 rename 的源父身份记录在 `fs_actions`；目标父属于固定 Candidate 时取同一 checkout 的耐久 `checkout_paths`，运行时切换到根 fallback 时则在 promotion action 中以严格规范编码固定目标父身份。缺失的 fallback 根由绑定到 promotion root 的可见 `create_directory` journal 动作创建；exact Directory 可复用，exact 非 Directory 或 case-fold alias 只推进 ordinal，不收养或覆盖。两侧父目录均在 Completed 前同步。结构目录冲突复用相同的逐文件 promotion；进程崩溃测试覆盖 root create、Intent、跨父 rename、父目录同步和 Completed 的耐久阶段，仅声明 Linux 进程崩溃恢复，不声明断电或 APFS/NTFS 语义。
+合并 Candidate checkout 时，捕获的本地冲突文件从内部 recovery 直接以 journaled no-replace rename 提升到 Candidate 的固定冲突路径，保留 inode 和旧文件描述符身份。promotion 后再次变化的同一 inode 被提升到下一个确定后缀，固定 Candidate 路径从不可变对象恢复；Sync Base 只推进到固定 Candidate，并明确要求下一轮同步发布 late 可见副本。跨父 rename 的源父身份记录在 `fs_actions`；目标父属于固定 Candidate 时取同一 checkout 的耐久 `checkout_paths`，运行时切换到根 fallback 时则在 promotion action 中以严格规范编码固定目标父身份。缺失的 fallback 根由绑定到 promotion root 的可见 `create_directory` journal 动作创建；exact Directory 可复用，exact 非 Directory 或 case-fold alias 只推进 ordinal，不收养或覆盖。两侧父目录均在 Completed 前同步。结构目录冲突复用相同的逐文件 promotion；统一 1B 矩阵在 ext4、APFS 和 NTFS 上覆盖 root create、Intent、跨父 rename、父目录同步和 Completed 等可执行场景的进程崩溃恢复。需要在同一目录物理共存大小写别名的场景只在大小写敏感文件系统执行；大小写不敏感 APFS/NTFS 的门禁以严格白名单允许这些场景跳过，并要求同次文件系统原语证明补位。该矩阵不声明物理断电或存储控制器故障下的绝对持久性。
 
 ## 路径规则
 

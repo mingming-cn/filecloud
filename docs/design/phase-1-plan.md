@@ -1,6 +1,6 @@
 # 第一阶段实施计划
 
-状态：阶段 0 评审中。第一阶段最终仍交付单节点 Go 服务端与 Linux/macOS/Windows Go CLI，但按 1A、1B、1C 递进验收。CAS、pending publication、对象校验和 checkout journal 不能因拆阶段而删减。
+状态：第一阶段实现已完成，并按 1A、1B、1C 递进验收。单节点 Go 服务端与 Linux/macOS/Windows Go CLI 已落地；各平台支持声明以对应目标文件系统的最近一次实机门禁记录为准。CAS、pending publication、对象校验和 checkout journal 不因拆阶段而删减。
 
 详细故障注入和平台断言见 [验收规范](./acceptance-tests.md)。
 
