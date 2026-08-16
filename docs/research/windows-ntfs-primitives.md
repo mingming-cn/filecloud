@@ -45,6 +45,15 @@ structured attestations. Deterministic convergence produced Root
 `746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599` and Head
 `6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`.
 
+Acceptance rerun from 2026-08-16: commit `ff9afc3` passed the same unified gate
+on Windows 11 (Microsoft Windows NT 10.0.26200.0, amd64) with Go 1.26.6 and a
+healthy local fixed NTFS volume presented by KVM/QEMU. Every required scenario
+and all 112 structured attestations passed; deterministic Root and Head matched
+the frozen values above. The first rerun exposed a non-portable test assertion
+that required an immediate measurement to have a positive clock delta;
+`ff9afc3` removed that timer-resolution assumption before all three platform
+gates were rerun.
+
 ## Primary sources
 
 - Microsoft, [NtCreateFile] (https://learn.microsoft.com/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntcreatefile): relative root handles and create options.

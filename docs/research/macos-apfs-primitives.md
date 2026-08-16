@@ -34,6 +34,8 @@
 
 2026-08-15 的验收记录：macOS 26.5.1（Darwin 25.5.0，arm64）、Go 1.26.5、本地大小写不敏感 APFS；完整统一门禁、required-pass 与 112 条结构化证明全部通过，`casefoldLookup=case-insensitive-alias`。固定收敛 Root 为 `746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599`，Head 为 `6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`。
 
+2026-08-16 在提交 `ff9afc3` 上复验：同一 macOS 26.5.1、Go 1.26.5 和本地大小写不敏感 APFS 环境再次通过完整统一门禁、required-pass 与 112 条结构化证明；固定 Root、Head 和 `casefoldLookup` 均与冻结值一致。
+
 运行命令：
 
 ```bash
