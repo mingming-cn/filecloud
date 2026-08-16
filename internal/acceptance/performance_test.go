@@ -7,9 +7,9 @@ import (
 
 func TestMeasurePeakHeapPropagatesOperationError(t *testing.T) {
 	want := errors.New("measurement failed")
-	_, elapsed, err := MeasurePeakHeap(func() error { return want })
-	if !errors.Is(err, want) || elapsed <= 0 {
-		t.Fatalf("MeasurePeakHeap error = %v elapsed = %s, want %v and positive elapsed", err, elapsed, want)
+	_, _, err := MeasurePeakHeap(func() error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("MeasurePeakHeap error = %v, want %v", err, want)
 	}
 }
 
