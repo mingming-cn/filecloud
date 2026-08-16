@@ -157,8 +157,8 @@ func TestSafetyDefaultsMatch1CBaseline(t *testing.T) {
 		head.MaxValidatedObjects != 2000000 {
 		t.Fatalf("Head validation defaults = %+v", head)
 	}
-	if _requestReadPeriod != 30*time.Second || _shutdownPeriod != 5*time.Second {
-		t.Fatalf("request/shutdown defaults = %s/%s", _requestReadPeriod, _shutdownPeriod)
+	if _requestReadPeriod != 30*time.Second || _shutdownPeriod != 5*time.Second || _clientRequestPeriod != 3*time.Minute {
+		t.Fatalf("request/shutdown/client defaults = %s/%s/%s", _requestReadPeriod, _shutdownPeriod, _clientRequestPeriod)
 	}
 }
 

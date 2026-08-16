@@ -43,25 +43,27 @@ const (
 
 // Config contains deterministic handler seams.
 type Config struct {
-	Now              func() time.Time
-	PageTokenKey     []byte
-	BeforeHeadUpdate func() error
-	AfterHeadUpdate  func() error
-	Upload           storage.UploadConfig
-	HeadValidation   HeadValidationConfig
-	headLimiter      *headValidationLimiter
+	Now                      func() time.Time
+	PageTokenKey             []byte
+	BeforeHeadUpdate         func() error
+	AfterHeadUpdate          func() error
+	Upload                   storage.UploadConfig
+	HeadValidation           HeadValidationConfig
+	headLimiter              *headValidationLimiter
+	afterHeadValidationAdmit func(context.Context)
 }
 
 type handler struct {
-	store            *storage.Store
-	logger           *log.Logger
-	now              func() time.Time
-	pageTokenAEAD    cipher.AEAD
-	beforeHeadUpdate func() error
-	afterHeadUpdate  func() error
-	uploadTimeout    time.Duration
-	headValidation   HeadValidationConfig
-	headLimiter      *headValidationLimiter
+	store                    *storage.Store
+	logger                   *log.Logger
+	now                      func() time.Time
+	pageTokenAEAD            cipher.AEAD
+	beforeHeadUpdate         func() error
+	afterHeadUpdate          func() error
+	uploadTimeout            time.Duration
+	headValidation           HeadValidationConfig
+	headLimiter              *headValidationLimiter
+	afterHeadValidationAdmit func(context.Context)
 }
 
 // NewHandler constructs authenticated create, list, and get library endpoints.
@@ -110,15 +112,16 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 		return nil, fmt.Errorf("create page token aead: %w", err)
 	}
 	h := &handler{
-		store:            store,
-		logger:           logger,
-		now:              config.Now,
-		pageTokenAEAD:    pageTokenAEAD,
-		beforeHeadUpdate: config.BeforeHeadUpdate,
-		afterHeadUpdate:  config.AfterHeadUpdate,
-		uploadTimeout:    upload.RequestTimeout,
-		headValidation:   headValidation,
-		headLimiter:      config.headLimiter,
+		store:                    store,
+		logger:                   logger,
+		now:                      config.Now,
+		pageTokenAEAD:            pageTokenAEAD,
+		beforeHeadUpdate:         config.BeforeHeadUpdate,
+		afterHeadUpdate:          config.AfterHeadUpdate,
+		uploadTimeout:            upload.RequestTimeout,
+		headValidation:           headValidation,
+		headLimiter:              config.headLimiter,
+		afterHeadValidationAdmit: config.afterHeadValidationAdmit,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}", h.create)

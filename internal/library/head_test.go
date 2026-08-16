@@ -2,6 +2,7 @@ package library
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -77,6 +78,9 @@ func TestHeadValidationDeadlineReleasesWorkPool(t *testing.T) {
 	handler, store, _ := newTestHandlerWithConfig(t, Config{
 		HeadValidation: HeadValidationConfig{GlobalConcurrency: 1, RequestTimeout: time.Nanosecond},
 		headLimiter:    limiter,
+		afterHeadValidationAdmit: func(ctx context.Context) {
+			<-ctx.Done()
+		},
 	})
 	defer closeStore(t, store)
 	createHeadLibrary(t, handler)

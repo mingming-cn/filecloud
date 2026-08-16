@@ -40,6 +40,7 @@ const (
 	_defaultUsernameKDFCapacity = 1
 	_shutdownPeriod             = 5 * time.Second
 	_requestReadPeriod          = 30 * time.Second
+	_clientRequestPeriod        = 3 * time.Minute
 )
 
 func main() {
@@ -442,7 +443,7 @@ func validateServerURL(raw string) (*url.URL, error) {
 
 func noRedirectClient() *http.Client {
 	return &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: _clientRequestPeriod,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

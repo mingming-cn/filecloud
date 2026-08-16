@@ -92,6 +92,9 @@ func (h *handler) updateHead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseValidation()
+	if h.afterHeadValidationAdmit != nil {
+		h.afterHeadValidationAdmit(validationRequest.Context())
+	}
 	missing, introduced, err := h.validateCandidate(validationRequest, owner, libraryID, current.HeadCommitID, commitID)
 	releaseValidation()
 	switch {
