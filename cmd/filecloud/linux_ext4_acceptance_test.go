@@ -37,6 +37,7 @@ func platformMatrixScenarios() []platformMatrixScenario {
 		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestCrossPlatformFixedObjectIDs"},
 		{category: "fixed convergence", packagePath: "./cmd/filecloud", test: "TestCrossPlatformDeterministicConvergence"},
 		{category: "correctness oracle", packagePath: "./cmd/filecloud", test: "TestPlatformCorrectnessLoop"},
+		{category: "real process acceptance", packagePath: "./cmd/filecloud", test: "TestBuiltBinaryEndToEndAcceptance"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindConcurrentInitializationAdoptsWinner"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindImportsLocalSnapshotAndSyncNoOps"},
@@ -117,6 +118,7 @@ func TestPlatformMatrixWiresFullScenarioSet(t *testing.T) {
 		"TestCrossPlatformFixedObjectIDs",
 		"TestCrossPlatformDeterministicConvergence",
 		"TestPlatformCorrectnessLoop",
+		"TestBuiltBinaryEndToEndAcceptance",
 		"TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly",
 		"TestScanRegularFileRetriesConcurrentRewrite",
 		"TestFSActionSubprocessCrashMatrix",
@@ -676,8 +678,8 @@ func TestRequiredPlatformAttestationCounts(t *testing.T) {
 		{platform: "darwin", filesystem: "apfs"},
 		{platform: "windows", filesystem: "ntfs"},
 	} {
-		if got := len(requiredPlatformAttestations(test.platform, test.filesystem)); got != 112 {
-			t.Fatalf("%s/%s attestations=%d, want 112", test.platform, test.filesystem, got)
+		if got := len(requiredPlatformAttestations(test.platform, test.filesystem)); got != 113 {
+			t.Fatalf("%s/%s attestations=%d, want 113", test.platform, test.filesystem, got)
 		}
 	}
 }
@@ -690,6 +692,7 @@ func uniqueSortedDigests(values []string) []string {
 
 func requiredPlatformAttestations(platform, filesystem string) map[string]string {
 	result := map[string]string{
+		"real binary CLI lifecycle":                       "convergence",
 		"publisher import":                                "convergence",
 		"subscriber checkout":                             "convergence",
 		"independent merge subscriber":                    "convergence",
@@ -1001,6 +1004,20 @@ func assertPlatformConverged(t *testing.T, scenario string, environment libraryC
 	clientDir, worktree string, confirmed []platformConfirmedInput,
 ) clientBinding {
 	t.Helper()
+	return assertPlatformConvergence(t, scenario, environment, clientDir, worktree, confirmed, true)
+}
+
+func assertPlatformConvergedWithoutAttestation(t *testing.T, scenario string, environment libraryCLIEnvironment,
+	clientDir, worktree string, confirmed []platformConfirmedInput,
+) clientBinding {
+	t.Helper()
+	return assertPlatformConvergence(t, scenario, environment, clientDir, worktree, confirmed, false)
+}
+
+func assertPlatformConvergence(t *testing.T, scenario string, environment libraryCLIEnvironment,
+	clientDir, worktree string, confirmed []platformConfirmedInput, emit bool,
+) clientBinding {
+	t.Helper()
 	platform, filesystem, enabled := acceptance.ActivePlatform()
 	if enabled {
 		requireAcceptanceFilesystem(t, worktree, platform, filesystem)
@@ -1051,7 +1068,11 @@ func assertPlatformConverged(t *testing.T, scenario string, environment libraryC
 	if scanErr != nil || closeErr != nil {
 		t.Fatalf("%s rescan: scan=%v close=%v", scenario, scanErr, closeErr)
 	}
-	reachable := inspectPlatformReachability(t, environment, *head.CommitID)
+	owner, err := getLibraryOwner(t.Context(), base, testClientLibraryID, []byte(environment.token))
+	if err != nil {
+		t.Fatalf("%s read library owner: %v", scenario, err)
+	}
+	reachable := inspectPlatformReachability(t, environment, *head.CommitID, owner)
 	preserved := make(map[string]bool, len(reachable.files))
 	for _, digest := range reachable.files {
 		preserved[digest] = true
@@ -1069,12 +1090,14 @@ func assertPlatformConverged(t *testing.T, scenario string, environment libraryC
 	}
 	confirmedDigests := slices.Sorted(maps.Keys(confirmedSet))
 	preservedDigests := slices.Sorted(maps.Keys(preservedSet))
-	emitPlatformAttestation(t, platformAttestation{
-		Kind: "convergence", Scenario: scenario, Platform: platform, Filesystem: filesystem,
-		Head: *head.CommitID, SyncBase: binding.SyncBase, HeadRoot: commit.Root, BaseRoot: binding.SyncBaseRoot,
-		Snapshot: snapshot.root, ReachableObjects: reachable.objects, ConfirmedInputDigests: confirmedDigests,
-		PreservedInputDigests: preservedDigests, ResidualJournalRows: residualRows,
-	})
+	if emit {
+		emitPlatformAttestation(t, platformAttestation{
+			Kind: "convergence", Scenario: scenario, Platform: platform, Filesystem: filesystem,
+			Head: *head.CommitID, SyncBase: binding.SyncBase, HeadRoot: commit.Root, BaseRoot: binding.SyncBaseRoot,
+			Snapshot: snapshot.root, ReachableObjects: reachable.objects, ConfirmedInputDigests: confirmedDigests,
+			PreservedInputDigests: preservedDigests, ResidualJournalRows: residualRows,
+		})
+	}
 	return binding
 }
 
@@ -1090,7 +1113,7 @@ func emitPlatformAttestation(t *testing.T, attestation platformAttestation) {
 	t.Log(line)
 }
 
-func inspectPlatformReachability(t *testing.T, environment libraryCLIEnvironment, head string) platformReachability {
+func inspectPlatformReachability(t *testing.T, environment libraryCLIEnvironment, head, expectedOwner string) platformReachability {
 	t.Helper()
 	base := mustServerURL(t, environment.server.URL)
 	token := []byte(environment.token)
@@ -1196,8 +1219,8 @@ func inspectPlatformReachability(t *testing.T, environment libraryCLIEnvironment
 		}
 		data := fetch("commits", commitID)
 		commit, err := object.VerifyCommit(data, commitID)
-		if err != nil || commit.AuthorUserID != testClientUserID {
-			t.Fatalf("verify reachable commit %s: commit=%+v err=%v", commitID, commit, err)
+		if err != nil || commit.AuthorUserID != expectedOwner {
+			t.Fatalf("verify reachable commit %s: commit=%+v expected_owner=%s err=%v", commitID, commit, expectedOwner, err)
 		}
 		visitDirectory(commit.Root)
 		pending = append(pending, commit.Parents...)

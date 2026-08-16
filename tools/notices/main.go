@@ -41,26 +41,30 @@ type releaseTarget struct {
 
 func main() {
 	output := flag.String("output", "dist/licenses", "output directory")
+	target := flag.String("target", "", "release target (linux/amd64, darwin/arm64, or windows/amd64; empty selects all)")
 	flag.Parse()
 	if flag.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "usage: go run ./tools/notices --output directory")
+		fmt.Fprintln(os.Stderr, "usage: go run ./tools/notices --output directory [--target goos/goarch]")
 		os.Exit(2)
 	}
-	if err := generate(*output); err != nil {
+	if err := generate(*output, *target); err != nil {
 		fmt.Fprintln(os.Stderr, "notices:", err)
 		os.Exit(1)
 	}
 }
 
-func generate(output string) error {
-	modules := make(map[string]noticeModule)
-	targets := []releaseTarget{
-		{goos: "linux", goarch: "amd64"},
-		{goos: "darwin", goarch: "arm64"},
-		{goos: "windows", goarch: "amd64"},
+func generate(output, selectedTarget string) error {
+	targets, err := selectedTargets(selectedTarget)
+	if err != nil {
+		return err
 	}
+	root, err := moduleRoot()
+	if err != nil {
+		return err
+	}
+	modules := make(map[string]noticeModule)
 	for _, target := range targets {
-		if err := collectTarget(target, modules); err != nil {
+		if err := collectTarget(target, root, modules); err != nil {
 			return err
 		}
 	}
@@ -92,7 +96,11 @@ func generate(output string) error {
 
 	var notices strings.Builder
 	notices.WriteString("# Third-Party Notices\n\n")
-	notices.WriteString("Generated from the packages compiled into Filecloud for `linux/amd64`, `darwin/arm64`, and `windows/amd64`.\n\n")
+	if selectedTarget == "" {
+		notices.WriteString("Generated from the packages compiled into Filecloud for `linux/amd64`, `darwin/arm64`, and `windows/amd64`.\n\n")
+	} else {
+		fmt.Fprintf(&notices, "Generated on the native release runner from the packages compiled into Filecloud for `%s`.\n\n", selectedTarget)
+	}
 	notices.WriteString("| Module | Version | License files |\n|---|---|---|\n")
 	for _, module := range values {
 		directory := moduleDirectory(module)
@@ -109,9 +117,39 @@ func generate(output string) error {
 	return nil
 }
 
-func collectTarget(target releaseTarget, modules map[string]noticeModule) error {
+func selectedTargets(selected string) ([]releaseTarget, error) {
+	targets := []releaseTarget{
+		{goos: "linux", goarch: "amd64"},
+		{goos: "darwin", goarch: "arm64"},
+		{goos: "windows", goarch: "amd64"},
+	}
+	if selected == "" {
+		return targets, nil
+	}
+	for _, target := range targets {
+		if selected == target.goos+"/"+target.goarch {
+			return []releaseTarget{target}, nil
+		}
+	}
+	return nil, fmt.Errorf("unsupported release target %q", selected)
+}
+
+func moduleRoot() (string, error) {
+	output, err := exec.Command("go", "env", "GOMOD").Output()
+	if err != nil {
+		return "", fmt.Errorf("locate Go module: %w", err)
+	}
+	module := strings.TrimSpace(string(output))
+	if module == "" || module == os.DevNull {
+		return "", errors.New("not inside a Go module")
+	}
+	return filepath.Dir(module), nil
+}
+
+func collectTarget(target releaseTarget, root string, modules map[string]noticeModule) error {
 	name := target.goos + "/" + target.goarch
 	command := exec.Command("go", "list", "-deps", "-json", "./cmd/filecloud")
+	command.Dir = root
 	command.Env = append(os.Environ(), "GOOS="+target.goos, "GOARCH="+target.goarch, "CGO_ENABLED=0")
 	stdout, err := command.StdoutPipe()
 	if err != nil {
@@ -140,7 +178,7 @@ func collectTarget(target releaseTarget, modules map[string]noticeModule) error 
 		if module.Path == "" || module.Version == "" || module.Dir == "" {
 			return errors.Join(fmt.Errorf("dependency for %s has incomplete module metadata", name), terminate(command))
 		}
-		modules[module.Path] = noticeModule{path: module.Path, version: module.Version, dir: module.Dir}
+		modules[module.Path+"\x00"+module.Version] = noticeModule{path: module.Path, version: module.Version, dir: module.Dir}
 	}
 	if err := command.Wait(); err != nil {
 		return fmt.Errorf("go list for %s: %w: %s", name, err, strings.TrimSpace(stderr.String()))

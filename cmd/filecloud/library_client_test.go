@@ -1376,6 +1376,121 @@ func TestLibraryCommandUsageLocksExplicitFlags(t *testing.T) {
 	}
 }
 
+func TestLibraryCreateListAndInspectCommands(t *testing.T) {
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	const libraryID = "22222222-3333-4444-8555-666666666666"
+
+	var createOutput bytes.Buffer
+	err := runTest(t.Context(), []string{
+		"library", "create", "--server", environment.server.URL, "--library-id", libraryID,
+		"--name", "Black-box Documents", "--token-stdin",
+	}, strings.NewReader(environment.token+"\n"), &createOutput, io.Discard)
+	if err != nil {
+		t.Fatalf("library create: %v", err)
+	}
+	var created struct {
+		Library struct {
+			LibraryID string `json:"LibraryId"`
+			Name      string
+		}
+	}
+	if err := json.Unmarshal(createOutput.Bytes(), &created); err != nil {
+		t.Fatalf("decode library create output: %v", err)
+	}
+	if created.Library.LibraryID != libraryID || created.Library.Name != "Black-box Documents" {
+		t.Fatalf("created library = %+v", created.Library)
+	}
+
+	var inspectOutput bytes.Buffer
+	err = runTest(t.Context(), []string{
+		"library", "inspect", "--server", environment.server.URL, "--library-id", libraryID, "--token-stdin",
+	}, strings.NewReader(environment.token+"\n"), &inspectOutput, io.Discard)
+	if err != nil {
+		t.Fatalf("library inspect: %v", err)
+	}
+	if inspectOutput.String() != createOutput.String() {
+		t.Fatalf("library inspect output = %q, want %q", inspectOutput.String(), createOutput.String())
+	}
+
+	var listOutput bytes.Buffer
+	err = runTest(t.Context(), []string{
+		"library", "list", "--server", environment.server.URL, "--page-size", "1", "--token-stdin",
+	}, strings.NewReader(environment.token+"\n"), &listOutput, io.Discard)
+	if err != nil {
+		t.Fatalf("library list: %v", err)
+	}
+	var listed struct {
+		Libraries []struct {
+			LibraryID string `json:"LibraryId"`
+		}
+		NextPageToken string
+	}
+	if err := json.Unmarshal(listOutput.Bytes(), &listed); err != nil {
+		t.Fatalf("decode library list output: %v", err)
+	}
+	if len(listed.Libraries) != 1 || listed.Libraries[0].LibraryID == "" || listed.NextPageToken == "" {
+		t.Fatalf("listed libraries = %+v", listed)
+	}
+}
+
+func TestLibraryManagementCommandsRetryAndValidateResponses(t *testing.T) {
+	attempts := atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprintf(w, `{"RetCode":0,"Message":"success","Library":{"LibraryId":%q,"Name":"retry","ETag":"head-version-0"}}`, testClientLibraryID); err != nil {
+			t.Errorf("write retry response: %v", err)
+		}
+	}))
+	defer server.Close()
+	if err := runTest(t.Context(), []string{
+		"library", "create", "--server", server.URL, "--library-id", testClientLibraryID,
+		"--name", "retry", "--token-stdin",
+	}, strings.NewReader("token\n"), io.Discard, io.Discard); err != nil {
+		t.Fatalf("create after transient response: %v", err)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("create attempts = %d, want 2", attempts.Load())
+	}
+
+	invalid := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, `{"RetCode":1000,"Message":"invalid","Library":{}}`); err != nil {
+			t.Errorf("write invalid response: %v", err)
+		}
+	}))
+	defer invalid.Close()
+	err := runTest(t.Context(), []string{
+		"library", "inspect", "--server", invalid.URL, "--library-id", testClientLibraryID, "--token-stdin",
+	}, strings.NewReader("token\n"), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "invalid inspect library response") {
+		t.Fatalf("inspect invalid envelope error = %v", err)
+	}
+}
+
+func TestLibraryManagementCommandsRejectInvalidArguments(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "create missing token input", args: []string{"library", "create", "--server", "http://127.0.0.1:1", "--library-id", testClientLibraryID, "--name", "x"}, want: "usage: filecloud library create"},
+		{name: "list invalid page size", args: []string{"library", "list", "--server", "http://127.0.0.1:1", "--page-size", "0", "--token-stdin"}, want: "page-size must be between 1 and 500"},
+		{name: "inspect invalid UUID", args: []string{"library", "inspect", "--server", "http://127.0.0.1:1", "--library-id", "invalid", "--token-stdin"}, want: "library-id must be a canonical UUID"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := runTest(t.Context(), test.args, strings.NewReader("token\n"), io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("run(%q) error = %v, want %q", test.args, err, test.want)
+			}
+		})
+	}
+}
+
 type libraryCLIEnvironment struct {
 	store   *storage.Store
 	handler http.Handler

@@ -35,7 +35,7 @@
    - 强 ETag、统一错误、服务端摘要重算和工作量门控。
 
 5. **客户端绑定、索引与扫描**
-   - `library create/list/bind/unbind`。
+   - `library create/list/inspect/bind/unbind`。
    - 只允许文档定义的四种首次绑定情形；两侧非空且无基线必须拒绝。
    - SQLite 保存 Sync Base、pending publication、checkout journal 和路径状态。
    - 双重文件读取与目录枚举；发现不稳定、不可读或不完整则整轮禁止发布。

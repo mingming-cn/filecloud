@@ -120,10 +120,28 @@ func smoke(ctx context.Context, binary, expectedVersion string) error {
 	if err := json.Unmarshal(loginOutput, &login); err != nil || login.Session.AccessToken == "" {
 		return fmt.Errorf("decode login response: token_present=%t: %w", login.Session.AccessToken != "", err)
 	}
-	if err := createLibrary(ctx, server.url, login.Session.AccessToken); err != nil {
+	tokenInput := []byte(login.Session.AccessToken + "\n")
+	defer clear(tokenInput)
+	if _, err := runBinary(ctx, absoluteBinary, tokenInput, "library", "create", "--server", server.url,
+		"--library-id", _libraryID, "--name", "Release Smoke", "--token-stdin"); err != nil {
 		return err
 	}
-	if _, err := runBinary(ctx, absoluteBinary, []byte(login.Session.AccessToken+"\n"), "library", "bind", "--client-dir", clientDir,
+	inspectOutput, err := runBinary(ctx, absoluteBinary, tokenInput, "library", "inspect", "--server", server.url,
+		"--library-id", _libraryID, "--token-stdin")
+	if err != nil {
+		return err
+	}
+	if !bytes.Contains(inspectOutput, []byte(_libraryID)) {
+		return errors.New("inspect response has no created library")
+	}
+	listOutput, err := runBinary(ctx, absoluteBinary, tokenInput, "library", "list", "--server", server.url, "--token-stdin")
+	if err != nil {
+		return err
+	}
+	if !bytes.Contains(listOutput, []byte(_libraryID)) {
+		return errors.New("list response has no created library")
+	}
+	if _, err := runBinary(ctx, absoluteBinary, tokenInput, "library", "bind", "--client-dir", clientDir,
 		"--server", server.url, "--library-id", _libraryID, "--worktree", worktree, "--device-id", _deviceID, "--token-stdin"); err != nil {
 		return err
 	}
@@ -201,8 +219,7 @@ func (s *runningServer) stop() {
 func cancelAndWait(cancel context.CancelFunc, command *exec.Cmd) error {
 	cancel()
 	err := command.Wait()
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if _, ok := errors.AsType[*exec.ExitError](err); ok {
 		return nil
 	}
 	if err != nil {
@@ -221,28 +238,6 @@ func runBinary(ctx context.Context, binary string, stdin []byte, args ...string)
 		return nil, fmt.Errorf("run filecloud %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.Bytes(), nil
-}
-
-func createLibrary(ctx context.Context, server, token string) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPut, server+"/v1/libraries/"+_libraryID, strings.NewReader(`{"Name":"Release Smoke"}`))
-	if err != nil {
-		return fmt.Errorf("create library request: %w", err)
-	}
-	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return fmt.Errorf("create library: %w", err)
-	}
-	defer response.Body.Close()
-	body, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
-	if readErr != nil {
-		return fmt.Errorf("read create library response: %w", readErr)
-	}
-	if response.StatusCode != http.StatusCreated {
-		return fmt.Errorf("create library returned %s: %s", response.Status, body)
-	}
-	return nil
 }
 
 func getHead(ctx context.Context, server, token string) (string, error) {

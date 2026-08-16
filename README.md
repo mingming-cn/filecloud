@@ -51,6 +51,6 @@ go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -tim
 
 ## 版本与分发
 
-开发构建可用 `filecloud version` 查看构建元数据。正式 `vMAJOR.MINOR.PATCH` tag 会在 1B/1C 门禁通过后生成 Linux amd64、macOS arm64 和 Windows amd64 归档，并对每个平台的成品二进制执行初始化、登录和同步冒烟测试。
+开发构建可用 `filecloud version` 查看构建元数据。正式 `vMAJOR.MINOR.PATCH` tag 会在 1B/1C 门禁通过后生成 Linux amd64、macOS arm64 和 Windows amd64 归档，并对每个平台的成品二进制执行初始化、登录、资料库创建、绑定和同步冒烟测试。
 
-项目采用 [MIT License](./LICENSE)。正式归档同时提供基于实际编译依赖生成的第三方模块版本清单和原始许可文本。
+项目采用 [MIT License](./LICENSE)。每个正式归档同时提供由对应原生构建作业根据实际编译依赖生成的第三方模块版本清单和原始许可文本。

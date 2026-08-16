@@ -44,28 +44,9 @@ jobs:
       - name: Run 1C acceptance
         run: ./scripts/acceptance-1c.sh
 
-  licenses:
-    name: Generate third-party license material
-    needs: [acceptance-1b, acceptance-1c]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Generate notices from compiled dependencies
-        run: go run ./tools/notices --output dist/licenses
-      - name: Upload license material
-        uses: actions/upload-artifact@v4
-        with:
-          name: license-material
-          path: dist/licenses
-          if-no-files-found: error
-
   build:
     name: Build and smoke test (${{ matrix.goos }})
-    needs: licenses
+    needs: [acceptance-1b, acceptance-1c]
     strategy:
       fail-fast: false
       matrix:
@@ -92,11 +73,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Download license material
-        uses: actions/download-artifact@v4
-        with:
-          name: license-material
-          path: dist/licenses
+      - name: Verify native release target
+        shell: bash
+        env:
+          TARGET: ${{ matrix.goos }}/${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          host="$(go env GOHOSTOS)/$(go env GOHOSTARCH)"
+          if [ "$host" != "$TARGET" ]; then
+            echo "runner host $host does not match release target $TARGET" >&2
+            exit 1
+          fi
       - name: Build versioned binary
         shell: bash
         env:
@@ -122,27 +109,56 @@ jobs:
           VERSION: ${{ github.ref_name }}
           EXECUTABLE: ${{ matrix.executable }}
         run: go run ./tools/release-smoke --binary "dist/bin/$EXECUTABLE" --version "$VERSION"
-      - name: Package binary and legal material
+      - name: Generate native third-party license material
         shell: bash
         env:
-          VERSION: ${{ github.ref_name }}
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          TARGET: ${{ matrix.goos }}/${{ matrix.goarch }}
+        run: go run ./tools/notices --target "$TARGET" --output dist/licenses
+      - name: Assemble binary and legal material
+        shell: bash
+        env:
+          PACKAGE: filecloud-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
           EXECUTABLE: ${{ matrix.executable }}
-          ARCHIVE: ${{ matrix.archive }}
         run: |
           set -euo pipefail
-          package="filecloud-$VERSION-$GOOS-$GOARCH"
-          mkdir -p "dist/$package"
-          cp "dist/bin/$EXECUTABLE" "dist/$package/"
-          cp LICENSE docs/distribution.md "dist/$package/"
-          cp dist/licenses/THIRD_PARTY_NOTICES.md "dist/$package/"
-          cp -R dist/licenses/third_party_licenses "dist/$package/"
-          if [ "$ARCHIVE" = "zip" ]; then
-            tar -C dist -a -cf "dist/$package.zip" "$package"
-          else
-            tar -C dist -czf "dist/$package.tar.gz" "$package"
-          fi
+          mkdir -p "dist/$PACKAGE"
+          cp "dist/bin/$EXECUTABLE" "dist/$PACKAGE/"
+          cp LICENSE docs/distribution.md "dist/$PACKAGE/"
+          cp dist/licenses/THIRD_PARTY_NOTICES.md "dist/$PACKAGE/"
+          cp -R dist/licenses/third_party_licenses "dist/$PACKAGE/"
+      - name: Create and inspect tar archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          PACKAGE: filecloud-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          set -euo pipefail
+          tar -C dist -czf "dist/$PACKAGE.tar.gz" "$PACKAGE"
+          mkdir -p dist/archive-check
+          tar -C dist/archive-check -xzf "dist/$PACKAGE.tar.gz"
+          test -x "dist/archive-check/$PACKAGE/$EXECUTABLE"
+          test -s "dist/archive-check/$PACKAGE/LICENSE"
+          test -s "dist/archive-check/$PACKAGE/THIRD_PARTY_NOTICES.md"
+      - name: Create and inspect zip archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          PACKAGE: filecloud-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Compress-Archive -Path "dist/$env:PACKAGE" -DestinationPath "dist/$env:PACKAGE.zip"
+          Expand-Archive -Path "dist/$env:PACKAGE.zip" -DestinationPath "dist/archive-check"
+          foreach ($path in @(
+            "dist/archive-check/$env:PACKAGE/$env:EXECUTABLE",
+            "dist/archive-check/$env:PACKAGE/LICENSE",
+            "dist/archive-check/$env:PACKAGE/THIRD_PARTY_NOTICES.md"
+          )) {
+            if (-not (Test-Path -Path $path -PathType Leaf)) {
+              throw "archive is missing $path"
+            }
+          }
       - name: Upload release archive
         uses: actions/upload-artifact@v4
         with:
