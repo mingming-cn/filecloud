@@ -149,6 +149,8 @@ go test ./cmd/filecloud -run '^TestCrossPlatformAcceptanceMatrix$' -count=1 -tim
 
 2026-08-16 在提交 `ff9afc3` 上完成三平台复验：Linux 7.1.8-zen1-3-zen（x86_64）、Go 1.26.5、本地 ext4；macOS 26.5.1（Darwin 25.5.0，arm64）、Go 1.26.5、本地大小写不敏感 APFS；Windows 11（Microsoft Windows NT 10.0.26200.0，amd64，KVM/QEMU）、Go 1.26.6、本地固定 NTFS。三平台的完整统一门禁、required-pass 与各 112 条结构化证明全部通过，固定收敛 Root 和 Head 与 2026-08-15 冻结值一致。Windows 首次复验发现即时错误测量可能合法返回 `0s`，提交 `ff9afc3` 移除了测试对正计时器增量的不具可移植性要求；修复后 Linux、APFS 与 NTFS 均重新通过同一门禁。
 
+2026-08-16 在提交 `4449976bc427ecbe7149a2ada7bef8f8e5b6852f` 上完成当前 113 条证明合同的三平台复验。Linux/ext4、macOS/APFS 和 Windows/固定 NTFS 的完整统一门禁、required-pass 与各 113 条结构化证明全部通过；新增的真实构建二进制、真实服务进程和双 CLI 客户端生命周期证明在三平台均存在。macOS 门禁耗时 412 秒；Windows 源码重新传输到本地固定 NTFS 路径 `C:\Users\ming\golang\filecloud` 后运行，门禁耗时约 898 秒。三平台固定收敛 Root 和 Head 继续与冻结值一致。
+
 稳定绑定、同步、传输恢复和 checkout 崩溃恢复场景输出以 `FILECLOUD_ATTESTATION` 开头的严格 JSON 记录。门禁按精确白名单拒绝缺失、重复、未知、无法完整解码或带未知字段的记录，并分别验证 `Head == Sync Base`、`Head Root == Sync Base Root ==` 独立重扫的工作树快照、完整 Head parent 历史对象可达、确认输入摘要集合完整保留、journal 清空且无未登记内部路径。双空场景允许确认输入集合为空；100 MiB 场景以流式 SHA-256 验证内容，不在 Oracle 中重复缓存整文件。完整 bind/sync checkout 文件系统动作矩阵的每个动作和崩溃边界各自产生证明，顶层矩阵测试名也在 required-pass 清单中。对象发布和 Head 更新矩阵在每个真实子进程 `SIGKILL` 点重开存储，输出旧 Head 与当前 Head，并逐对象验证旧 Head 的 Commit、Directory、File 和 Block 仍可读。当前三平台门禁精确要求 113 条结构化证明：既有收敛、可读性和 bind/sync `between_create_identity` 恢复证明，加上一条由真实构建二进制、真实 `serve` 进程和两个 CLI 客户端完成创建、读取、双向同步、冲突收敛、服务重启及 token 撤销的生命周期证明，一条固定向量证明、两条固定双设备收敛证明和一条平台文件系统原语证明。固定向量由生产规范化、冲突命名和合并函数实际计算，并与冻结 ObjectId map 比较；固定收敛使用相同设备 ID、整秒 mtime 和提交时钟，要求两端及三平台均得到 Root `746abb68bf9a6fb9cc2251b96be467622a28dd8a7d6686c73a5f0db97a703599` 与 Head `6b604c48ae82f9a829370976c3f08ce34dee7ea01a1791a336b3363175fcee53`。这些进程测试只证明进程崩溃恢复，不证明物理断电、控制器缓存或硬件故障下的持久性。
 
 ## macOS/APFS 平台边界
