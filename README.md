@@ -12,6 +12,7 @@
 - [HTTP API 契约](./docs/design/http-api.md)
 - [第一阶段实施计划](./docs/design/phase-1-plan.md)
 - [第一阶段验收规范](./docs/design/acceptance-tests.md)
+- [服务端部署与客户端使用](./docs/operations/deployment-and-client.md)
 - [1C 部署性能基线](./docs/operations/performance-baseline.md)
 - [分发、许可与平台支持范围](./docs/distribution.md)
 - [架构决策](./docs/adr/)
