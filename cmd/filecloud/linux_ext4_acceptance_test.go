@@ -143,16 +143,20 @@ func platformSkipAllowed(event platformTestEvent, allowed map[platformTestKey]bo
 }
 
 func TestPlatformSkipAllowed(t *testing.T) {
-	allowed := map[platformTestKey]bool{{packagePath: "example/helpers", test: "TestCrashHelper"}: true}
+	const module = "example/"
+	allowed, _ := platformMatrixAllowedSkips(module, "linux")
 	for _, test := range []struct {
 		name  string
 		event platformTestEvent
 		want  bool
 	}{
-		{name: "package without test files", event: platformTestEvent{Action: "skip", Package: "example/no-tests"}, want: true},
-		{name: "registered helper", event: platformTestEvent{Action: "skip", Package: "example/helpers", Test: "TestCrashHelper"}, want: true},
-		{name: "same name from another package", event: platformTestEvent{Action: "skip", Package: "example/other", Test: "TestCrashHelper"}, want: false},
-		{name: "unknown named test", event: platformTestEvent{Action: "skip", Package: "example/helpers", Test: "TestUnexpected"}, want: false},
+		{name: "package without test files", event: platformTestEvent{Action: "skip", Package: module + "no-tests"}, want: true},
+		{name: "registered helper", event: platformTestEvent{Action: "skip", Package: module + "internal/library", Test: "TestHeadUpdateCrashHelper"}, want: true},
+		{name: "1C command performance test", event: platformTestEvent{Action: "skip", Package: module + "cmd/filecloud", Test: "TestPerformanceBaselineLargeFile"}, want: true},
+		{name: "1C object performance test", event: platformTestEvent{Action: "skip", Package: module + "internal/object", Test: "TestPerformanceBaselineWideDirectory"}, want: true},
+		{name: "same name from another package", event: platformTestEvent{Action: "skip", Package: module + "other", Test: "TestHeadUpdateCrashHelper"}, want: false},
+		{name: "unknown performance test", event: platformTestEvent{Action: "skip", Package: module + "internal/object", Test: "TestPerformanceBaselineUnexpected"}, want: false},
+		{name: "unknown named test", event: platformTestEvent{Action: "skip", Package: module + "internal/library", Test: "TestUnexpected"}, want: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := platformSkipAllowed(test.event, allowed); got != test.want {
@@ -414,7 +418,52 @@ func platformMatrixEnvironment() []string {
 		"FILECLOUD_RUN_1A=",
 		"FILECLOUD_RUN_1B_APFS=",
 		"FILECLOUD_RUN_1B_NTFS=",
+		"FILECLOUD_RUN_1C=",
 	}
+}
+
+func TestPlatformMatrixEnvironmentDisables1C(t *testing.T) {
+	if !slices.Contains(platformMatrixEnvironment(), "FILECLOUD_RUN_1C=") {
+		t.Fatal("platform matrix environment does not disable FILECLOUD_RUN_1C")
+	}
+}
+
+func platformMatrixAllowedSkips(module, platform string) (map[platformTestKey]bool, map[string]bool) {
+	commandPackage := module + "cmd/filecloud"
+	allowed := map[platformTestKey]bool{
+		{packagePath: module + "internal/library", test: "TestHeadUpdateCrashHelper"}:             true,
+		{packagePath: module + "internal/object", test: "TestPerformanceBaselineWideDirectory"}:   true,
+		{packagePath: module + "internal/storage", test: "TestGarbageCollectorCrashHelper"}:       true,
+		{packagePath: module + "internal/storage", test: "TestObjectStorePublicationCrashHelper"}: true,
+		{packagePath: commandPackage, test: "TestPerformanceBaselineSmallFiles"}:                  true,
+		{packagePath: commandPackage, test: "TestPerformanceBaselineLargeFile"}:                   true,
+		{packagePath: commandPackage, test: "TestPerformanceBaselineKDF"}:                         true,
+		{packagePath: commandPackage, test: "TestPublicInitialCheckoutBaseCommitCrashHelper"}:     true,
+		{packagePath: commandPackage, test: "TestPublicSyncTransactionCrashHelper"}:               true,
+		{packagePath: commandPackage, test: "TestPublicUnbindFSActionCrashHelper"}:                true,
+		{packagePath: commandPackage, test: "TestPublicSyncFSActionCrashHelper"}:                  true,
+		{packagePath: commandPackage, test: "TestPublicFSActionCrashHelper"}:                      true,
+		{packagePath: commandPackage, test: "TestFSActionCrashHelper"}:                            true,
+		{packagePath: commandPackage, test: "TestCrossPlatformAcceptanceMatrix"}:                  true,
+		{packagePath: commandPackage, test: "TestLinuxExt4LockHelper"}:                            true,
+		{packagePath: commandPackage, test: "TestMacOSAPFSLockHelper"}:                            true,
+		{packagePath: commandPackage, test: "TestWindowsNTFSLockHelper"}:                          true,
+	}
+	casefold := make(map[string]bool)
+	if platform != "darwin" && platform != "windows" {
+		return allowed, casefold
+	}
+	for _, test := range []string{
+		"TestLibraryBindImportRejectsUnsupportedAndCollidingPaths/casefold",
+		"TestLibrarySyncLongConflictNamesConverge/root_fallback_casefold_alias",
+		"TestLibrarySyncCasefoldAliasRaceRelocatesCapturedPromotion",
+		"TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget",
+		"TestLibrarySyncCasefoldAliasRelocationCrashMatrix",
+	} {
+		allowed[platformTestKey{packagePath: commandPackage, test: test}] = true
+		casefold[test] = true
+	}
+	return allowed, casefold
 }
 
 func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platformMatrixScenario,
@@ -444,35 +493,7 @@ func runPlatformMatrix(t *testing.T, filesystemRoot string, scenarios []platform
 		required[platformTestKey{packagePath: packagePath, test: scenario.test}] = scenario
 	}
 	passed := make(map[platformTestKey]bool, len(required))
-	commandPackage := module + "cmd/filecloud"
-	allowedSkips := map[platformTestKey]bool{
-		{packagePath: module + "internal/library", test: "TestHeadUpdateCrashHelper"}:             true,
-		{packagePath: module + "internal/storage", test: "TestGarbageCollectorCrashHelper"}:       true,
-		{packagePath: module + "internal/storage", test: "TestObjectStorePublicationCrashHelper"}: true,
-		{packagePath: commandPackage, test: "TestPublicInitialCheckoutBaseCommitCrashHelper"}:     true,
-		{packagePath: commandPackage, test: "TestPublicSyncTransactionCrashHelper"}:               true,
-		{packagePath: commandPackage, test: "TestPublicUnbindFSActionCrashHelper"}:                true,
-		{packagePath: commandPackage, test: "TestPublicSyncFSActionCrashHelper"}:                  true,
-		{packagePath: commandPackage, test: "TestPublicFSActionCrashHelper"}:                      true,
-		{packagePath: commandPackage, test: "TestFSActionCrashHelper"}:                            true,
-		{packagePath: commandPackage, test: "TestCrossPlatformAcceptanceMatrix"}:                  true,
-		{packagePath: commandPackage, test: "TestLinuxExt4LockHelper"}:                            true,
-		{packagePath: commandPackage, test: "TestMacOSAPFSLockHelper"}:                            true,
-		{packagePath: commandPackage, test: "TestWindowsNTFSLockHelper"}:                          true,
-	}
-	casefoldSkips := make(map[string]bool)
-	if platform == "darwin" || platform == "windows" {
-		for _, test := range []string{
-			"TestLibraryBindImportRejectsUnsupportedAndCollidingPaths/casefold",
-			"TestLibrarySyncLongConflictNamesConverge/root_fallback_casefold_alias",
-			"TestLibrarySyncCasefoldAliasRaceRelocatesCapturedPromotion",
-			"TestLibrarySyncCasefoldAliasRaceKeepsFixedCapturedTarget",
-			"TestLibrarySyncCasefoldAliasRelocationCrashMatrix",
-		} {
-			allowedSkips[platformTestKey{packagePath: commandPackage, test: test}] = true
-			casefoldSkips[test] = true
-		}
-	}
+	allowedSkips, casefoldSkips := platformMatrixAllowedSkips(module, platform)
 	var attestations []platformAttestation
 	actualCasefoldSkips := make(map[string]bool)
 	collector := newPlatformAttestationCollector()
