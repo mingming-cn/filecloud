@@ -175,7 +175,7 @@ func TestClientLegacyV12FingerprintBeforeDDL(t *testing.T) {
 			t.Fatal(err)
 		}
 		var versions int
-		if err := db.QueryRow("SELECT COUNT(*) FROM client_schema_migrations").Scan(&versions); err != nil || versions != clientSchemaVersion-12 {
+		if err := db.QueryRow("SELECT COUNT(*) FROM client_schema_migrations").Scan(&versions); err != nil || versions != _clientSchemaVersion-12 {
 			t.Fatalf("versions=%d err=%v", versions, err)
 		}
 	})
@@ -239,7 +239,7 @@ func TestClientSchemaRejectsFutureVersionAndGapWithoutDDL(t *testing.T) {
 		mutate func(*sql.DB) error
 	}{
 		{"future", func(db *sql.DB) error {
-			_, err := db.Exec("INSERT INTO client_schema_migrations(version) VALUES (?)", clientSchemaVersion+1)
+			_, err := db.Exec("INSERT INTO client_schema_migrations(version) VALUES (?)", _clientSchemaVersion+1)
 			return err
 		}},
 		{"gap", func(db *sql.DB) error {
@@ -326,7 +326,7 @@ func TestFSActionV15ProvenanceMigration(t *testing.T) {
 		if err := db.QueryRow("SELECT MAX(version) FROM client_schema_migrations").Scan(&version); err != nil {
 			t.Fatal(err)
 		}
-		if err := db.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil || rows != 1 || version != clientSchemaVersion || foreignKeys != 1 {
+		if err := db.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil || rows != 1 || version != _clientSchemaVersion || foreignKeys != 1 {
 			t.Fatalf("rows=%d version=%d foreign_keys=%d err=%v", rows, version, foreignKeys, err)
 		}
 	})
@@ -569,7 +569,7 @@ func TestClientV21PendingPublicationFingerprint(t *testing.T) {
 				t.Fatal("v21 rejection changed schema or database bytes")
 			}
 			var version int
-			if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&version); err != nil || version != clientSchemaVersion {
+			if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&version); err != nil || version != _clientSchemaVersion {
 				t.Fatalf("schema rejection changed version=%d err=%v", version, err)
 			}
 		})
@@ -591,7 +591,7 @@ func TestPendingPublicationBlobLimits(t *testing.T) {
 			}
 			defer db.Close()
 			statement := `PRAGMA ignore_check_constraints=ON;
-				INSERT INTO pending_publications VALUES('/work','base','root','base','etag','candidate','root',` +
+				INSERT INTO pending_publications VALUES('/work','sync','base','root','base','etag','candidate','root',` +
 				test.candidate + `,'candidate','root',` + test.captured + `,` + test.history + `,0,0,0,0,0)`
 			if _, err := db.Exec(statement); err != nil {
 				t.Fatal(err)
@@ -689,12 +689,14 @@ func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
 			if err := initializeClientSchema(t.Context(), db); err != nil {
 				t.Fatal(err)
 			}
+			var kind PublicationKind
 			var expected, base string
-			if err := db.QueryRow(`SELECT expected_head,base_commit FROM pending_publications WHERE worktree='/work'`).Scan(&expected, &base); err != nil {
+			if err := db.QueryRow(`SELECT publication_kind,expected_head,base_commit FROM pending_publications WHERE worktree='/work'`).Scan(
+				&kind, &expected, &base); err != nil {
 				t.Fatal(err)
 			}
-			if expected != base || expected != "base" {
-				t.Fatalf("v%d migration expected=%q base=%q", version, expected, base)
+			if kind != PublicationKindSync || expected != base || expected != "base" {
+				t.Fatalf("v%d migration kind=%q expected=%q base=%q", version, kind, expected, base)
 			}
 			var capturedCommit, capturedRoot string
 			var candidateData, capturedData, history []byte
@@ -707,6 +709,58 @@ func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
 					capturedRoot, candidateData, capturedData, history, err)
 			}
 		})
+	}
+}
+
+func TestClientV22PendingPublicationMigrationRejectsInvalidRowsAtomically(t *testing.T) {
+	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DROP TABLE pending_publications;
+		DELETE FROM client_schema_migrations WHERE version=23`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(_clientV21PendingSQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON;
+		INSERT INTO pending_publications VALUES('/work','base','root','base','etag','candidate','root',X'00',
+			'candidate','root',X'00',X'4643483100000000',1,20,0,1,0);
+		PRAGMA ignore_check_constraints=OFF`); err != nil {
+		t.Fatal(err)
+	}
+	var beforeSchema, beforeData string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='pending_publications'`).Scan(&beforeSchema); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT quote(worktree)||'|'||tracked_count||'|'||delete_confirmed
+		FROM pending_publications`).Scan(&beforeData); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeClientSchema(t.Context(), db); err == nil {
+		t.Fatal("invalid v22 pending publication was migrated")
+	}
+	var afterSchema, afterData string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='pending_publications'`).Scan(&afterSchema); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT quote(worktree)||'|'||tracked_count||'|'||delete_confirmed
+		FROM pending_publications`).Scan(&afterData); err != nil {
+		t.Fatal(err)
+	}
+	var version, kindColumns int
+	if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pending_publications')
+		WHERE name='publication_kind'`).Scan(&kindColumns); err != nil {
+		t.Fatal(err)
+	}
+	if beforeSchema != afterSchema || beforeData != afterData || version != 22 || kindColumns != 0 {
+		t.Fatalf("failed migration changed state: schema=%t data=%q/%q version=%d kind_columns=%d",
+			beforeSchema == afterSchema, beforeData, afterData, version, kindColumns)
 	}
 }
 
@@ -769,7 +823,7 @@ func TestPendingPublicationV17DeletionConfirmationMigration(t *testing.T) {
 		AND requires_delete_confirmation=0 AND delete_confirmed=0 AND legacy_revalidation_required=1`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if columns != 10 || version != clientSchemaVersion || rows != 1 {
+	if columns != 10 || version != _clientSchemaVersion || rows != 1 {
 		t.Fatalf("columns=%d version=%d preserved_rows=%d", columns, version, rows)
 	}
 	for _, values := range []string{

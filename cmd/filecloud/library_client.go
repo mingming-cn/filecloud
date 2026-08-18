@@ -1287,7 +1287,7 @@ func initializeClientDB(ctx context.Context, clientDir string, syncDir func(stri
 	return db, nil
 }
 
-const clientSchemaVersion = 22
+const _clientSchemaVersion = 23
 
 var legacyClientV12Columns = map[string][]string{
 	"bindings":             {"server_url|TEXT|1||0", "library_id|TEXT|1||0", "worktree|TEXT|1||1", "user_id|TEXT|1||0", "device_id|TEXT|1||0", "sync_base_commit|TEXT|1||0", "sync_base_root|TEXT|1||0", "head_etag|TEXT|1||0", "access_token|BLOB|1||0"},
@@ -1371,6 +1371,27 @@ const _clientV21PendingSQL = `CREATE TABLE pending_publications (
 		requires_delete_confirmation = (deletion_count > 100 OR (tracked_count > 0 AND
 		deletion_count >= tracked_count / 10 + CASE WHEN tracked_count % 10 = 0 THEN 0 ELSE 1 END)))))`
 
+const _clientV23PendingSQL = `CREATE TABLE pending_publications (
+	worktree TEXT PRIMARY KEY NOT NULL, publication_kind TEXT NOT NULL, base_commit TEXT NOT NULL, base_root TEXT NOT NULL,
+	expected_head TEXT NOT NULL, expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL,
+	candidate_root TEXT NOT NULL, candidate_data BLOB NOT NULL, captured_commit TEXT NOT NULL,
+	captured_root TEXT NOT NULL, captured_data BLOB NOT NULL, candidate_history BLOB NOT NULL,
+	deletion_count INTEGER NOT NULL DEFAULT 0,
+	tracked_count INTEGER NOT NULL DEFAULT 0, requires_delete_confirmation INTEGER NOT NULL DEFAULT 0,
+	delete_confirmed INTEGER NOT NULL DEFAULT 0, legacy_revalidation_required INTEGER NOT NULL DEFAULT 0,
+	CHECK(publication_kind = 'sync'),
+	CHECK(length(candidate_data) BETWEEN 1 AND 65536),
+	CHECK(length(captured_data) BETWEEN 1 AND 65536),
+	CHECK(length(candidate_history) BETWEEN 8 AND 67112968),
+	CHECK(deletion_count >= 0 AND tracked_count >= deletion_count),
+	CHECK(requires_delete_confirmation IN (0, 1) AND delete_confirmed IN (0, 1)
+		AND legacy_revalidation_required IN (0, 1)),
+	CHECK((legacy_revalidation_required = 1 AND deletion_count = 0 AND tracked_count = 0
+		AND requires_delete_confirmation = 0 AND delete_confirmed = 0) OR
+		(legacy_revalidation_required = 0 AND delete_confirmed <= requires_delete_confirmation AND
+		requires_delete_confirmation = (deletion_count > 100 OR (tracked_count > 0 AND
+		deletion_count >= tracked_count / 10 + CASE WHEN tracked_count % 10 = 0 THEN 0 ELSE 1 END)))))`
+
 var clientV19PendingColumns = []string{
 	"0|worktree|TEXT|1||1", "1|base_commit|TEXT|1||0", "2|base_root|TEXT|1||0",
 	"3|expected_etag|TEXT|1||0", "4|candidate_commit|TEXT|1||0", "5|candidate_root|TEXT|1||0",
@@ -1395,6 +1416,16 @@ var _clientV21PendingColumns = []string{
 	"12|deletion_count|INTEGER|1|0|0", "13|tracked_count|INTEGER|1|0|0",
 	"14|requires_delete_confirmation|INTEGER|1|0|0", "15|delete_confirmed|INTEGER|1|0|0",
 	"16|legacy_revalidation_required|INTEGER|1|0|0",
+}
+
+var _clientV23PendingColumns = []string{
+	"0|worktree|TEXT|1||1", "1|publication_kind|TEXT|1||0", "2|base_commit|TEXT|1||0", "3|base_root|TEXT|1||0",
+	"4|expected_head|TEXT|1||0", "5|expected_etag|TEXT|1||0", "6|candidate_commit|TEXT|1||0",
+	"7|candidate_root|TEXT|1||0", "8|candidate_data|BLOB|1||0", "9|captured_commit|TEXT|1||0",
+	"10|captured_root|TEXT|1||0", "11|captured_data|BLOB|1||0", "12|candidate_history|BLOB|1||0",
+	"13|deletion_count|INTEGER|1|0|0", "14|tracked_count|INTEGER|1|0|0",
+	"15|requires_delete_confirmation|INTEGER|1|0|0", "16|delete_confirmed|INTEGER|1|0|0",
+	"17|legacy_revalidation_required|INTEGER|1|0|0",
 }
 
 var legacyClientV12Indexes = map[string][]string{
@@ -1449,6 +1480,10 @@ func validateClientV20Schema(ctx context.Context, db clientSchemaQuerier) error 
 
 func _validateClientV21Schema(ctx context.Context, db clientSchemaQuerier) error {
 	return validatePendingPublicationSchema(ctx, db, 21, _clientV21PendingSQL, _clientV21PendingColumns)
+}
+
+func _validateClientV23Schema(ctx context.Context, db clientSchemaQuerier) error {
+	return validatePendingPublicationSchema(ctx, db, 23, _clientV23PendingSQL, _clientV23PendingColumns)
 }
 
 const _clientV21CheckoutSQL = `CREATE TABLE pending_checkouts (server_url TEXT NOT NULL, library_id TEXT NOT NULL,
@@ -1850,12 +1885,24 @@ func validateClientSchemaVersion(ctx context.Context, db *sql.DB) error {
 		return errors.New("client schema migration history has an unknown baseline or gap")
 	}
 	for index, version := range versions {
-		if version != 13+index || version > clientSchemaVersion {
+		if version != 13+index || version > _clientSchemaVersion {
 			return errors.New("client schema migration history is unknown, gapped, or newer than this client")
 		}
 	}
 	version := versions[len(versions)-1]
-	if version == clientSchemaVersion {
+	if version == _clientSchemaVersion {
+		if err := _validateClientV23Schema(ctx, db); err != nil {
+			return err
+		}
+		if err := _validateClientV22CheckoutSchema(ctx, db); err != nil {
+			return err
+		}
+		if err := _validateClientSyncRecoverySchema(ctx, db, 22, _clientV22SyncRecoverySQL, _clientV22SyncRecoveryColumns); err != nil {
+			return err
+		}
+		return _validateClientSyncRecoveryPromotionSchema(ctx, db)
+	}
+	if version == 22 {
 		if err := _validateClientV21Schema(ctx, db); err != nil {
 			return err
 		}
@@ -2202,7 +2249,7 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		return fail(err)
 	}
 	if pendingPublications == 0 {
-		if _, err := tx.ExecContext(ctx, _clientV21PendingSQL); err != nil {
+		if _, err := tx.ExecContext(ctx, _clientV23PendingSQL); err != nil {
 			return fail(err)
 		}
 	}
@@ -2406,6 +2453,45 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 	} else if capturedColumns != 4 {
 		return fail(errors.New("pending publication captured schema is incomplete"))
 	}
+	var publicationKindColumns int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('pending_publications')
+		WHERE name='publication_kind'`).Scan(&publicationKindColumns); err != nil {
+		return fail(err)
+	}
+	if publicationKindColumns == 0 {
+		if err := _validateClientV21Schema(ctx, tx); err != nil {
+			return fail(fmt.Errorf("validate v22 pending publication schema before kind migration: %w", err))
+		}
+		var invalidRows int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_publications WHERE
+			length(candidate_data) NOT BETWEEN 1 AND 65536 OR length(captured_data) NOT BETWEEN 1 AND 65536 OR
+			length(candidate_history) NOT BETWEEN 8 AND 67112968 OR deletion_count < 0 OR tracked_count < deletion_count OR
+			requires_delete_confirmation NOT IN (0,1) OR delete_confirmed NOT IN (0,1) OR
+			legacy_revalidation_required NOT IN (0,1) OR
+			(legacy_revalidation_required=1 AND (deletion_count<>0 OR tracked_count<>0 OR
+				requires_delete_confirmation<>0 OR delete_confirmed<>0)) OR
+			(legacy_revalidation_required=0 AND (delete_confirmed>requires_delete_confirmation OR
+				requires_delete_confirmation<>(deletion_count>100 OR (tracked_count>0 AND deletion_count>=tracked_count/10+
+					CASE WHEN tracked_count%10=0 THEN 0 ELSE 1 END))))`).Scan(&invalidRows); err != nil {
+			return fail(fmt.Errorf("validate legacy pending publication rows: %w", err))
+		}
+		if invalidRows != 0 {
+			return fail(errors.New("legacy pending publication is invalid"))
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE pending_publications RENAME TO old_pending_publications;
+			`+_clientV23PendingSQL+`;
+			INSERT INTO pending_publications(worktree,publication_kind,base_commit,base_root,expected_head,expected_etag,
+				candidate_commit,candidate_root,candidate_data,captured_commit,captured_root,captured_data,candidate_history,
+				deletion_count,tracked_count,requires_delete_confirmation,delete_confirmed,legacy_revalidation_required)
+			SELECT worktree,'sync',base_commit,base_root,expected_head,expected_etag,candidate_commit,candidate_root,candidate_data,
+				captured_commit,captured_root,captured_data,candidate_history,deletion_count,tracked_count,
+				requires_delete_confirmation,delete_confirmed,legacy_revalidation_required FROM old_pending_publications;
+			DROP TABLE old_pending_publications`); err != nil {
+			return fail(fmt.Errorf("migrate pending publication kind: %w", err))
+		}
+	} else if publicationKindColumns != 1 {
+		return fail(errors.New("pending publication kind schema is incomplete"))
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (13);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (14);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (15);
@@ -2415,10 +2501,11 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (19);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (20);
 		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (21);
-		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (22)`); err != nil {
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (22);
+		INSERT OR IGNORE INTO client_schema_migrations(version) VALUES (23)`); err != nil {
 		return fail(err)
 	}
-	if err := _validateClientV21Schema(ctx, tx); err != nil {
+	if err := _validateClientV23Schema(ctx, tx); err != nil {
 		return fail(fmt.Errorf("validate migrated client schema: %w", err))
 	}
 	if err := _validateClientV22CheckoutSchema(ctx, tx); err != nil {

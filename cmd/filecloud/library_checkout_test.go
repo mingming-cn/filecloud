@@ -1239,9 +1239,10 @@ func TestPendingCheckoutV21InflightMigrationRejectedBeforeDDL(t *testing.T) {
 				}
 				defer db.Close()
 				if _, err := db.Exec(`DROP TABLE sync_recovery_promotions;
+					DROP TABLE pending_publications;`+_clientV21PendingSQL+`;
 					ALTER TABLE pending_checkouts RENAME TO v22_pending_checkouts;`+_clientV21CheckoutSQL+`;
 					DROP TABLE v22_pending_checkouts;
-					DELETE FROM client_schema_migrations WHERE version=22;
+					DELETE FROM client_schema_migrations WHERE version>=22;
 					INSERT INTO pending_checkouts VALUES('http://localhost','library','/work','user','device','commit','root','etag',?)`, state); err != nil {
 					t.Fatal(err)
 				}
@@ -1317,7 +1318,8 @@ func TestPendingCheckoutV21ToV22Migration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`ALTER TABLE pending_checkouts RENAME TO v22_pending_checkouts;` + _clientV21CheckoutSQL + `;
+	if _, err := db.Exec(`DROP TABLE pending_publications;` + _clientV21PendingSQL + `;
+		ALTER TABLE pending_checkouts RENAME TO v22_pending_checkouts;` + _clientV21CheckoutSQL + `;
 		INSERT INTO pending_checkouts(server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state)
 		SELECT server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state FROM v22_pending_checkouts;
 		INSERT INTO pending_checkouts VALUES('http://localhost','11111111-2222-4333-8444-555555555555','/work',
@@ -1326,7 +1328,7 @@ func TestPendingCheckoutV21ToV22Migration(t *testing.T) {
 		ALTER TABLE sync_recoveries RENAME TO v22_sync_recoveries;` + _clientV21SyncRecoverySQL + `;
 		INSERT INTO sync_recoveries(worktree,path,recovery_name,type,object_id,canonical_mtime,size,device,inode,completed,tombstone_name)
 		SELECT worktree,path,recovery_name,type,object_id,canonical_mtime,size,device,inode,completed,tombstone_name FROM v22_sync_recoveries;
-		DROP TABLE v22_sync_recoveries; DELETE FROM client_schema_migrations WHERE version=22`); err != nil {
+		DROP TABLE v22_sync_recoveries; DELETE FROM client_schema_migrations WHERE version>=22`); err != nil {
 		t.Fatal(err)
 	}
 	if err := initializeClientSchema(t.Context(), db); err != nil {
@@ -1350,7 +1352,7 @@ func TestPendingCheckoutV21ToV22Migration(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM sync_recovery_promotions").Scan(&promotionRows); err != nil {
 		t.Fatal(err)
 	}
-	if version != 22 || !bytes.Equal(encoded, _emptyConflictPromotions) || recoveryColumns != 0 || rollbackColumns != 1 || promotionRows != 0 {
+	if version != _clientSchemaVersion || !bytes.Equal(encoded, _emptyConflictPromotions) || recoveryColumns != 0 || rollbackColumns != 1 || promotionRows != 0 {
 		t.Fatalf("migration version=%d provenance=%x scalar columns=%d rollback columns=%d promotion rows=%d",
 			version, encoded, recoveryColumns, rollbackColumns, promotionRows)
 	}
@@ -1417,12 +1419,13 @@ func TestSyncRecoveryV21DriftRejectedBeforePromotionDDL(t *testing.T) {
 	}
 	defer db.Close()
 	if _, err := db.Exec(`DROP TABLE sync_recovery_promotions;
+		DROP TABLE pending_publications;` + _clientV21PendingSQL + `;
 		ALTER TABLE pending_checkouts RENAME TO v22_pending_checkouts;` + _clientV21CheckoutSQL + `;
 		INSERT INTO pending_checkouts(server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state)
 		SELECT server_url,library_id,worktree,user_id,device_id,target_commit,target_root,head_etag,apply_state FROM v22_pending_checkouts;
 		DROP TABLE v22_pending_checkouts;
 		ALTER TABLE sync_recoveries ADD COLUMN stale TEXT NOT NULL DEFAULT '';
-		DELETE FROM client_schema_migrations WHERE version=22`); err != nil {
+		DELETE FROM client_schema_migrations WHERE version>=22`); err != nil {
 		t.Fatal(err)
 	}
 	if err := initializeClientSchema(t.Context(), db); err == nil || !strings.Contains(err.Error(), "v21 sync recovery canonical SQL changed") {

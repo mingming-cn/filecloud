@@ -313,7 +313,7 @@ func TestLibrarySyncMigratesV20TrivialMergePending(t *testing.T) {
 				t.Fatal(err)
 			}
 			if _, err := db.Exec(`DROP TABLE pending_publications;
-				DELETE FROM client_schema_migrations WHERE version IN (21,22)`); err != nil {
+				DELETE FROM client_schema_migrations WHERE version>=21`); err != nil {
 				db.Close()
 				t.Fatal(err)
 			}
@@ -334,6 +334,193 @@ func TestLibrarySyncMigratesV20TrivialMergePending(t *testing.T) {
 			}
 			assertTestConverged(t, state.environment, state.clientDir, state.worktree)
 		})
+	}
+}
+
+func TestLibraryPendingPublicationKindDispatch(t *testing.T) {
+	for _, command := range []string{"sync", "sync with confirmation", "watch"} {
+		t.Run(command, func(t *testing.T) {
+			state := newImportedBinding(t)
+			if err := os.WriteFile(filepath.Join(state.worktree, "pending"), []byte("data"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", state.clientDir, "--worktree", state.worktree},
+				strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+					beforeHeadCAS: func() error { return errors.New("stop before CAS") }})
+			if err == nil {
+				t.Fatal("expected pending publication")
+			}
+			pending := readTestPendingPublication(t, state.clientDir, state.worktree)
+			if pending.Kind != PublicationKindSync {
+				t.Fatalf("new pending publication kind=%q, want %q", pending.Kind, PublicationKindSync)
+			}
+			beforeBinding, beforeRoot := readTestBinding(t, state.clientDir, state.worktree), scanTestRoot(t, state.worktree)
+			beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+				[]byte(state.environment.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			db, err := openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON;
+				UPDATE pending_publications SET publication_kind='unknown' WHERE worktree=?;
+				PRAGMA ignore_check_constraints=OFF`, state.worktree); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			name := command
+			if command == "sync with confirmation" {
+				name = "sync"
+			}
+			args := []string{name, "--client-dir", state.clientDir, "--worktree", state.worktree}
+			switch command {
+			case "sync with confirmation":
+				args = append(args, "--confirm-delete", pending.CandidateCommit[:deleteCandidatePrefixLen])
+			case "watch":
+				args = append(args, "--interval", "1h")
+			}
+			err = runLibraryWithConfig(t.Context(), args, strings.NewReader(""), io.Discard, io.Discard,
+				libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
+			if err == nil || !strings.Contains(err.Error(), "unsupported pending publication kind") {
+				t.Fatalf("%s unknown pending kind error=%v", command, err)
+			}
+			afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+				[]byte(state.environment.token))
+			if headErr != nil || beforeHead.CommitID == nil || afterHead.CommitID == nil ||
+				*beforeHead.CommitID != *afterHead.CommitID || beforeHead.ETag != afterHead.ETag ||
+				readTestBinding(t, state.clientDir, state.worktree) != beforeBinding || scanTestRoot(t, state.worktree) != beforeRoot {
+				t.Fatalf("%s rejection changed state: head=%+v binding=%+v root=%s err=%v", command, afterHead,
+					readTestBinding(t, state.clientDir, state.worktree), scanTestRoot(t, state.worktree), headErr)
+			}
+			db, err = openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var kind string
+			if err := db.QueryRow(`SELECT publication_kind FROM pending_publications WHERE worktree=?`, state.worktree).Scan(&kind); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if closeErr := db.Close(); closeErr != nil || kind != "unknown" {
+				t.Fatalf("%s rejection changed pending kind=%q close=%v", command, kind, closeErr)
+			}
+		})
+	}
+}
+
+func TestLibrarySyncMigratesV22PendingPublicationWithoutFieldDrift(t *testing.T) {
+	state := newImportedBinding(t)
+	if err := os.WriteFile(filepath.Join(state.worktree, "pending"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", state.clientDir, "--worktree", state.worktree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			beforeHeadCAS: func() error { return errors.New("stop before CAS") }})
+	if err == nil {
+		t.Fatal("expected pending publication")
+	}
+	db, err := openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE pending_publications SET deletion_count=1,tracked_count=10,
+		requires_delete_confirmation=1,delete_confirmed=1 WHERE worktree=?`, state.worktree); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	before, err := loadPendingPublication(t.Context(), db, state.worktree)
+	if err != nil || before == nil {
+		db.Close()
+		t.Fatalf("load v23 pending before downgrade: pending=%+v err=%v", before, err)
+	}
+	if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO v23_pending_publications`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(_clientV21PendingSQL); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO pending_publications(worktree,base_commit,base_root,expected_head,expected_etag,
+		candidate_commit,candidate_root,candidate_data,captured_commit,captured_root,captured_data,candidate_history,
+		deletion_count,tracked_count,requires_delete_confirmation,delete_confirmed,legacy_revalidation_required)
+		SELECT worktree,base_commit,base_root,expected_head,expected_etag,candidate_commit,candidate_root,candidate_data,
+		captured_commit,captured_root,captured_data,candidate_history,deletion_count,tracked_count,
+		requires_delete_confirmation,delete_confirmed,legacy_revalidation_required FROM v23_pending_publications;
+		DROP TABLE v23_pending_publications;
+		DELETE FROM client_schema_migrations WHERE version=23`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := initializeClientSchema(t.Context(), db); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	after, err := loadPendingPublication(t.Context(), db, state.worktree)
+	if closeErr := db.Close(); err != nil || closeErr != nil || after == nil {
+		t.Fatalf("load migrated v22 pending: pending=%+v err=%v", after, errors.Join(err, closeErr))
+	}
+	if !reflect.DeepEqual(after, before) || after.Kind != PublicationKindSync {
+		t.Fatalf("v22 migration changed pending fields:\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
+func TestLibraryPendingCheckoutPrecedesPublicationDispatch(t *testing.T) {
+	state := newImportedBinding(t)
+	if err := os.WriteFile(filepath.Join(state.worktree, "pending"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", state.clientDir, "--worktree", state.worktree},
+		strings.NewReader(""), io.Discard, io.Discard, libraryClientConfig{checkFilesystem: func(*os.File) error { return nil },
+			beforeHeadCAS: func() error { return errors.New("stop before CAS") }})
+	if err == nil {
+		t.Fatal("expected pending publication")
+	}
+	beforeBinding, beforeRoot := readTestBinding(t, state.clientDir, state.worktree), scanTestRoot(t, state.worktree)
+	beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+		[]byte(state.environment.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON;
+		UPDATE pending_publications SET publication_kind='unknown' WHERE worktree=?;
+		PRAGMA ignore_check_constraints=OFF`, state.worktree); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO pending_checkouts(server_url,library_id,worktree,user_id,device_id,target_commit,target_root,
+		head_etag,apply_state) VALUES(?,?,?,?,?,?,?,?,?)`, state.binding.ServerURL, state.binding.LibraryID, state.worktree,
+		"other-user", state.binding.DeviceID, state.binding.SyncBase, state.binding.SyncBaseRoot,
+		state.binding.HeadETag, "pending"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = syncTestWorktree(t, state.clientDir, state.worktree)
+	if err == nil || !strings.Contains(err.Error(), "pending checkout does not match the binding") ||
+		strings.Contains(err.Error(), "publication kind") {
+		t.Fatalf("checkout priority error=%v", err)
+	}
+	afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+		[]byte(state.environment.token))
+	if headErr != nil || beforeHead.CommitID == nil || afterHead.CommitID == nil ||
+		*beforeHead.CommitID != *afterHead.CommitID || beforeHead.ETag != afterHead.ETag ||
+		readTestBinding(t, state.clientDir, state.worktree) != beforeBinding || scanTestRoot(t, state.worktree) != beforeRoot ||
+		countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 1 ||
+		countClientRows(t, state.clientDir, "pending_checkouts", state.worktree) != 1 {
+		t.Fatalf("checkout rejection changed state: head=%+v binding=%+v root=%s err=%v", afterHead,
+			readTestBinding(t, state.clientDir, state.worktree), scanTestRoot(t, state.worktree), headErr)
 	}
 }
 
@@ -957,9 +1144,10 @@ func TestLibrarySyncProtectedRecursiveMergeSurvivesRepeatedHeadAdvances(t *testi
 	budget := &_replayBudget{commitLimit: 2, treeLimit: _mergeMaxObjects, pathLimit: _mergeMaxObjects,
 		commits: make(map[string]object.Commit), walked: make(map[string]bool)}
 	puts.Store(0)
-	err = resumePublication(t.Context(), db, bindOptions{base: mustServerURL(t, binding.ServerURL),
+	err = dispatchPendingPublication(t.Context(), db, bindOptions{base: mustServerURL(t, binding.ServerURL),
 		libraryID: testClientLibraryID, token: []byte(environment.token), clientDir: subscriberDir, worktreeRoot: root},
-		binding, snapshot, head, third, io.Discard, normalizeLibraryClientConfig(libraryClientConfig{}), budget)
+		binding, snapshot, head, third, io.Discard, normalizeLibraryClientConfig(libraryClientConfig{}), budget,
+		_publicationDispatchResume)
 	if closeErr := errors.Join(root.Close(), db.Close()); closeErr != nil {
 		t.Fatal(closeErr)
 	}

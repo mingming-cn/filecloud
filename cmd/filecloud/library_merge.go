@@ -109,7 +109,7 @@ func _startRecursiveMerge(ctx context.Context, db *sql.DB, options bindOptions, 
 	}
 	deleted, tracked := deletionStats(_trackedPathSet(basePaths), prepared.paths)
 	protected := protectedDeletion(deleted, tracked)
-	pending := pendingPublication{BaseCommit: binding.SyncBase, BaseRoot: binding.SyncBaseRoot,
+	pending := pendingPublication{Kind: PublicationKindSync, BaseCommit: binding.SyncBase, BaseRoot: binding.SyncBaseRoot,
 		ExpectedHead: *head.CommitID, ExpectedETag: head.ETag, CandidateCommit: prepared.candidateID,
 		CandidateRoot: prepared.root, CandidateData: prepared.candidateData, CapturedCommit: capturedID,
 		CapturedRoot: snapshot.root, CapturedData: capturedData, CandidateHistory: _emptyCandidateHistory,
@@ -117,10 +117,8 @@ func _startRecursiveMerge(ctx context.Context, db *sql.DB, options bindOptions, 
 	if err := savePendingPublication(ctx, db, binding.Worktree, pending); err != nil {
 		return err
 	}
-	if protected {
-		return deletionConfirmationError(pending)
-	}
-	return _uploadAndPublishPrepared(ctx, db, options, binding, snapshot, pending, prepared.directories, stdout, config, budget)
+	return dispatchPendingPublication(ctx, db, options, binding, snapshot, head, pending, stdout, config, budget,
+		_publicationDispatchStart)
 }
 
 func _prepareRecursiveMerge(ctx context.Context, options bindOptions, snapshot worktreeSnapshot, baseRoot, localRoot,

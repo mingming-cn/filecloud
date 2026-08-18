@@ -37,7 +37,23 @@ var (
 	_emptyCandidateHistory = []byte{'F', 'C', 'H', '1', 0, 0, 0, 0}
 )
 
+// PublicationKind identifies the workflow that owns a pending publication.
+type PublicationKind string
+
+const (
+	// PublicationKindSync identifies an ordinary synchronization publication.
+	PublicationKindSync PublicationKind = "sync"
+)
+
+type _publicationDispatchMode uint8
+
+const (
+	_publicationDispatchResume _publicationDispatchMode = iota
+	_publicationDispatchStart
+)
+
 type pendingPublication struct {
+	Kind                                             PublicationKind
 	BaseCommit, BaseRoot, ExpectedHead, ExpectedETag string
 	CandidateCommit, CandidateRoot                   string
 	CandidateData                                    []byte
@@ -49,7 +65,7 @@ type pendingPublication struct {
 	LegacyRevalidationRequired                       bool
 }
 
-const _pendingPublicationWhere = `worktree = ? AND base_commit = ? AND base_root = ? AND expected_head = ?
+const _pendingPublicationWhere = `worktree = ? AND publication_kind = ? AND base_commit = ? AND base_root = ? AND expected_head = ?
 	AND expected_etag = ? AND candidate_commit = ? AND candidate_root = ? AND candidate_data = ?
 	AND captured_commit = ? AND captured_root = ? AND captured_data = ? AND candidate_history = ?
 	AND deletion_count = ? AND tracked_count = ? AND requires_delete_confirmation = ? AND delete_confirmed = ?
@@ -60,7 +76,7 @@ type _pendingPublicationExecer interface {
 }
 
 func _pendingPublicationArgs(worktree string, value pendingPublication) []any {
-	return []any{worktree, value.BaseCommit, value.BaseRoot, value.ExpectedHead, value.ExpectedETag,
+	return []any{worktree, value.Kind, value.BaseCommit, value.BaseRoot, value.ExpectedHead, value.ExpectedETag,
 		value.CandidateCommit, value.CandidateRoot, value.CandidateData, value.CapturedCommit, value.CapturedRoot,
 		value.CapturedData, value.CandidateHistory, value.DeletionCount, value.TrackedCount,
 		value.RequiresDeleteConfirmation, value.DeleteConfirmed, value.LegacyRevalidationRequired}
@@ -194,19 +210,19 @@ func syncRecoveryPromotionCASArgs(value syncRecoveryPromotion) []any {
 
 func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding, stdout io.Writer, config libraryClientConfig) error {
 	budget := _newReplayBudget()
-	pending, err := loadPendingPublication(ctx, db, binding.Worktree)
-	if err != nil {
-		return err
-	}
-	if options.confirmDeleteSet && (pending == nil || (!pending.RequiresDeleteConfirmation && !pending.LegacyRevalidationRequired)) {
-		return errors.New("--confirm-delete requires a protected pending deletion candidate for this worktree")
-	}
 	checkout, err := loadPendingCheckout(ctx, db, binding.ServerURL, binding.LibraryID, binding.Worktree)
 	if err != nil {
 		return err
 	}
 	if checkout != nil {
 		return continueSyncCheckout(ctx, db, options, binding, *checkout, stdout, config)
+	}
+	pending, err := loadPendingPublication(ctx, db, binding.Worktree)
+	if err != nil {
+		return err
+	}
+	if options.confirmDeleteSet && pending == nil {
+		return errors.New("--confirm-delete requires a protected pending deletion candidate for this worktree")
 	}
 
 	snapshot, err := scanWorktreeWithConfig(options.worktreeRoot, options.scanConfig)
@@ -221,7 +237,8 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 		return errors.New("bound library Head is empty")
 	}
 	if pending != nil {
-		return resumePublication(ctx, db, options, binding, snapshot, head, *pending, stdout, config, budget)
+		return dispatchPendingPublication(ctx, db, options, binding, snapshot, head, *pending, stdout, config, budget,
+			_publicationDispatchResume)
 	}
 
 	localChanged := snapshot.root != binding.SyncBaseRoot
@@ -250,7 +267,7 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 		}
 		deleted, tracked := deletionStats(options.scanConfig.trackedPaths, snapshot.paths)
 		protected := protectedDeletion(deleted, tracked)
-		pending = &pendingPublication{BaseCommit: binding.SyncBase, BaseRoot: binding.SyncBaseRoot,
+		pending = &pendingPublication{Kind: PublicationKindSync, BaseCommit: binding.SyncBase, BaseRoot: binding.SyncBaseRoot,
 			ExpectedHead: *head.CommitID, ExpectedETag: head.ETag, CandidateCommit: id, CandidateRoot: snapshot.root,
 			CandidateData: data, CapturedCommit: id, CapturedRoot: snapshot.root, CapturedData: data,
 			CandidateHistory: _emptyCandidateHistory, DeletionCount: deleted, TrackedCount: tracked,
@@ -258,24 +275,22 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 		if err := savePendingPublication(ctx, db, binding.Worktree, *pending); err != nil {
 			return err
 		}
-		if protected {
-			return deletionConfirmationError(*pending)
-		}
-		return uploadAndPublishPending(ctx, db, options, binding, snapshot, *pending, stdout, config, budget)
+		return dispatchPendingPublication(ctx, db, options, binding, snapshot, head, *pending, stdout, config, budget,
+			_publicationDispatchStart)
 	}
 }
 
 func loadPendingPublication(ctx context.Context, db *sql.DB, worktree string) (*pendingPublication, error) {
 	var value pendingPublication
 	var candidateLength, capturedLength, historyLength int
-	err := db.QueryRowContext(ctx, `SELECT base_commit, base_root, expected_head, expected_etag, candidate_commit, candidate_root,
+	err := db.QueryRowContext(ctx, `SELECT publication_kind, base_commit, base_root, expected_head, expected_etag, candidate_commit, candidate_root,
 		length(candidate_data), CASE WHEN length(candidate_data) BETWEEN 1 AND 65536 THEN candidate_data END,
 		captured_commit, captured_root, length(captured_data),
 		CASE WHEN length(captured_data) BETWEEN 1 AND 65536 THEN captured_data END,
 		length(candidate_history), CASE WHEN length(candidate_history) BETWEEN 8 AND 67112968 THEN candidate_history END,
 		deletion_count, tracked_count, requires_delete_confirmation, delete_confirmed, legacy_revalidation_required
 		FROM pending_publications WHERE worktree = ?`, worktree).Scan(
-		&value.BaseCommit, &value.BaseRoot, &value.ExpectedHead, &value.ExpectedETag, &value.CandidateCommit,
+		&value.Kind, &value.BaseCommit, &value.BaseRoot, &value.ExpectedHead, &value.ExpectedETag, &value.CandidateCommit,
 		&value.CandidateRoot, &candidateLength, &value.CandidateData, &value.CapturedCommit, &value.CapturedRoot,
 		&capturedLength, &value.CapturedData, &historyLength, &value.CandidateHistory, &value.DeletionCount,
 		&value.TrackedCount, &value.RequiresDeleteConfirmation, &value.DeleteConfirmed, &value.LegacyRevalidationRequired)
@@ -293,11 +308,11 @@ func loadPendingPublication(ctx context.Context, db *sql.DB, worktree string) (*
 }
 
 func savePendingPublication(ctx context.Context, db *sql.DB, worktree string, value pendingPublication) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO pending_publications(worktree, base_commit, base_root, expected_head,
+	_, err := db.ExecContext(ctx, `INSERT INTO pending_publications(worktree, publication_kind, base_commit, base_root, expected_head,
 		expected_etag, candidate_commit, candidate_root, candidate_data, captured_commit, captured_root, captured_data,
 		candidate_history, deletion_count, tracked_count, requires_delete_confirmation, delete_confirmed,
-		legacy_revalidation_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, worktree,
-		value.BaseCommit, value.BaseRoot, value.ExpectedHead, value.ExpectedETag, value.CandidateCommit,
+		legacy_revalidation_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, worktree,
+		value.Kind, value.BaseCommit, value.BaseRoot, value.ExpectedHead, value.ExpectedETag, value.CandidateCommit,
 		value.CandidateRoot, value.CandidateData, value.CapturedCommit, value.CapturedRoot, value.CapturedData,
 		value.CandidateHistory, value.DeletionCount, value.TrackedCount, value.RequiresDeleteConfirmation,
 		value.DeleteConfirmed, value.LegacyRevalidationRequired)
@@ -446,10 +461,35 @@ func _verifyPendingPublicationChain(ctx context.Context, options bindOptions, va
 	return nil
 }
 
-func resumePublication(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding, snapshot worktreeSnapshot,
+func dispatchPendingPublication(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding, snapshot worktreeSnapshot,
+	head remoteHead, pending pendingPublication, stdout io.Writer, config libraryClientConfig, budget *_replayBudget,
+	mode _publicationDispatchMode) error {
+	if pending.Kind != PublicationKindSync {
+		return fmt.Errorf("unsupported pending publication kind %q", pending.Kind)
+	}
+	switch mode {
+	case _publicationDispatchStart:
+		if err := verifyPendingPublication(pending, binding); err != nil {
+			return err
+		}
+		if pending.RequiresDeleteConfirmation && !pending.DeleteConfirmed {
+			return deletionConfirmationError(pending)
+		}
+		return uploadAndPublishPending(ctx, db, options, binding, snapshot, pending, stdout, config, budget)
+	case _publicationDispatchResume:
+		return resumeSyncPublication(ctx, db, options, binding, snapshot, head, pending, stdout, config, budget)
+	default:
+		return errors.New("pending publication dispatcher has an invalid mode")
+	}
+}
+
+func resumeSyncPublication(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding, snapshot worktreeSnapshot,
 	head remoteHead, pending pendingPublication, stdout io.Writer, config libraryClientConfig, budget *_replayBudget) error {
 	if err := verifyPendingPublication(pending, binding); err != nil {
 		return err
+	}
+	if options.confirmDeleteSet && !pending.RequiresDeleteConfirmation && !pending.LegacyRevalidationRequired {
+		return errors.New("--confirm-delete requires a protected pending deletion candidate for this worktree")
 	}
 	if err := _verifyPendingPublicationChain(ctx, options, pending, binding, budget); err != nil {
 		return err
@@ -592,7 +632,7 @@ func replacePendingForTrivialMerge(ctx context.Context, db *sql.DB, options bind
 	if err != nil {
 		return err
 	}
-	next := pendingPublication{BaseCommit: old.ExpectedHead, BaseRoot: base.Root, ExpectedHead: *head.CommitID,
+	next := pendingPublication{Kind: PublicationKindSync, BaseCommit: old.ExpectedHead, BaseRoot: base.Root, ExpectedHead: *head.CommitID,
 		ExpectedETag: head.ETag, CandidateCommit: prepared.candidateID, CandidateRoot: prepared.root,
 		CandidateData: prepared.candidateData, CapturedCommit: old.CapturedCommit, CapturedRoot: old.CapturedRoot,
 		CapturedData: old.CapturedData, CandidateHistory: encodedHistory, DeletionCount: deleted, TrackedCount: tracked,
@@ -916,7 +956,8 @@ func publishPending(ctx context.Context, db *sql.DB, options bindOptions, bindin
 		return errors.New("library Head is empty before publication")
 	}
 	if *current.CommitID != pending.ExpectedHead {
-		return resumePublication(ctx, db, options, binding, snapshot, current, pending, stdout, config, budget)
+		return dispatchPendingPublication(ctx, db, options, binding, snapshot, current, pending, stdout, config, budget,
+			_publicationDispatchResume)
 	}
 	if current.ETag != pending.ExpectedETag {
 		if err := refreshPendingETag(ctx, db, binding.Worktree, &pending, current.ETag); err != nil {
@@ -936,7 +977,8 @@ func publishPending(ctx context.Context, db *sql.DB, options bindOptions, bindin
 		return errors.Join(publishErr, fmt.Errorf("rescan worktree after publish: %w", scanErr))
 	}
 	if published.CommitID != nil && *published.CommitID == pending.CandidateCommit {
-		return resumePublication(ctx, db, options, binding, observed, published, pending, stdout, config, budget)
+		return dispatchPendingPublication(ctx, db, options, binding, observed, published, pending, stdout, config, budget,
+			_publicationDispatchResume)
 	}
 	if published.CommitID != nil && *published.CommitID == pending.ExpectedHead {
 		if published.ETag != pending.ExpectedETag {
@@ -949,7 +991,8 @@ func publishPending(ctx context.Context, db *sql.DB, options bindOptions, bindin
 	if published.CommitID == nil {
 		return errors.Join(publishErr, errors.New("library Head became empty during publication"))
 	}
-	resumeErr := resumePublication(ctx, db, options, binding, observed, published, pending, stdout, config, budget)
+	resumeErr := dispatchPendingPublication(ctx, db, options, binding, observed, published, pending, stdout, config, budget,
+		_publicationDispatchResume)
 	if resumeErr != nil {
 		return errors.Join(publishErr, resumeErr)
 	}
