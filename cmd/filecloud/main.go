@@ -117,6 +117,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		headMaxParentDepth := flags.Int("head-max-parent-depth", headDefaults.MaxCommitDepth, "Maximum second-parent traversal depth")
 		headMaxIntroducedCommits := flags.Int("head-max-introduced-commits", headDefaults.MaxIntroducedCommits, "Maximum commits introduced by a Head update")
 		headMaxValidatedObjects := flags.Int("head-max-validated-objects", headDefaults.MaxValidatedObjects, "Maximum deduplicated objects validated by a Head update")
+		historyDefaults := libraryapi.DefaultHistoryConfig()
+		historyGlobalCapacity := flags.Int("history-global-capacity", historyDefaults.GlobalConcurrency, "Global concurrent history traversal capacity")
+		historyUserCapacity := flags.Int("history-user-capacity", historyDefaults.UserConcurrency, "Concurrent history traversal capacity per user")
+		historyReadTimeout := flags.Duration("history-read-timeout", historyDefaults.RequestTimeout, "Maximum time for one history traversal")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -149,11 +153,15 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			headConfig.MaxTraversalContexts < 1 || headConfig.MaxCommitDepth < 1 || headConfig.MaxIntroducedCommits < 1 || headConfig.MaxValidatedObjects < 1 {
 			return errors.New("head validation limits must be positive")
 		}
+		historyConfig := libraryapi.HistoryConfig{GlobalConcurrency: *historyGlobalCapacity, UserConcurrency: *historyUserCapacity, RequestTimeout: *historyReadTimeout}
+		if historyConfig.GlobalConcurrency < 1 || historyConfig.UserConcurrency < 1 || historyConfig.RequestTimeout <= 0 {
+			return errors.New("history limits must be positive")
+		}
 		return serve(ctx, *dataDir, *listen, stdout, stderr, auth.HandlerConfig{
 			GlobalKDFLimit:   *globalKDFCapacity,
 			SourceIPKDFLimit: *sourceIPKDFCapacity,
 			UsernameKDFLimit: *usernameKDFCapacity,
-		}, uploadConfig, headConfig)
+		}, uploadConfig, headConfig, historyConfig)
 	case "gc":
 		return runGarbageCollection(ctx, args[1:], stdout, stderr)
 	case "integrity":
@@ -499,7 +507,7 @@ func (t *requestTracker) wait() {
 	<-t.allDone
 }
 
-func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Writer, authConfig auth.HandlerConfig, uploadConfig storage.UploadConfig, headConfig libraryapi.HeadValidationConfig) (retErr error) {
+func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Writer, authConfig auth.HandlerConfig, uploadConfig storage.UploadConfig, headConfig libraryapi.HeadValidationConfig, historyConfig libraryapi.HistoryConfig) (retErr error) {
 	store, err := storage.OpenForServe(ctx, dataDir)
 	if err != nil {
 		return err
@@ -515,7 +523,7 @@ func serve(ctx context.Context, dataDir, address string, stdout, stderr io.Write
 	if err != nil {
 		return errors.Join(err, listener.Close())
 	}
-	libraries, err := libraryapi.NewHandler(store, logger, libraryapi.Config{Upload: uploadConfig, HeadValidation: headConfig})
+	libraries, err := libraryapi.NewHandler(store, logger, libraryapi.Config{Upload: uploadConfig, HeadValidation: headConfig, History: historyConfig})
 	if err != nil {
 		return errors.Join(err, listener.Close())
 	}

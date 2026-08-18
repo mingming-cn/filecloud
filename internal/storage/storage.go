@@ -84,6 +84,20 @@ func metadataMigrations() []migration {
 			)`,
 			`CREATE INDEX upload_charges_window ON upload_charges(user_id, accepted_at)`,
 		}},
+		{version: 6, statements: []string{
+			`CREATE TABLE published_commit_roles (
+				owner_user_id TEXT NOT NULL,
+				library_id TEXT NOT NULL,
+				commit_id TEXT NOT NULL,
+				role TEXT NOT NULL CHECK(role IN ('mainline', 'merge-source')),
+				mainline_commit_id TEXT NOT NULL,
+				PRIMARY KEY(owner_user_id, library_id, commit_id),
+				FOREIGN KEY(owner_user_id, library_id)
+					REFERENCES libraries(owner_user_id, id) ON DELETE CASCADE
+			)`,
+			`CREATE INDEX published_commit_roles_mainline
+				ON published_commit_roles(owner_user_id, library_id, mainline_commit_id, role, commit_id)`,
+		}, apply: backfillPublishedCommitRoles},
 	}
 }
 
@@ -141,7 +155,7 @@ func Init(ctx context.Context, dataDir string) (retErr error) {
 	if err := os.Chmod(databasePath, 0o600); err != nil {
 		return fmt.Errorf("secure metadata database: %w", err)
 	}
-	if err := migrate(ctx, db, metadataMigrations()); err != nil {
+	if err := migrateWithEnvironment(ctx, db, metadataMigrations(), migrationEnvironment{objectsDir: filepath.Join(dataDir, _objectsName)}); err != nil {
 		return err
 	}
 	return nil
@@ -181,7 +195,7 @@ func openForServe(ctx context.Context, dataDir string, migrations []migration) (
 	if err != nil {
 		return nil, errors.Join(err, lock.Close())
 	}
-	if err := migrate(ctx, db, migrations); err != nil {
+	if err := migrateWithEnvironment(ctx, db, migrations, migrationEnvironment{objectsDir: filepath.Join(dataDir, _objectsName)}); err != nil {
 		return nil, errors.Join(err, db.Close(), lock.Close())
 	}
 	if err := lock.shared(); err != nil {
@@ -289,9 +303,18 @@ func sqliteURLPath(path string) string {
 type migration struct {
 	version    int
 	statements []string
+	apply      func(context.Context, *sql.Tx, migrationEnvironment) error
 }
 
-func migrate(ctx context.Context, db *sql.DB, migrations []migration) (retErr error) {
+type migrationEnvironment struct {
+	objectsDir string
+}
+
+func migrate(ctx context.Context, db *sql.DB, migrations []migration) error {
+	return migrateWithEnvironment(ctx, db, migrations, migrationEnvironment{})
+}
+
+func migrateWithEnvironment(ctx context.Context, db *sql.DB, migrations []migration, environment migrationEnvironment) (retErr error) {
 	latest := 0
 	for _, migration := range migrations {
 		if migration.version <= latest {
@@ -332,6 +355,11 @@ func migrate(ctx context.Context, db *sql.DB, migrations []migration) (retErr er
 		for _, statement := range migration.statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("apply metadata migration %d: %w", migration.version, err)
+			}
+		}
+		if migration.apply != nil {
+			if err := migration.apply(ctx, tx, environment); err != nil {
+				return fmt.Errorf("apply metadata migration %d callback: %w", migration.version, err)
 			}
 		}
 		if _, err := tx.ExecContext(ctx,

@@ -176,6 +176,34 @@ func TestUpdateLibraryHeadMaintainsPublishedCommitsAtomically(t *testing.T) {
 	}
 }
 
+func TestPublishedCommitRoleRequiresPublishedReachability(t *testing.T) {
+	store := openAccountStore(t)
+	defer closeAccountStore(t, store)
+	now := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := store.CreateUser(t.Context(), User{ID: "owner", Username: "alice", PasswordHash: "hash"}, now); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if _, _, err := store.CreateLibrary(t.Context(), Library{ID: "library", OwnerUserID: "owner", Name: "library"}, now); err != nil {
+		t.Fatalf("CreateLibrary: %v", err)
+	}
+	if _, err := store.DB().ExecContext(t.Context(), `
+		INSERT INTO published_commit_roles(owner_user_id, library_id, commit_id, role, mainline_commit_id)
+		VALUES ('owner', 'library', 'candidate', 'mainline', 'candidate')`); err != nil {
+		t.Fatalf("insert role without reachability: %v", err)
+	}
+	if _, found, err := store.GetPublishedCommitRole(t.Context(), "owner", "library", "candidate"); err != nil || found {
+		t.Fatalf("role without published reachability = found:%t err:%v, want absent", found, err)
+	}
+	if _, err := store.DB().ExecContext(t.Context(), `
+		INSERT INTO published_commits(owner_user_id, library_id, commit_id) VALUES ('owner', 'library', 'candidate')`); err != nil {
+		t.Fatalf("insert published reachability: %v", err)
+	}
+	role, found, err := store.GetPublishedCommitRole(t.Context(), "owner", "library", "candidate")
+	if err != nil || !found || role.Role != "mainline" || role.MainlineCommitID != "candidate" {
+		t.Fatalf("role with published reachability = %+v found:%t err:%v", role, found, err)
+	}
+}
+
 func TestFindActiveSession(t *testing.T) {
 	store := openAccountStore(t)
 	defer closeAccountStore(t, store)

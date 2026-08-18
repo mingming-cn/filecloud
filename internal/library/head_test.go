@@ -208,9 +208,9 @@ func TestHeadValidationCommitBudgetBoundaries(t *testing.T) {
 			base := putCommit(t, store, _ownerID, nil, root)
 			publishHead(t, handler, base, `"head-version-0"`, http.StatusOK, 0)
 
-			branch := base
-			for range test.branchDepth {
-				branch = putCommit(t, store, _ownerID, []string{branch}, root)
+			branch := putCommit(t, store, _ownerID, []string{base}, root)
+			for index := 1; index < test.branchDepth; index++ {
+				branch = putCommit(t, store, _ownerID, []string{base, branch}, root)
 			}
 			merge := putCommit(t, store, _ownerID, []string{base, branch}, root)
 			publishHead(t, handler, merge, `"head-version-1"`, test.status, test.code)

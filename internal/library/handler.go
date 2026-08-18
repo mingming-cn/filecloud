@@ -34,6 +34,7 @@ const (
 	_maxPageSize         = 500
 	_pageTokenLifetime   = 15 * time.Minute
 	_pageTokenKeySize    = 32
+	_maxHistoryTokenSize = 4096
 	_maxObjectCheckBody  = 1 << 20
 	_maxObjectCheckCount = 1000
 	_maxCommitBody       = object.MaxCommitSize
@@ -49,8 +50,11 @@ type Config struct {
 	AfterHeadUpdate          func() error
 	Upload                   storage.UploadConfig
 	HeadValidation           HeadValidationConfig
+	History                  HistoryConfig
 	headLimiter              *headValidationLimiter
+	historyLimiter           *historyLimiter
 	afterHeadValidationAdmit func(context.Context)
+	afterHistoryAdmit        func(context.Context)
 }
 
 type handler struct {
@@ -58,12 +62,16 @@ type handler struct {
 	logger                   *log.Logger
 	now                      func() time.Time
 	pageTokenAEAD            cipher.AEAD
+	historyTokenAEAD         cipher.AEAD
 	beforeHeadUpdate         func() error
 	afterHeadUpdate          func() error
 	uploadTimeout            time.Duration
 	headValidation           HeadValidationConfig
 	headLimiter              *headValidationLimiter
+	history                  HistoryConfig
+	historyLimiter           *historyLimiter
 	afterHeadValidationAdmit func(context.Context)
+	afterHistoryAdmit        func(context.Context)
 }
 
 // NewHandler constructs authenticated create, list, and get library endpoints.
@@ -103,6 +111,16 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 			return nil, err
 		}
 	}
+	history, err := normalizeHistoryConfig(config.History)
+	if err != nil {
+		return nil, err
+	}
+	if config.historyLimiter == nil {
+		config.historyLimiter, err = newHistoryLimiter(history.GlobalConcurrency, history.UserConcurrency)
+		if err != nil {
+			return nil, err
+		}
+	}
 	block, err := aes.NewCipher(config.PageTokenKey)
 	if err != nil {
 		return nil, fmt.Errorf("create page token cipher: %w", err)
@@ -115,19 +133,24 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 		store:                    store,
 		logger:                   logger,
 		now:                      config.Now,
+		historyTokenAEAD:         pageTokenAEAD,
 		pageTokenAEAD:            pageTokenAEAD,
 		beforeHeadUpdate:         config.BeforeHeadUpdate,
 		afterHeadUpdate:          config.AfterHeadUpdate,
 		uploadTimeout:            upload.RequestTimeout,
 		headValidation:           headValidation,
 		headLimiter:              config.headLimiter,
+		history:                  history,
+		historyLimiter:           config.historyLimiter,
 		afterHeadValidationAdmit: config.afterHeadValidationAdmit,
+		afterHistoryAdmit:        config.afterHistoryAdmit,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}", h.create)
 	mux.HandleFunc("GET /v1/libraries/{LibraryId}", h.get)
 	mux.HandleFunc("GET /v1/libraries/{LibraryId}/head", h.getHead)
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}/head", h.updateHead)
+	mux.HandleFunc("GET /v1/libraries/{LibraryId}/history", h.listHistory)
 	mux.HandleFunc("GET /v1/libraries", h.list)
 	mux.HandleFunc("POST /v1/libraries/{LibraryId}/object-checks", h.checkObjects)
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}/objects/{ObjectType}/{ObjectId}", h.putMetadataObject)

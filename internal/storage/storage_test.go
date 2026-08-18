@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mingming-cn/filecloud/internal/object"
 )
 
 func TestMetadataMigrationsReturnsFreshData(t *testing.T) {
@@ -99,7 +101,7 @@ func TestInitCreatesLayoutAndSchemaIdempotently(t *testing.T) {
 	if err := rows.Close(); err != nil {
 		t.Fatalf("close table rows: %v", err)
 	}
-	if got := strings.Join(tables, ","); got != "access_tokens,libraries,published_commits,schema_migrations,upload_charges,users" {
+	if got := strings.Join(tables, ","); got != "access_tokens,libraries,published_commit_roles,published_commits,schema_migrations,upload_charges,users" {
 		t.Fatalf("tables = %q, want library schema", got)
 	}
 
@@ -107,8 +109,8 @@ func TestInitCreatesLayoutAndSchemaIdempotently(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*), MAX(version) FROM schema_migrations").Scan(&count, &version); err != nil {
 		t.Fatalf("query schema version: %v", err)
 	}
-	if count != 5 || version != 5 {
-		t.Fatalf("migration rows = %d, version = %d; want 5, 5", count, version)
+	if count != 6 || version != 6 {
+		t.Fatalf("migration rows = %d, version = %d; want 6, 6", count, version)
 	}
 }
 
@@ -123,24 +125,119 @@ func TestPublishedCommitsMigrationBackfillsExistingHead(t *testing.T) {
 	if err := migrate(t.Context(), db, migrations[:3]); err != nil {
 		t.Fatalf("migrate legacy schema: %v", err)
 	}
+	owner := "12345678-9abc-4def-8123-456789abcdef"
+	root := strings.Repeat("b", 64)
+	commitData, commitID, err := object.Canonicalize("commits", []byte(`{"AuthorUserId":"`+owner+`","CreatedAt":"2026-01-01T00:00:00Z","DeviceId":"01234567-89ab-4def-8123-456789abcdef","Message":"sync","Parents":[],"Root":"`+root+`","Type":"Commit","Version":1}`))
+	if err != nil {
+		t.Fatalf("canonical legacy commit: %v", err)
+	}
+	objectsDir := filepath.Join(t.TempDir(), "objects")
+	commitPath := filepath.Join(objectsDir, owner, "library", "commits", commitID[:2])
+	if err := os.MkdirAll(commitPath, 0o700); err != nil {
+		t.Fatalf("create legacy commit path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(commitPath, commitID[2:]), commitData, 0o600); err != nil {
+		t.Fatalf("write legacy commit: %v", err)
+	}
 	if _, err := db.ExecContext(t.Context(), `
 		INSERT INTO users(id, username, username_key, password_hash, created_at, updated_at)
-		VALUES ('owner', 'owner', 'owner', 'hash', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+		VALUES (?, 'owner', 'owner', 'hash', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
 		INSERT INTO libraries(id, owner_user_id, name, name_key, head_commit_id, head_version, created_at, updated_at)
-		VALUES ('library', 'owner', 'library', 'library', 'existing-head', 7, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
+		VALUES ('library', ?, 'library', 'library', ?, 7, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`, owner, commitID); err != nil {
 		t.Fatalf("seed legacy head: %v", err)
 	}
-	if err := migrate(t.Context(), db, migrations); err != nil {
+	if err := migrate(t.Context(), db, migrations[:5]); err != nil {
+		t.Fatalf("migrate published commits: %v", err)
+	}
+	var seededPublished string
+	if err := db.QueryRowContext(t.Context(), "SELECT commit_id FROM published_commits").Scan(&seededPublished); err != nil {
+		t.Fatalf("read seeded published: %v", err)
+	}
+	if err := migrateWithEnvironment(t.Context(), db, migrations, migrationEnvironment{objectsDir: objectsDir}); err != nil {
 		t.Fatalf("migrate published commits: %v", err)
 	}
 	var count int
 	if err := db.QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM published_commits
-		WHERE owner_user_id = 'owner' AND library_id = 'library' AND commit_id = 'existing-head'`).Scan(&count); err != nil {
+		WHERE owner_user_id = ? AND library_id = 'library' AND commit_id = ?`, owner, commitID).Scan(&count); err != nil {
 		t.Fatalf("query backfilled head: %v", err)
 	}
 	if count != 1 {
 		t.Fatalf("backfilled head count = %d, want 1", count)
+	}
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT COUNT(*) FROM published_commit_roles
+		WHERE owner_user_id = ? AND library_id = 'library' AND commit_id = ? AND role = 'mainline' AND mainline_commit_id = ?`, owner, commitID, commitID).Scan(&count); err != nil {
+		t.Fatalf("query backfilled role: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("backfilled role count = %d, want 1", count)
+	}
+}
+
+func TestPublishedCommitRolesMigrationRollsBackOnUnprovableHistory(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "metadata.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer closeDB(t, db)
+
+	migrations := metadataMigrations()
+	if err := migrate(t.Context(), db, migrations[:5]); err != nil {
+		t.Fatalf("migrate legacy schema: %v", err)
+	}
+	owner := "12345678-9abc-4def-8123-456789abcdef"
+	root := strings.Repeat("b", 64)
+	_, commitID, err := object.Canonicalize("commits", []byte(`{"AuthorUserId":"`+owner+`","CreatedAt":"2026-01-01T00:00:00Z","DeviceId":"01234567-89ab-4def-8123-456789abcdef","Message":"sync","Parents":[],"Root":"`+root+`","Type":"Commit","Version":1}`))
+	if err != nil {
+		t.Fatalf("canonical legacy commit: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO users(id, username, username_key, password_hash, created_at, updated_at)
+		VALUES (?, 'owner', 'owner', 'hash', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`, owner); err != nil {
+		t.Fatalf("seed legacy user: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO libraries(id, owner_user_id, name, name_key, head_commit_id, head_version, created_at, updated_at)
+		VALUES ('library', ?, 'library', 'library', ?, 7, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`, owner, commitID); err != nil {
+		t.Fatalf("seed legacy library: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO published_commits(owner_user_id, library_id, commit_id) VALUES (?, 'library', ?)`, owner, commitID); err != nil {
+		t.Fatalf("seed legacy published history: %v", err)
+	}
+
+	objectsDir := filepath.Join(t.TempDir(), "objects-path-canary")
+	migrationErr := migrateWithEnvironment(t.Context(), db, migrations, migrationEnvironment{objectsDir: objectsDir})
+	if migrationErr == nil {
+		t.Fatal("unprovable history migration unexpectedly succeeded")
+	}
+	if !strings.Contains(migrationErr.Error(), "run integrity check") || strings.Contains(migrationErr.Error(), objectsDir) {
+		t.Fatalf("migration error = %q, want integrity guidance without object path", migrationErr)
+	}
+	var version int
+	if err := db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if version != 5 {
+		t.Fatalf("schema version = %d, want 5 after rollback", version)
+	}
+	if tableExists(t, db, "published_commit_roles") {
+		t.Fatal("history role table remained after failed migration")
+	}
+	var head string
+	if err := db.QueryRowContext(t.Context(), "SELECT head_commit_id FROM libraries WHERE owner_user_id = ? AND id = 'library'", owner).Scan(&head); err != nil {
+		t.Fatalf("read Head after rollback: %v", err)
+	}
+	if head != commitID {
+		t.Fatalf("Head after rollback = %q, want %q", head, commitID)
+	}
+	var published int
+	if err := db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM published_commits WHERE owner_user_id = ? AND library_id = 'library'", owner).Scan(&published); err != nil {
+		t.Fatalf("read published history after rollback: %v", err)
+	}
+	if published != 1 {
+		t.Fatalf("published history count after rollback = %d, want 1", published)
 	}
 }
 
@@ -255,7 +352,7 @@ func TestMigrateRejectsNewerSchemaWithoutMutation(t *testing.T) {
 		t.Fatalf("create newer schema: %v", err)
 	}
 	if _, err := db.ExecContext(ctx,
-		"INSERT INTO schema_migrations(version, applied_at) VALUES (6, 'test')"); err != nil {
+		"INSERT INTO schema_migrations(version, applied_at) VALUES (7, 'test')"); err != nil {
 		t.Fatalf("record newer schema: %v", err)
 	}
 	before := schemaSnapshot(t, db)
@@ -270,8 +367,8 @@ func TestMigrateRejectsNewerSchemaWithoutMutation(t *testing.T) {
 		"SELECT COUNT(*), MAX(version) FROM schema_migrations").Scan(&count, &version); err != nil {
 		t.Fatalf("query schema version: %v", err)
 	}
-	if count != 6 || version != 6 {
-		t.Fatalf("migration rows = %d, version = %d; want 6, 6", count, version)
+	if count != 7 || version != 7 {
+		t.Fatalf("migration rows = %d, version = %d; want 7, 7", count, version)
 	}
 	if after := schemaSnapshot(t, db); after != before {
 		t.Fatalf("schema changed after rejection:\nbefore: %s\nafter:  %s", before, after)
@@ -324,7 +421,7 @@ func TestOpenForServeAppliesPendingMigration(t *testing.T) {
 	}
 
 	migrations := append(metadataMigrations(), migration{
-		version:    6,
+		version:    7,
 		statements: []string{"CREATE TABLE migrated_on_serve (id INTEGER PRIMARY KEY)"},
 	})
 	store, err := openForServe(ctx, dataDir, migrations)
@@ -344,8 +441,8 @@ func TestOpenForServeAppliesPendingMigration(t *testing.T) {
 	if err := store.DB().QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
 		t.Fatalf("query schema version: %v", err)
 	}
-	if version != 6 {
-		t.Fatalf("schema version = %d, want 6", version)
+	if version != 7 {
+		t.Fatalf("schema version = %d, want 7", version)
 	}
 }
 

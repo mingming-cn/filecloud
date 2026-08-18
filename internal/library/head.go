@@ -95,7 +95,7 @@ func (h *handler) updateHead(w http.ResponseWriter, r *http.Request) {
 	if h.afterHeadValidationAdmit != nil {
 		h.afterHeadValidationAdmit(validationRequest.Context())
 	}
-	missing, introduced, err := h.validateCandidate(validationRequest, owner, libraryID, current.HeadCommitID, commitID)
+	missing, roles, err := h.validateCandidate(validationRequest, owner, libraryID, current.HeadCommitID, commitID)
 	releaseValidation()
 	switch {
 	case errors.Is(err, object.ErrPayloadTooLarge):
@@ -129,7 +129,7 @@ func (h *handler) updateHead(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	updated, err := h.store.UpdateLibraryHead(r.Context(), owner, libraryID, current.HeadCommitID, current.HeadVersion, commitID, introduced, h.now().UTC().Truncate(0))
+	updated, err := h.store.UpdateLibraryHeadWithRoles(r.Context(), owner, libraryID, current.HeadCommitID, current.HeadVersion, commitID, roles, h.now().UTC().Truncate(0))
 	if errors.Is(err, storage.ErrHeadConflict) {
 		latest, getErr := h.store.GetLibrary(r.Context(), owner, libraryID)
 		if getErr != nil {
@@ -299,12 +299,7 @@ type directoryWork struct {
 	ancestor *directoryPath
 }
 
-type commitWork struct {
-	id    string
-	depth int
-}
-
-func (h *handler) validateCandidate(r *http.Request, owner, libraryID string, currentHead *string, commitID string) (missingObjects, []string, error) {
+func (h *handler) validateCandidate(r *http.Request, owner, libraryID string, currentHead *string, commitID string) (missingObjects, []storage.PublishedCommitRole, error) {
 	if err := r.Context().Err(); err != nil {
 		return missingObjects{}, nil, err
 	}
@@ -322,70 +317,97 @@ func (h *handler) validateCandidate(r *http.Request, owner, libraryID string, cu
 	if commit.AuthorUserID != owner || !validCommitParents(commit.Parents, currentHead) {
 		return state.missing, nil, errInvalidSnapshot
 	}
+	if currentHead != nil {
+		parentRole, found, err := h.store.GetPublishedCommitRole(r.Context(), owner, libraryID, *currentHead)
+		if err != nil {
+			return state.missing, nil, err
+		}
+		if !found || parentRole.Role != _historyRoleMainline || parentRole.MainlineCommitID != *currentHead {
+			return state.missing, nil, errInvalidSnapshot
+		}
+	}
 	if err := state.validateRoot(commit.Root); err != nil {
 		return state.missing, nil, err
 	}
+	roles := []storage.PublishedCommitRole{{CommitID: commitID, Role: _historyRoleMainline, MainlineCommitID: commitID}}
 	if len(commit.Parents) < 2 {
-		return state.missing, nil, nil
+		return state.missing, roles, nil
 	}
 
-	queue := []commitWork{{id: commit.Parents[1], depth: 1}}
-	seenDepth := make(map[string]int)
-	introducedSet := make(map[string]struct{})
-	introduced := make([]string, 0, state.h.headValidation.MaxIntroducedCommits)
-	commitContexts := 1
-	for len(queue) > 0 {
+	seen := make(map[string]struct{})
+	current := commit.Parents[1]
+	for depth := 1; current != ""; depth++ {
 		if err := state.r.Context().Err(); err != nil {
 			return state.missing, nil, err
 		}
-		work := queue[0]
-		queue = queue[1:]
-		if seenDepth[work.id] >= work.depth {
-			continue
+		if depth > state.h.headValidation.MaxCommitDepth {
+			return state.missing, nil, object.ErrPayloadTooLarge
 		}
-		seenDepth[work.id] = work.depth
-		published, err := state.h.store.IsCommitPublished(state.r.Context(), state.owner, state.libraryID, work.id)
+		if _, exists := seen[current]; exists {
+			return state.missing, nil, errInvalidSnapshot
+		}
+		seen[current] = struct{}{}
+		if err := state.addContext(); err != nil {
+			return state.missing, nil, err
+		}
+		role, roleFound, err := state.h.store.GetPublishedCommitRole(state.r.Context(), owner, libraryID, current)
+		if err != nil {
+			return state.missing, nil, err
+		}
+		if roleFound || role.CommitID != "" {
+			return state.missing, nil, errInvalidSnapshot
+		}
+		published, err := state.h.store.IsCommitPublished(state.r.Context(), owner, libraryID, current)
 		if err != nil {
 			return state.missing, nil, err
 		}
 		if published {
-			if work.id == commit.Parents[1] {
-				return state.missing, nil, errInvalidSnapshot
-			}
-			continue
+			return state.missing, nil, errInvalidSnapshot
 		}
-		if work.depth > state.h.headValidation.MaxCommitDepth {
-			return state.missing, nil, object.ErrPayloadTooLarge
-		}
-		value, found, err := state.loadCommit(work.id)
+		value, found, err := state.loadCommit(current)
 		if err != nil {
 			return state.missing, nil, err
 		}
 		if !found {
-			continue
+			return state.missing, roles, nil
 		}
-		if value.AuthorUserID != owner || len(value.Parents) > 2 || len(value.Parents) == 0 {
+		if value.AuthorUserID != owner || len(value.Parents) == 0 || len(value.Parents) > 2 {
 			return state.missing, nil, errInvalidSnapshot
 		}
-		if _, exists := introducedSet[work.id]; !exists {
-			if len(introduced) == state.h.headValidation.MaxIntroducedCommits {
-				return state.missing, nil, object.ErrPayloadTooLarge
-			}
-			introducedSet[work.id] = struct{}{}
-			introduced = append(introduced, work.id)
-			if err := state.validateRoot(value.Root); err != nil {
+		if len(roles)-1 == state.h.headValidation.MaxIntroducedCommits {
+			return state.missing, nil, object.ErrPayloadTooLarge
+		}
+		parentRole, parentFound, err := state.h.store.GetPublishedCommitRole(state.r.Context(), owner, libraryID, value.Parents[0])
+		if err != nil {
+			return state.missing, nil, err
+		}
+		if !parentFound {
+			published, err := state.h.store.IsCommitPublished(state.r.Context(), owner, libraryID, value.Parents[0])
+			if err != nil {
 				return state.missing, nil, err
 			}
-		}
-		for _, parent := range value.Parents {
-			if commitContexts == state.h.headValidation.MaxTraversalContexts {
-				return state.missing, nil, object.ErrPayloadTooLarge
+			if !published {
+				if _, found, err := state.loadCommit(value.Parents[0]); err != nil {
+					return state.missing, nil, err
+				} else if !found {
+					return state.missing, roles, nil
+				}
 			}
-			commitContexts++
-			queue = append(queue, commitWork{id: parent, depth: work.depth + 1})
+			return state.missing, nil, errInvalidSnapshot
 		}
+		if parentRole.Role != _historyRoleMainline || parentRole.MainlineCommitID != value.Parents[0] {
+			return state.missing, nil, errInvalidSnapshot
+		}
+		if err := state.validateRoot(value.Root); err != nil {
+			return state.missing, nil, err
+		}
+		roles = append(roles, storage.PublishedCommitRole{CommitID: current, Role: _historyRoleMergeSource, MainlineCommitID: commitID})
+		if len(value.Parents) == 1 {
+			break
+		}
+		current = value.Parents[1]
 	}
-	return state.missing, introduced, nil
+	return state.missing, roles, nil
 }
 
 func validCommitParents(parents []string, currentHead *string) bool {

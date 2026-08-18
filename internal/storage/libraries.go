@@ -115,8 +115,42 @@ func (s *Store) IsCommitPublished(ctx context.Context, ownerUserID, libraryID, c
 	return published, nil
 }
 
+// GetPublishedCommitRole returns the proven history role of commitID.
+func (s *Store) GetPublishedCommitRole(ctx context.Context, ownerUserID, libraryID, commitID string) (PublishedCommitRole, bool, error) {
+	var role PublishedCommitRole
+	err := s.db.QueryRowContext(ctx, `
+		SELECT roles.commit_id, roles.role, roles.mainline_commit_id
+		FROM published_commit_roles AS roles
+		JOIN published_commits AS published
+		  ON published.owner_user_id = roles.owner_user_id
+		 AND published.library_id = roles.library_id
+		 AND published.commit_id = roles.commit_id
+		WHERE roles.owner_user_id = ? AND roles.library_id = ? AND roles.commit_id = ?`, ownerUserID, libraryID, commitID).
+		Scan(&role.CommitID, &role.Role, &role.MainlineCommitID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PublishedCommitRole{}, false, nil
+	}
+	if err != nil {
+		return PublishedCommitRole{}, false, fmt.Errorf("query published commit role: %w", err)
+	}
+	return role, true, nil
+}
+
 // UpdateLibraryHead atomically advances Head and records its newly published ancestry.
-func (s *Store) UpdateLibraryHead(ctx context.Context, ownerUserID, libraryID string, expectedHead *string, expectedVersion int64, commitID string, introducedCommitIDs []string, now time.Time) (ret Library, retErr error) {
+func (s *Store) UpdateLibraryHead(ctx context.Context, ownerUserID, libraryID string, expectedHead *string, expectedVersion int64, commitID string, introducedCommitIDs []string, now time.Time) (Library, error) {
+	roles := make([]PublishedCommitRole, 0, len(introducedCommitIDs)+1)
+	roles = append(roles, PublishedCommitRole{CommitID: commitID, Role: _publishedRoleMainline, MainlineCommitID: commitID})
+	for _, id := range introducedCommitIDs {
+		if id == commitID {
+			continue
+		}
+		roles = append(roles, PublishedCommitRole{CommitID: id, Role: _publishedRoleMergeSource, MainlineCommitID: commitID})
+	}
+	return s.UpdateLibraryHeadWithRoles(ctx, ownerUserID, libraryID, expectedHead, expectedVersion, commitID, roles, now)
+}
+
+// UpdateLibraryHeadWithRoles atomically advances Head and records the supplied history roles.
+func (s *Store) UpdateLibraryHeadWithRoles(ctx context.Context, ownerUserID, libraryID string, expectedHead *string, expectedVersion int64, commitID string, roles []PublishedCommitRole, now time.Time) (ret Library, retErr error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Library{}, fmt.Errorf("begin update library head: %w", err)
@@ -146,12 +180,50 @@ func (s *Store) UpdateLibraryHead(ctx context.Context, ownerUserID, libraryID st
 	if changed != 1 {
 		return Library{}, ErrHeadConflict
 	}
-	for _, publishedCommitID := range append([]string{commitID}, introducedCommitIDs...) {
+	seenRoles := make(map[string]struct{}, len(roles))
+	candidateRoleFound := false
+	for _, role := range roles {
+		if role.CommitID == "" || role.MainlineCommitID == "" || (role.Role != _publishedRoleMainline && role.Role != _publishedRoleMergeSource) {
+			return Library{}, errors.New("invalid published commit role")
+		}
+		if _, exists := seenRoles[role.CommitID]; exists {
+			return Library{}, errors.New("duplicate published commit role")
+		}
+		seenRoles[role.CommitID] = struct{}{}
+		if role.CommitID == commitID {
+			if role.Role != _publishedRoleMainline || role.MainlineCommitID != commitID {
+				return Library{}, errors.New("candidate published commit role is invalid")
+			}
+			candidateRoleFound = true
+		} else if role.Role != _publishedRoleMergeSource || role.MainlineCommitID != commitID {
+			return Library{}, errors.New("introduced published commit role is invalid")
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO published_commits(owner_user_id, library_id, commit_id)
-			VALUES (?, ?, ?)`, ownerUserID, libraryID, publishedCommitID); err != nil {
+			VALUES (?, ?, ?)`, ownerUserID, libraryID, role.CommitID); err != nil {
 			return Library{}, fmt.Errorf("record published commit: %w", err)
 		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO published_commit_roles(owner_user_id, library_id, commit_id, role, mainline_commit_id)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(owner_user_id, library_id, commit_id) DO NOTHING`,
+			ownerUserID, libraryID, role.CommitID, role.Role, role.MainlineCommitID); err != nil {
+			return Library{}, fmt.Errorf("record published commit role: %w", err)
+		}
+		var existing PublishedCommitRole
+		if err := tx.QueryRowContext(ctx, `
+			SELECT commit_id, role, mainline_commit_id
+			FROM published_commit_roles
+			WHERE owner_user_id = ? AND library_id = ? AND commit_id = ?`, ownerUserID, libraryID, role.CommitID).
+			Scan(&existing.CommitID, &existing.Role, &existing.MainlineCommitID); err != nil {
+			return Library{}, fmt.Errorf("verify published commit role: %w", err)
+		}
+		if existing != role {
+			return Library{}, errors.New("published commit role conflict")
+		}
+	}
+	if !candidateRoleFound {
+		return Library{}, errors.New("candidate published commit role is missing")
 	}
 	ret, err = scanLibrary(tx.QueryRowContext(ctx, `
 		SELECT id, owner_user_id, name, head_commit_id, head_version, created_at, updated_at

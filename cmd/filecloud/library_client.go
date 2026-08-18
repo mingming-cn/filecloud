@@ -142,7 +142,7 @@ func runLibraryWithConfig(ctx context.Context, args []string, stdin io.Reader, s
 	}
 	config = normalizeLibraryClientConfig(config)
 	if len(args) == 0 {
-		return errors.New("usage: filecloud library <create|list|inspect|bind|sync|watch|unbind> [options]")
+		return errors.New("usage: filecloud library <create|list|inspect|history|bind|sync|watch|unbind> [options]")
 	}
 	switch args[0] {
 	case "create":
@@ -151,6 +151,11 @@ func runLibraryWithConfig(ctx context.Context, args []string, stdin io.Reader, s
 		return runLibraryList(ctx, args[1:], stdin, stdout, stderr)
 	case "inspect":
 		return runLibraryInspect(ctx, args[1:], stdin, stdout, stderr)
+	case "history":
+		if len(args) < 2 || args[1] != "list" {
+			return errors.New("usage: filecloud library history list --client-dir path --worktree path [--page-size n] [--page-token token]")
+		}
+		return runLibraryHistoryList(ctx, args[2:], stdout, stderr)
 	case "bind":
 		options, err := parseLibraryBind(ctx, args[1:], stdin, stderr, config)
 		if err != nil {
