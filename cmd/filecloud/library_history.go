@@ -18,7 +18,10 @@ import (
 	"github.com/mingming-cn/filecloud/internal/object"
 )
 
-const _maximumHistoryPageTokenSize = 4096
+const (
+	_maximumHistoryPageTokenSize = 4096
+	_historyReadAttempts         = 3
+)
 
 type historyCommandCommit struct {
 	CommitID     string   `json:"CommitId"`
@@ -95,36 +98,9 @@ func runLibraryHistoryList(ctx context.Context, args []string, stdout, stderr io
 	}
 	target := base.JoinPath("v1/libraries", binding.LibraryID, "history")
 	target.RawQuery = query.Encode()
-	var status int
-	var data []byte
-	var headers http.Header
-	var requestErr error
-	for attempt := 0; attempt < _headUpdateAttempts; attempt++ {
-		var request *http.Request
-		request, requestErr = authenticatedRequest(ctx, http.MethodGet, target.String(), token, nil)
-		if requestErr != nil {
-			return requestErr
-		}
-		status, data, headers, requestErr = doClientRequestWithHeaders(request)
-		if requestErr != nil {
-			if attempt+1 == _headUpdateAttempts {
-				return fmt.Errorf("list library history unavailable after %d attempts", _headUpdateAttempts)
-			}
-			if err := waitTransientRetry(ctx, "", time.Now()); err != nil {
-				return fmt.Errorf("wait to retry library history: %w", err)
-			}
-			continue
-		}
-		if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
-			if attempt+1 == _headUpdateAttempts {
-				return fmt.Errorf("list library history failed after %d attempts: server returned %s", _headUpdateAttempts, http.StatusText(status))
-			}
-			if err := waitTransientRetry(ctx, headers.Get("Retry-After"), time.Now()); err != nil {
-				return fmt.Errorf("wait to retry library history: %w", err)
-			}
-			continue
-		}
-		break
+	status, data, _, err := historyGETWithRetry(ctx, target.String(), token, "list library history")
+	if err != nil {
+		return err
 	}
 	if status != http.StatusOK {
 		return fmt.Errorf("list library history failed: server returned %s", http.StatusText(status))
@@ -149,6 +125,38 @@ func runLibraryHistoryList(ctx context.Context, args []string, stdout, stderr io
 
 func historyWorktreePath(path string) (string, error) {
 	return canonicalExistingPath(path)
+}
+
+func historyGETWithRetry(ctx context.Context, target string, token []byte, operation string) (int, []byte, http.Header, error) {
+	var status int
+	var data []byte
+	var headers http.Header
+	for attempt := 0; attempt < _historyReadAttempts; attempt++ {
+		request, err := authenticatedRequest(ctx, http.MethodGet, target, token, nil)
+		if err != nil {
+			return 0, nil, nil, errors.New(operation + " request is invalid")
+		}
+		status, data, headers, err = doClientRequestWithHeaders(request)
+		if err != nil {
+			if attempt+1 == _historyReadAttempts {
+				return 0, nil, nil, fmt.Errorf("%s unavailable after %d attempts", operation, _historyReadAttempts)
+			}
+			if err := waitTransientRetry(ctx, "", time.Now()); err != nil {
+				return 0, nil, nil, fmt.Errorf("wait to retry %s: %w", operation, err)
+			}
+			continue
+		}
+		if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
+			return status, data, headers, nil
+		}
+		if attempt+1 == _historyReadAttempts {
+			return 0, nil, nil, fmt.Errorf("%s failed after %d attempts: server returned %s", operation, _historyReadAttempts, http.StatusText(status))
+		}
+		if err := waitTransientRetry(ctx, headers.Get("Retry-After"), time.Now()); err != nil {
+			return 0, nil, nil, fmt.Errorf("wait to retry %s: %w", operation, err)
+		}
+	}
+	return 0, nil, nil, errors.New(operation + " failed")
 }
 
 func decodeHistoryCommandResponse(data []byte) (historyCommandResponse, error) {

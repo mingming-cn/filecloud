@@ -33,6 +33,8 @@ const (
 	_maxEntries     = 100000
 	_maxParents     = 2
 	_maxJSONNesting = 256
+	_maxPathDepth   = 256
+	_maxPathBytes   = 1024
 )
 
 var (
@@ -53,6 +55,26 @@ func ValidID(value string) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil
+}
+
+// ValidPath reports whether value is a canonical protocol-relative path or root marker.
+func ValidPath(value string) bool {
+	if value == "." {
+		return true
+	}
+	if value == "" || len(value) > _maxPathBytes || !utf8.ValidString(value) {
+		return false
+	}
+	components := strings.Split(value, "/")
+	if len(components) > _maxPathDepth {
+		return false
+	}
+	for _, component := range components {
+		if !validName(component) {
+			return false
+		}
+	}
+	return true
 }
 
 // Canonicalize validates one metadata object and returns its JCS bytes and identity.

@@ -57,6 +57,86 @@ type historyListResponse struct {
 	NextPageToken  string                  `json:"NextPageToken"`
 }
 
+type historyCommitDetailResponse struct {
+	CommitID         string   `json:"CommitId"`
+	Role             string   `json:"Role"`
+	MainlineCommitID string   `json:"MainlineCommitId"`
+	AuthorUserID     string   `json:"AuthorUserId"`
+	CreatedAt        string   `json:"CreatedAt"`
+	DeviceID         string   `json:"DeviceId"`
+	Message          string   `json:"Message"`
+	Parents          []string `json:"Parents"`
+	Root             string   `json:"Root"`
+}
+
+func (h *handler) getHistoryCommit(w http.ResponseWriter, r *http.Request) {
+	owner, ok := auth.UserID(r.Context())
+	if !ok {
+		h.historyFailure(w, errors.New("missing authenticated user"), "")
+		return
+	}
+	libraryID := r.PathValue("LibraryId")
+	commitID := r.PathValue("CommitId")
+	if !validUUID(libraryID) || !object.ValidID(commitID) || r.URL.RawQuery != "" {
+		h.writeError(w, http.StatusBadRequest, 1000, "invalid history commit request")
+		return
+	}
+
+	request, release, ok := h.admitHistory(w, r, owner)
+	if !ok {
+		return
+	}
+	defer release()
+	if h.afterHistoryAdmit != nil {
+		h.afterHistoryAdmit(request.Context())
+	}
+
+	role, found, err := h.store.GetPublishedCommitRole(request.Context(), owner, libraryID, commitID)
+	if err != nil {
+		h.historyFailure(w, fmt.Errorf("%w: role lookup", errHistoryUnavailable), "")
+		return
+	}
+	if !found {
+		h.writeError(w, http.StatusNotFound, 2000, "history commit not found")
+		return
+	}
+	if role.CommitID != commitID || !object.ValidID(role.MainlineCommitID) ||
+		(role.Role == _historyRoleMainline && role.MainlineCommitID != commitID) ||
+		(role.Role == _historyRoleMergeSource && role.MainlineCommitID == commitID) ||
+		(role.Role != _historyRoleMainline && role.Role != _historyRoleMergeSource) {
+		h.historyFailure(w, errHistoryCorrupt, commitID)
+		return
+	}
+	if role.Role == _historyRoleMergeSource {
+		mainline, found, err := h.store.GetPublishedCommitRole(request.Context(), owner, libraryID, role.MainlineCommitID)
+		if err != nil {
+			h.historyFailure(w, fmt.Errorf("%w: mainline role lookup", errHistoryUnavailable), "")
+			return
+		}
+		if !found || mainline.Role != _historyRoleMainline || mainline.CommitID != role.MainlineCommitID || mainline.MainlineCommitID != role.MainlineCommitID {
+			h.historyFailure(w, errHistoryCorrupt, commitID)
+			return
+		}
+	}
+	commit, err := h.readHistoryCommitObject(request.Context(), owner, libraryID, commitID)
+	if err != nil {
+		h.historyFailure(w, err, commitID)
+		return
+	}
+	response := historyCommitDetailResponse{
+		CommitID: commitID, Role: role.Role, MainlineCommitID: role.MainlineCommitID,
+		AuthorUserID: commit.AuthorUserID, CreatedAt: commit.CreatedAt, DeviceID: commit.DeviceID,
+		Message: commit.Message, Parents: append([]string{}, commit.Parents...), Root: commit.Root,
+	}
+	w.Header().Set("ETag", `"`+commitID+`"`)
+	w.Header().Set("Cache-Control", "private, immutable")
+	h.writeJSON(w, http.StatusOK, struct {
+		RetCode       int
+		Message       string
+		HistoryCommit historyCommitDetailResponse
+	}{RetCode: 0, Message: "success", HistoryCommit: response})
+}
+
 func (h *handler) listHistory(w http.ResponseWriter, r *http.Request) {
 	owner, ok := auth.UserID(r.Context())
 	if !ok {
@@ -253,6 +333,10 @@ func (h *handler) readHistoryCommit(ctx context.Context, owner, libraryID, id st
 	if !found || role.Role != _historyRoleMainline || role.MainlineCommitID != id {
 		return object.Commit{}, errHistoryCorrupt
 	}
+	return h.readHistoryCommitObject(ctx, owner, libraryID, id)
+}
+
+func (h *handler) readHistoryCommitObject(ctx context.Context, owner, libraryID, id string) (object.Commit, error) {
 	file, size, err := h.store.GetObject(ctx, owner, libraryID, "commits", id)
 	if errors.Is(err, storage.ErrObjectNotFound) {
 		return object.Commit{}, errHistoryCorrupt

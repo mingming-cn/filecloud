@@ -151,6 +151,7 @@ func NewHandler(store *storage.Store, logger *log.Logger, config Config) (http.H
 	mux.HandleFunc("GET /v1/libraries/{LibraryId}/head", h.getHead)
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}/head", h.updateHead)
 	mux.HandleFunc("GET /v1/libraries/{LibraryId}/history", h.listHistory)
+	mux.HandleFunc("GET /v1/libraries/{LibraryId}/history/{CommitId}", h.getHistoryCommit)
 	mux.HandleFunc("GET /v1/libraries", h.list)
 	mux.HandleFunc("POST /v1/libraries/{LibraryId}/object-checks", h.checkObjects)
 	mux.HandleFunc("PUT /v1/libraries/{LibraryId}/objects/{ObjectType}/{ObjectId}", h.putMetadataObject)

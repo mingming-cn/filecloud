@@ -152,10 +152,17 @@ func runLibraryWithConfig(ctx context.Context, args []string, stdin io.Reader, s
 	case "inspect":
 		return runLibraryInspect(ctx, args[1:], stdin, stdout, stderr)
 	case "history":
-		if len(args) < 2 || args[1] != "list" {
-			return errors.New("usage: filecloud library history list --client-dir path --worktree path [--page-size n] [--page-token token]")
+		if len(args) < 2 {
+			return errors.New("usage: filecloud library history <list|inspect> [options]")
 		}
-		return runLibraryHistoryList(ctx, args[2:], stdout, stderr)
+		switch args[1] {
+		case "list":
+			return runLibraryHistoryList(ctx, args[2:], stdout, stderr)
+		case "inspect":
+			return runLibraryHistoryInspect(ctx, args[2:], stdout, stderr)
+		default:
+			return errors.New("usage: filecloud library history <list|inspect> [options]")
+		}
 	case "bind":
 		options, err := parseLibraryBind(ctx, args[1:], stdin, stderr, config)
 		if err != nil {
