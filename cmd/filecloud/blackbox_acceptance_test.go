@@ -9,12 +9,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -141,6 +144,127 @@ func TestBuiltBinaryEndToEndAcceptance(t *testing.T) {
 	command.Stdin = bytes.NewReader(tokenInput)
 	if output, err := command.CombinedOutput(); err == nil || !bytes.Contains(output, []byte("Unauthorized")) {
 		t.Fatalf("inspect with revoked token error=%v output=%s", err, output)
+	}
+	server.stop(t)
+}
+
+func TestBuiltBinaryHistoryInspectReadOnlyAcceptance(t *testing.T) {
+	if os.Getenv("FILECLOUD_PLATFORM_MATRIX_CHILD") != "1" {
+		t.Skip("runs inside the native 1B platform matrix")
+	}
+	root := os.Getenv("FILECLOUD_ACCEPTANCE_ROOT")
+	if root == "" {
+		t.Fatal("FILECLOUD_ACCEPTANCE_ROOT is required")
+	}
+	testRoot, err := os.MkdirTemp(root, ".filecloud-history-inspect-")
+	if err != nil {
+		t.Fatalf("create history inspect acceptance root: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(testRoot); err != nil {
+			t.Errorf("remove history inspect acceptance root: %v", err)
+		}
+	})
+
+	binaryName := "filecloud"
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
+	binary := filepath.Join(testRoot, binaryName)
+	build := exec.CommandContext(t.Context(), "go", "build", "-trimpath", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build history inspect CLI: %v\n%s", err, output)
+	}
+	dataDir := filepath.Join(testRoot, "data")
+	password := []byte("history-inspect-password-1234\n")
+	defer clear(password)
+	runBlackBoxCLI(t, binary, nil, "init", "--data-dir", dataDir)
+	runBlackBoxCLI(t, binary, password, "user", "add", "--data-dir", dataDir, "--username", "history-inspect", "--password-stdin")
+	server := startBlackBoxServer(t, binary, dataDir, "127.0.0.1:0")
+	serverURL := "http://" + server.address
+	loginOutput := runBlackBoxCLI(t, binary, password, "login", "--server", serverURL, "--username", "history-inspect",
+		"--device-name", "history-inspect", "--password-stdin")
+	var login struct {
+		Session struct{ AccessToken string }
+	}
+	if err := json.Unmarshal(loginOutput, &login); err != nil || login.Session.AccessToken == "" {
+		t.Fatalf("decode history inspect login: token_present=%t error=%v", login.Session.AccessToken != "", err)
+	}
+	tokenInput := []byte(login.Session.AccessToken + "\n")
+	defer clear(tokenInput)
+
+	backend, err := url.Parse(serverURL)
+	if err != nil {
+		t.Fatalf("parse history inspect server URL: %v", err)
+	}
+	reverseProxy := httputil.NewSingleHostReverseProxy(backend)
+	var armed atomic.Bool
+	var forbidden atomic.Int32
+	spy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if armed.Load() && (r.Method != http.MethodGet || strings.Contains(r.URL.Path, "/blocks/") || strings.HasSuffix(r.URL.Path, "/head")) {
+			forbidden.Add(1)
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		reverseProxy.ServeHTTP(w, r)
+	}))
+	defer spy.Close()
+
+	runBlackBoxCLI(t, binary, tokenInput, "library", "create", "--server", spy.URL,
+		"--library-id", _blackBoxLibraryID, "--name", "History Inspect", "--token-stdin")
+	clientDir := filepath.Join(testRoot, "client")
+	worktree := filepath.Join(testRoot, "worktree")
+	if err := os.Mkdir(worktree, 0o755); err != nil {
+		t.Fatalf("create history inspect worktree: %v", err)
+	}
+	runBlackBoxCLI(t, binary, tokenInput, "library", "bind", "--client-dir", clientDir, "--server", spy.URL,
+		"--library-id", _blackBoxLibraryID, "--worktree", worktree, "--device-id", _blackBoxDeviceAID, "--token-stdin")
+	writeBlackBoxFile(t, worktree, "a.txt", "history-a\n")
+	writeBlackBoxFile(t, worktree, "b.txt", "history-b\n")
+	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientDir, "--worktree", worktree)
+	binding := readTestBinding(t, clientDir, worktree)
+	stateDB, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
+	if err != nil {
+		t.Fatalf("open history inspect state observer: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stateDB.Close(); err != nil {
+			t.Errorf("close history inspect state observer: %v", err)
+		}
+	})
+	beforeClient := captureHistoryInspectClientState(t, clientDir)
+	beforeWorktree := captureHistoryInspectWorktree(t, worktree)
+	armed.Store(true)
+
+	commitOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientDir,
+		"--worktree", worktree, "--commit", binding.SyncBase)
+	if !bytes.Contains(commitOutput, []byte("CommitId="+binding.SyncBase)) || !bytes.Contains(commitOutput, []byte("Root="+binding.SyncBaseRoot)) {
+		t.Fatalf("history commit output missing identity: %s", commitOutput)
+	}
+	fileOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientDir,
+		"--worktree", worktree, "--commit", binding.SyncBase, "--path", "a.txt")
+	if !bytes.Contains(fileOutput, []byte("Type=File")) || !bytes.Contains(fileOutput, []byte("Blocks=1")) {
+		t.Fatalf("history file output missing metadata: %s", fileOutput)
+	}
+	rootOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientDir,
+		"--worktree", worktree, "--commit", binding.SyncBase, "--path", ".", "--page-size", "1")
+	pageToken := outputValue(string(rootOutput), "next_page_token=")
+	if !bytes.Contains(rootOutput, []byte("Entry name=a.txt type=File")) || pageToken == "" {
+		t.Fatalf("history directory first page is incomplete: token_present=%t output=%s", pageToken != "", rootOutput)
+	}
+	secondOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientDir,
+		"--worktree", worktree, "--commit", binding.SyncBase, "--path", ".", "--page-size", "1", "--page-token", pageToken)
+	if !bytes.Contains(secondOutput, []byte("Entry name=b.txt type=File")) {
+		t.Fatalf("history directory second page is incomplete: %s", secondOutput)
+	}
+	if forbidden.Load() != 0 {
+		t.Fatalf("history inspect attempted %d block, write, or Head requests, want 0", forbidden.Load())
+	}
+	if afterClient := captureHistoryInspectClientState(t, clientDir); !slices.Equal(beforeClient, afterClient) {
+		t.Fatalf("history inspect changed client state: %s", historyInspectSnapshotDifference(beforeClient, afterClient))
+	}
+	if afterWorktree := captureHistoryInspectWorktree(t, worktree); !slices.Equal(beforeWorktree, afterWorktree) {
+		t.Fatalf("history inspect changed worktree: %s", historyInspectSnapshotDifference(beforeWorktree, afterWorktree))
 	}
 	server.stop(t)
 }

@@ -180,7 +180,11 @@ func loadHistoryInspectClient(ctx context.Context, clientDir, worktree string) (
 	defer func() {
 		retErr = errors.Join(retErr, db.Close())
 		if retErr != nil {
-			clear(token)
+			if client != nil {
+				clear(client.token)
+			} else {
+				clear(token)
+			}
 		}
 	}()
 	var binding clientBinding
@@ -199,7 +203,8 @@ func loadHistoryInspectClient(ctx context.Context, clientDir, worktree string) (
 	if err != nil {
 		return nil, err
 	}
-	return &historyInspectClient{binding: binding, base: base, token: token}, nil
+	client = &historyInspectClient{binding: binding, base: base, token: token}
+	return client, nil
 }
 
 func (c *historyInspectClient) fetchCommit(ctx context.Context, commitID string) (historyInspectCommit, error) {

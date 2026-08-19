@@ -326,7 +326,7 @@ func TestGetHistoryCommitReturnsPublishedRolesAndImmutableMetadata(t *testing.T)
 		UPDATE published_commit_roles SET mainline_commit_id = ?
 		WHERE owner_user_id = ? AND library_id = ? AND commit_id = ?`,
 		missingMainline, _ownerID, _headLibraryID, captured); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history detail test operation: %v", err)
 	}
 	assertStatusCode(t, serve(handler, http.MethodGet, "/v1/libraries/"+_headLibraryID+"/history/"+captured, "", _ownerToken), http.StatusInternalServerError, 5000)
 }
@@ -343,7 +343,7 @@ func TestGetHistoryCommitValidationAndVisibility(t *testing.T) {
 	if _, err := store.DB().ExecContext(t.Context(), `
 		INSERT INTO published_commits(owner_user_id, library_id, commit_id) VALUES (?, ?, ?)`,
 		_ownerID, _headLibraryID, onlyReachable); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history detail test operation: %v", err)
 	}
 	otherLibraryID := "32345678-9abc-4def-8123-456789abcdef"
 	assertStatusCode(t, serve(handler, http.MethodPut, "/v1/libraries/"+otherLibraryID, `{"Name":"other"}`, _ownerToken), http.StatusCreated, 0)
@@ -367,7 +367,7 @@ func TestGetHistoryCommitValidationAndVisibility(t *testing.T) {
 
 	objectPath := filepath.Join(store.ObjectsDir(), _ownerID, _headLibraryID, "commits", published[:2], published[2:])
 	if err := os.Remove(objectPath); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history detail test operation: %v", err)
 	}
 	assertStatusCode(t, serve(handler, http.MethodGet, "/v1/libraries/"+_headLibraryID+"/history/"+published, "", _ownerToken), http.StatusInternalServerError, 5000)
 }
@@ -394,7 +394,7 @@ func TestPublishedCommitRoleIsAtomicWithHead(t *testing.T) {
 	base := putCommit(t, store, _ownerID, nil, root)
 	publishHead(t, handler, base, `"head-version-0"`, http.StatusOK, 0)
 	if _, err := store.DB().ExecContext(t.Context(), `CREATE TRIGGER fail_history_role BEFORE INSERT ON published_commit_roles BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history detail test operation: %v", err)
 	}
 	candidate := putCommit(t, store, _ownerID, []string{base}, root)
 	publishHead(t, handler, candidate, `"head-version-1"`, http.StatusInternalServerError, 5000)

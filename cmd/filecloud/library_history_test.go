@@ -184,7 +184,7 @@ func TestLibraryHistoryInspectFileAndDirectoryPagesWithoutBlocks(t *testing.T) {
 	}
 	tamperedBytes, decodeErr := base64.RawURLEncoding.Strict().DecodeString(token)
 	if decodeErr != nil {
-		t.Fatal(decodeErr)
+		t.Fatalf("decode history inspect page token: %v", decodeErr)
 	}
 	tamperedBytes[len(tamperedBytes)-1] ^= 1
 	tampered := base64.RawURLEncoding.EncodeToString(tamperedBytes)
@@ -273,7 +273,7 @@ func TestLibraryHistoryInspectPageTokenIsBoundToLibrary(t *testing.T) {
 		"--commit", fixture.commitID, "--path", ".", "--page-size", "1"}
 	var first bytes.Buffer
 	if err := runTest(t.Context(), args, strings.NewReader(""), &first, io.Discard); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 	token := outputValue(first.String(), "next_page_token=")
 	if token == "" {
@@ -348,12 +348,12 @@ func TestLibraryHistoryInspectRejectsMissingAndCorruptMetadataReadOnly(t *testin
 				if kind == "File" {
 					root, err := object.VerifyDirectory(readHistoryInspectObjectFile(t, fixture, "directories", fixture.rootID), fixture.rootID)
 					if err != nil {
-						t.Fatal(err)
+						t.Fatalf("history inspect test operation: %v", err)
 					}
 					docs := historyInspectTestEntry(t, root, "docs")
 					directory, err := object.VerifyDirectory(readHistoryInspectObjectFile(t, fixture, "directories", docs.ID), docs.ID)
 					if err != nil {
-						t.Fatal(err)
+						t.Fatalf("history inspect test operation: %v", err)
 					}
 					objectID = historyInspectTestEntry(t, directory, "readme.txt").ID
 					objectKind = "files"
@@ -367,7 +367,7 @@ func TestLibraryHistoryInspectRejectsMissingAndCorruptMetadataReadOnly(t *testin
 					err = os.WriteFile(objectPath, []byte(`{}`), 0o600)
 				}
 				if err != nil {
-					t.Fatal(err)
+					t.Fatalf("history inspect test operation: %v", err)
 				}
 				err = runTest(t.Context(), args, strings.NewReader(""), io.Discard, io.Discard)
 				if err == nil {
@@ -391,7 +391,7 @@ func TestLibraryHistoryInspectDiagnosticsDoNotExposeCanaries(t *testing.T) {
 		"--commit", fixture.commitID, "--path", ".", "--page-size", "1"}
 	var output bytes.Buffer
 	if err := runTest(t.Context(), args, strings.NewReader(""), &output, io.Discard); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 	pageToken := outputValue(output.String(), "next_page_token=")
 	if pageToken == "" {
@@ -401,7 +401,7 @@ func TestLibraryHistoryInspectDiagnosticsDoNotExposeCanaries(t *testing.T) {
 	commitPath := filepath.Join(fixture.objectsDir, testClientUserID, testClientLibraryID, "commits", fixture.commitID[:2], fixture.commitID[2:])
 	corruptData := []byte(pathCanary + "\n" + pageToken + "\n" + contentCanary + "\nAuthorization: Bearer " + fixture.environment.token)
 	if err := os.WriteFile(commitPath, corruptData, 0o600); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 	var diagnostics bytes.Buffer
 	err := runTest(t.Context(), []string{"library", "history", "inspect", "--client-dir", fixture.clientDir,
@@ -429,7 +429,7 @@ func TestLibraryHistoryListTransportErrorDoesNotExposePageToken(t *testing.T) {
 	environment := newLibraryCLIEnvironment(t, library.Config{})
 	clientDir, worktree := newClientPaths(t)
 	if err := os.MkdirAll(worktree, 0o700); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 	if err := runTest(t.Context(), bindArgs(clientDir, environment.server.URL, testClientLibraryID, worktree, testClientDeviceID),
 		strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
@@ -478,19 +478,19 @@ func newHistoryInspectFixtureWithFiles(t *testing.T, files map[string]string) hi
 	for path, content := range files {
 		fullPath := filepath.Join(worktree, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
-			t.Fatal(err)
+			t.Fatalf("history inspect test operation: %v", err)
 		}
 		if err := os.WriteFile(fullPath, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
+			t.Fatalf("history inspect test operation: %v", err)
 		}
 	}
 	if err := os.MkdirAll(filepath.Join(worktree, "empty"), 0o700); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 	var serverLogs bytes.Buffer
 	handler, err := library.NewHandler(environment.store, log.New(&serverLogs, "", 0), library.Config{})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 	var armed atomic.Bool
 	var forbidden atomic.Int32
@@ -534,7 +534,7 @@ func newHistoryInspectFixtureWithFiles(t *testing.T, files map[string]string) hi
 	binding := readTestBinding(t, clientDir, worktree)
 	stateDB, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := stateDB.Close(); err != nil {
@@ -569,7 +569,7 @@ func readHistoryInspectObjectFile(t *testing.T, fixture historyInspectFixture, k
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(fixture.objectsDir, testClientUserID, testClientLibraryID, kind, id[:2], id[2:]))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 	return data
 }
@@ -603,7 +603,7 @@ func cloneHistoryInspectLibrary(t *testing.T, fixture historyInspectFixture, lib
 	if _, _, err := fixture.environment.store.CreateLibrary(t.Context(), storage.Library{
 		ID: libraryID, OwnerUserID: testClientUserID, Name: "History Clone",
 	}, time.Now().UTC()); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 	seen := make(map[string]bool)
 	var copyObject func(string, string)
@@ -615,13 +615,13 @@ func cloneHistoryInspectLibrary(t *testing.T, fixture historyInspectFixture, lib
 		seen[key] = true
 		data := readHistoryInspectObjectFile(t, fixture, kind, id)
 		if _, err := fixture.environment.store.PutObject(t.Context(), testClientUserID, libraryID, kind, id, bytes.NewReader(data)); err != nil {
-			t.Fatal(err)
+			t.Fatalf("history inspect test operation: %v", err)
 		}
 		switch kind {
 		case "commits":
 			commit, err := object.VerifyCommit(data, id)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("history inspect test operation: %v", err)
 			}
 			copyObject("directories", commit.Root)
 			for _, parent := range commit.Parents {
@@ -630,7 +630,7 @@ func cloneHistoryInspectLibrary(t *testing.T, fixture historyInspectFixture, lib
 		case "directories":
 			directory, err := object.VerifyDirectory(data, id)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("history inspect test operation: %v", err)
 			}
 			for _, entry := range directory.Entries {
 				if entry.Type == "Directory" {
@@ -642,7 +642,7 @@ func cloneHistoryInspectLibrary(t *testing.T, fixture historyInspectFixture, lib
 		case "files":
 			file, err := object.VerifyFile(data, id)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("history inspect test operation: %v", err)
 			}
 			for _, block := range file.Blocks {
 				copyObject("blocks", block)
@@ -652,7 +652,7 @@ func cloneHistoryInspectLibrary(t *testing.T, fixture historyInspectFixture, lib
 	copyObject("commits", fixture.commitID)
 	if _, err := fixture.environment.store.UpdateLibraryHead(t.Context(), testClientUserID, libraryID, nil, 0,
 		fixture.commitID, nil, time.Now().UTC()); err != nil {
-		t.Fatal(err)
+		t.Fatalf("history inspect test operation: %v", err)
 	}
 }
 
