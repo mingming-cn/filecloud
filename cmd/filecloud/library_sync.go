@@ -43,6 +43,8 @@ type PublicationKind string
 const (
 	// PublicationKindSync identifies an ordinary synchronization publication.
 	PublicationKindSync PublicationKind = "sync"
+	// PublicationKindRestore identifies a history restore publication.
+	PublicationKindRestore PublicationKind = "restore"
 )
 
 type _publicationDispatchMode uint8
@@ -63,23 +65,39 @@ type pendingPublication struct {
 	RequiresDeleteConfirmation                       bool
 	DeleteConfirmed                                  bool
 	LegacyRevalidationRequired                       bool
+	SourceCommit, SourcePath, SourceRoot             string
+	CreatedCount, UpdatedCount                       int64
+	TypeReplacementCount, RemovedDescendantCount     int64
+	PreservedCurrentOnlyCount                        int64
+	ChangedPathPreview                               []byte
+	ChangedPathCount                                 int64
+	PreviewTruncated, RestoreConfirmed               bool
 }
 
 const _pendingPublicationWhere = `worktree = ? AND publication_kind = ? AND base_commit = ? AND base_root = ? AND expected_head = ?
 	AND expected_etag = ? AND candidate_commit = ? AND candidate_root = ? AND candidate_data = ?
 	AND captured_commit = ? AND captured_root = ? AND captured_data = ? AND candidate_history = ?
 	AND deletion_count = ? AND tracked_count = ? AND requires_delete_confirmation = ? AND delete_confirmed = ?
-	AND legacy_revalidation_required = ?`
+	AND legacy_revalidation_required = ? AND source_commit = ? AND source_path = ? AND source_root = ?
+	AND created_count = ? AND updated_count = ? AND type_replacement_count = ? AND removed_descendant_count = ?
+	AND preserved_current_only_count = ? AND changed_path_preview = ? AND changed_path_count = ?
+	AND preview_truncated = ? AND restore_confirmed = ?`
 
 type _pendingPublicationExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
 func _pendingPublicationArgs(worktree string, value pendingPublication) []any {
+	if value.Kind == PublicationKindSync && value.ChangedPathPreview == nil {
+		value.ChangedPathPreview = _emptyRestorePreview
+	}
 	return []any{worktree, value.Kind, value.BaseCommit, value.BaseRoot, value.ExpectedHead, value.ExpectedETag,
 		value.CandidateCommit, value.CandidateRoot, value.CandidateData, value.CapturedCommit, value.CapturedRoot,
 		value.CapturedData, value.CandidateHistory, value.DeletionCount, value.TrackedCount,
-		value.RequiresDeleteConfirmation, value.DeleteConfirmed, value.LegacyRevalidationRequired}
+		value.RequiresDeleteConfirmation, value.DeleteConfirmed, value.LegacyRevalidationRequired,
+		value.SourceCommit, value.SourcePath, value.SourceRoot, value.CreatedCount, value.UpdatedCount,
+		value.TypeReplacementCount, value.RemovedDescendantCount, value.PreservedCurrentOnlyCount,
+		value.ChangedPathPreview, value.ChangedPathCount, value.PreviewTruncated, value.RestoreConfirmed}
 }
 
 func _execPendingPublicationCAS(ctx context.Context, execer _pendingPublicationExecer, statement string, statementArgs []any,
@@ -282,18 +300,27 @@ func syncLibrary(ctx context.Context, db *sql.DB, options bindOptions, binding c
 
 func loadPendingPublication(ctx context.Context, db *sql.DB, worktree string) (*pendingPublication, error) {
 	var value pendingPublication
-	var candidateLength, capturedLength, historyLength int
+	var candidateLength, capturedLength, historyLength, previewLength int
 	err := db.QueryRowContext(ctx, `SELECT publication_kind, base_commit, base_root, expected_head, expected_etag, candidate_commit, candidate_root,
 		length(candidate_data), CASE WHEN length(candidate_data) BETWEEN 1 AND 65536 THEN candidate_data END,
 		captured_commit, captured_root, length(captured_data),
 		CASE WHEN length(captured_data) BETWEEN 1 AND 65536 THEN captured_data END,
-		length(candidate_history), CASE WHEN length(candidate_history) BETWEEN 8 AND 67112968 THEN candidate_history END,
-		deletion_count, tracked_count, requires_delete_confirmation, delete_confirmed, legacy_revalidation_required
+		length(candidate_history), CASE WHEN length(candidate_history) = 0 OR length(candidate_history) BETWEEN 8 AND 67112968 THEN candidate_history END,
+		deletion_count, tracked_count, requires_delete_confirmation, delete_confirmed, legacy_revalidation_required,
+		CASE WHEN length(source_commit) <= 64 THEN source_commit END,
+		CASE WHEN length(source_path) <= 1024 THEN source_path END,
+		CASE WHEN length(source_root) <= 64 THEN source_root END,
+		created_count, updated_count, type_replacement_count, removed_descendant_count, preserved_current_only_count,
+		length(changed_path_preview), CASE WHEN length(changed_path_preview) BETWEEN 8 AND `+strconv.Itoa(_restorePreviewMaxBytes)+` THEN changed_path_preview END,
+		changed_path_count, preview_truncated, restore_confirmed
 		FROM pending_publications WHERE worktree = ?`, worktree).Scan(
 		&value.Kind, &value.BaseCommit, &value.BaseRoot, &value.ExpectedHead, &value.ExpectedETag, &value.CandidateCommit,
 		&value.CandidateRoot, &candidateLength, &value.CandidateData, &value.CapturedCommit, &value.CapturedRoot,
 		&capturedLength, &value.CapturedData, &historyLength, &value.CandidateHistory, &value.DeletionCount,
-		&value.TrackedCount, &value.RequiresDeleteConfirmation, &value.DeleteConfirmed, &value.LegacyRevalidationRequired)
+		&value.TrackedCount, &value.RequiresDeleteConfirmation, &value.DeleteConfirmed, &value.LegacyRevalidationRequired,
+		&value.SourceCommit, &value.SourcePath, &value.SourceRoot, &value.CreatedCount, &value.UpdatedCount,
+		&value.TypeReplacementCount, &value.RemovedDescendantCount, &value.PreservedCurrentOnlyCount,
+		&previewLength, &value.ChangedPathPreview, &value.ChangedPathCount, &value.PreviewTruncated, &value.RestoreConfirmed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -301,21 +328,53 @@ func loadPendingPublication(ctx context.Context, db *sql.DB, worktree string) (*
 		return nil, fmt.Errorf("read pending publication: %w", err)
 	}
 	if candidateLength != len(value.CandidateData) || capturedLength != len(value.CapturedData) ||
-		historyLength != len(value.CandidateHistory) {
+		historyLength != len(value.CandidateHistory) || previewLength != len(value.ChangedPathPreview) {
 		return nil, errors.New("pending publication metadata exceeds synchronization budget")
+	}
+	if historyLength == 0 && value.CandidateHistory == nil {
+		value.CandidateHistory = []byte{}
+	}
+	if value.Kind == PublicationKindRestore {
+		if err := validateRestorePublicationFields(value); err != nil {
+			return nil, fmt.Errorf("validate restore publication: %w", err)
+		}
+	} else if value.Kind == PublicationKindSync {
+		if !isEmptyRestoreFields(value) {
+			return nil, errors.New("sync publication contains restore state")
+		}
+	} else {
+		return nil, fmt.Errorf("unsupported pending publication kind %q", value.Kind)
 	}
 	return &value, nil
 }
 
-func savePendingPublication(ctx context.Context, db *sql.DB, worktree string, value pendingPublication) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO pending_publications(worktree, publication_kind, base_commit, base_root, expected_head,
+func savePendingPublication(ctx context.Context, execer _pendingPublicationExecer, worktree string, value pendingPublication) error {
+	if value.Kind == PublicationKindSync && value.ChangedPathPreview == nil {
+		value.ChangedPathPreview = append([]byte(nil), _emptyRestorePreview...)
+	}
+	if value.Kind == PublicationKindRestore && value.CandidateHistory == nil {
+		value.CandidateHistory = []byte{}
+	}
+	if value.Kind == PublicationKindRestore {
+		if err := validateRestorePublicationFields(value); err != nil {
+			return fmt.Errorf("validate restore publication: %w", err)
+		}
+	} else if value.Kind != PublicationKindSync {
+		return fmt.Errorf("unsupported pending publication kind %q", value.Kind)
+	}
+	_, err := execer.ExecContext(ctx, `INSERT INTO pending_publications(worktree, publication_kind, base_commit, base_root, expected_head,
 		expected_etag, candidate_commit, candidate_root, candidate_data, captured_commit, captured_root, captured_data,
 		candidate_history, deletion_count, tracked_count, requires_delete_confirmation, delete_confirmed,
-		legacy_revalidation_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, worktree,
+		legacy_revalidation_required, source_commit, source_path, source_root, created_count, updated_count,
+		type_replacement_count, removed_descendant_count, preserved_current_only_count, changed_path_preview,
+		changed_path_count, preview_truncated, restore_confirmed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, worktree,
 		value.Kind, value.BaseCommit, value.BaseRoot, value.ExpectedHead, value.ExpectedETag, value.CandidateCommit,
 		value.CandidateRoot, value.CandidateData, value.CapturedCommit, value.CapturedRoot, value.CapturedData,
 		value.CandidateHistory, value.DeletionCount, value.TrackedCount, value.RequiresDeleteConfirmation,
-		value.DeleteConfirmed, value.LegacyRevalidationRequired)
+		value.DeleteConfirmed, value.LegacyRevalidationRequired, value.SourceCommit, value.SourcePath, value.SourceRoot,
+		value.CreatedCount, value.UpdatedCount, value.TypeReplacementCount, value.RemovedDescendantCount,
+		value.PreservedCurrentOnlyCount, value.ChangedPathPreview, value.ChangedPathCount, value.PreviewTruncated,
+		value.RestoreConfirmed)
 	if err != nil {
 		return fmt.Errorf("save pending publication: %w", err)
 	}
@@ -464,7 +523,11 @@ func _verifyPendingPublicationChain(ctx context.Context, options bindOptions, va
 func dispatchPendingPublication(ctx context.Context, db *sql.DB, options bindOptions, binding clientBinding, snapshot worktreeSnapshot,
 	head remoteHead, pending pendingPublication, stdout io.Writer, config libraryClientConfig, budget *_replayBudget,
 	mode _publicationDispatchMode) error {
-	if pending.Kind != PublicationKindSync {
+	switch pending.Kind {
+	case PublicationKindRestore:
+		return dispatchRestorePublication(ctx, db, options, binding, snapshot, head, pending, stdout, config, budget, mode)
+	case PublicationKindSync:
+	default:
 		return fmt.Errorf("unsupported pending publication kind %q", pending.Kind)
 	}
 	switch mode {

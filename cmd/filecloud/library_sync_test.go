@@ -453,7 +453,7 @@ func TestLibrarySyncMigratesV22PendingPublicationWithoutFieldDrift(t *testing.T)
 		captured_commit,captured_root,captured_data,candidate_history,deletion_count,tracked_count,
 		requires_delete_confirmation,delete_confirmed,legacy_revalidation_required FROM v23_pending_publications;
 		DROP TABLE v23_pending_publications;
-		DELETE FROM client_schema_migrations WHERE version=23`); err != nil {
+		DELETE FROM client_schema_migrations WHERE version>=23`); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}

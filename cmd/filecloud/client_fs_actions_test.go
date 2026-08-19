@@ -591,8 +591,11 @@ func TestPendingPublicationBlobLimits(t *testing.T) {
 			}
 			defer db.Close()
 			statement := `PRAGMA ignore_check_constraints=ON;
-				INSERT INTO pending_publications VALUES('/work','sync','base','root','base','etag','candidate','root',` +
-				test.candidate + `,'candidate','root',` + test.captured + `,` + test.history + `,0,0,0,0,0)`
+				INSERT INTO pending_publications(worktree,publication_kind,base_commit,base_root,expected_head,expected_etag,
+					candidate_commit,candidate_root,candidate_data,captured_commit,captured_root,captured_data,candidate_history,
+					deletion_count,tracked_count,requires_delete_confirmation,delete_confirmed,legacy_revalidation_required)
+				VALUES('/work','sync','base','root','base','etag','candidate','root',` + test.candidate +
+				`,'candidate','root',` + test.captured + `,` + test.history + `,0,0,0,0,0)`
 			if _, err := db.Exec(statement); err != nil {
 				t.Fatal(err)
 			}
@@ -719,7 +722,7 @@ func TestClientV22PendingPublicationMigrationRejectsInvalidRowsAtomically(t *tes
 	}
 	defer db.Close()
 	if _, err := db.Exec(`DROP TABLE pending_publications;
-		DELETE FROM client_schema_migrations WHERE version=23`); err != nil {
+		DELETE FROM client_schema_migrations WHERE version>=23`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(_clientV21PendingSQL); err != nil {
