@@ -498,7 +498,8 @@ func canonicalRestoreCommit(owner, device, root, source, path string, parents []
 		Root         string   `json:"Root"`
 		Type         string   `json:"Type"`
 		Version      int      `json:"Version"`
-	}{owner, canonicalProtocolMtime(now), device, message, parents, root, "Commit", 1})
+	}{AuthorUserID: owner, CreatedAt: canonicalProtocolMtime(now), DeviceID: device, Message: message,
+		Parents: parents, Root: root, Type: "Commit", Version: 1})
 	if err != nil {
 		return nil, "", fmt.Errorf("construct restore commit: %w", err)
 	}

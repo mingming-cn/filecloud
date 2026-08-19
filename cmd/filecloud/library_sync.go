@@ -89,7 +89,7 @@ type _pendingPublicationExecer interface {
 
 func _pendingPublicationArgs(worktree string, value pendingPublication) []any {
 	if value.Kind == PublicationKindSync && value.ChangedPathPreview == nil {
-		value.ChangedPathPreview = _emptyRestorePreview
+		value.ChangedPathPreview = []byte(_emptyRestorePreview)
 	}
 	return []any{worktree, value.Kind, value.BaseCommit, value.BaseRoot, value.ExpectedHead, value.ExpectedETag,
 		value.CandidateCommit, value.CandidateRoot, value.CandidateData, value.CapturedCommit, value.CapturedRoot,
@@ -350,7 +350,7 @@ func loadPendingPublication(ctx context.Context, db *sql.DB, worktree string) (*
 
 func savePendingPublication(ctx context.Context, execer _pendingPublicationExecer, worktree string, value pendingPublication) error {
 	if value.Kind == PublicationKindSync && value.ChangedPathPreview == nil {
-		value.ChangedPathPreview = append([]byte(nil), _emptyRestorePreview...)
+		value.ChangedPathPreview = []byte(_emptyRestorePreview)
 	}
 	if value.Kind == PublicationKindRestore && value.CandidateHistory == nil {
 		value.CandidateHistory = []byte{}
@@ -1023,6 +1023,10 @@ func publishPending(ctx context.Context, db *sql.DB, options bindOptions, bindin
 			_publicationDispatchResume)
 	}
 	if current.ETag != pending.ExpectedETag {
+		if pending.Kind == PublicationKindRestore {
+			return dispatchPendingPublication(ctx, db, options, binding, snapshot, current, pending, stdout, config, budget,
+				_publicationDispatchResume)
+		}
 		if err := refreshPendingETag(ctx, db, binding.Worktree, &pending, current.ETag); err != nil {
 			return err
 		}
@@ -1045,6 +1049,11 @@ func publishPending(ctx context.Context, db *sql.DB, options bindOptions, bindin
 	}
 	if published.CommitID != nil && *published.CommitID == pending.ExpectedHead {
 		if published.ETag != pending.ExpectedETag {
+			if pending.Kind == PublicationKindRestore {
+				resumeErr := dispatchPendingPublication(ctx, db, options, binding, observed, published, pending, stdout, config, budget,
+					_publicationDispatchResume)
+				return errors.Join(publishErr, resumeErr)
+			}
 			if err := refreshPendingETag(ctx, db, binding.Worktree, &pending, published.ETag); err != nil {
 				return errors.Join(publishErr, err)
 			}

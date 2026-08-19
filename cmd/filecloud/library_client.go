@@ -1481,19 +1481,21 @@ var _clientV23PendingColumns = []string{
 	"17|legacy_revalidation_required|INTEGER|1|0|0",
 }
 
-var _clientV24PendingColumns = []string{
-	"0|worktree|TEXT|1||1", "1|publication_kind|TEXT|1||0", "2|base_commit|TEXT|1||0", "3|base_root|TEXT|1||0",
-	"4|expected_head|TEXT|1||0", "5|expected_etag|TEXT|1||0", "6|candidate_commit|TEXT|1||0",
-	"7|candidate_root|TEXT|1||0", "8|candidate_data|BLOB|1||0", "9|captured_commit|TEXT|1||0",
-	"10|captured_root|TEXT|1||0", "11|captured_data|BLOB|1||0", "12|candidate_history|BLOB|1||0",
-	"13|deletion_count|INTEGER|1|0|0", "14|tracked_count|INTEGER|1|0|0",
-	"15|requires_delete_confirmation|INTEGER|1|0|0", "16|delete_confirmed|INTEGER|1|0|0",
-	"17|legacy_revalidation_required|INTEGER|1|0|0", "18|source_commit|TEXT|1|''|0",
-	"19|source_path|TEXT|1|''|0", "20|source_root|TEXT|1|''|0", "21|created_count|INTEGER|1|0|0",
-	"22|updated_count|INTEGER|1|0|0", "23|type_replacement_count|INTEGER|1|0|0",
-	"24|removed_descendant_count|INTEGER|1|0|0", "25|preserved_current_only_count|INTEGER|1|0|0",
-	"26|changed_path_preview|BLOB|1|X'4652503100000000'|0", "27|changed_path_count|INTEGER|1|0|0",
-	"28|preview_truncated|INTEGER|1|0|0", "29|restore_confirmed|INTEGER|1|0|0",
+func _clientV24PendingColumns() []string {
+	return []string{
+		"0|worktree|TEXT|1||1", "1|publication_kind|TEXT|1||0", "2|base_commit|TEXT|1||0", "3|base_root|TEXT|1||0",
+		"4|expected_head|TEXT|1||0", "5|expected_etag|TEXT|1||0", "6|candidate_commit|TEXT|1||0",
+		"7|candidate_root|TEXT|1||0", "8|candidate_data|BLOB|1||0", "9|captured_commit|TEXT|1||0",
+		"10|captured_root|TEXT|1||0", "11|captured_data|BLOB|1||0", "12|candidate_history|BLOB|1||0",
+		"13|deletion_count|INTEGER|1|0|0", "14|tracked_count|INTEGER|1|0|0",
+		"15|requires_delete_confirmation|INTEGER|1|0|0", "16|delete_confirmed|INTEGER|1|0|0",
+		"17|legacy_revalidation_required|INTEGER|1|0|0", "18|source_commit|TEXT|1|''|0",
+		"19|source_path|TEXT|1|''|0", "20|source_root|TEXT|1|''|0", "21|created_count|INTEGER|1|0|0",
+		"22|updated_count|INTEGER|1|0|0", "23|type_replacement_count|INTEGER|1|0|0",
+		"24|removed_descendant_count|INTEGER|1|0|0", "25|preserved_current_only_count|INTEGER|1|0|0",
+		"26|changed_path_preview|BLOB|1|X'4652503100000000'|0", "27|changed_path_count|INTEGER|1|0|0",
+		"28|preview_truncated|INTEGER|1|0|0", "29|restore_confirmed|INTEGER|1|0|0",
+	}
 }
 
 var legacyClientV12Indexes = map[string][]string{
@@ -1555,7 +1557,7 @@ func _validateClientV23Schema(ctx context.Context, db clientSchemaQuerier) error
 }
 
 func _validateClientV24Schema(ctx context.Context, db clientSchemaQuerier) error {
-	return validatePendingPublicationSchema(ctx, db, 24, _clientV24PendingSQL, _clientV24PendingColumns)
+	return validatePendingPublicationSchema(ctx, db, 24, _clientV24PendingSQL, _clientV24PendingColumns())
 }
 
 const _clientV21CheckoutSQL = `CREATE TABLE pending_checkouts (server_url TEXT NOT NULL, library_id TEXT NOT NULL,

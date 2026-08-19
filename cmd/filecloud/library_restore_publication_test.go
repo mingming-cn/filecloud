@@ -85,9 +85,9 @@ func TestClientV24RestorePublicationDatabaseChecks(t *testing.T) {
 	for _, test := range []struct {
 		name, statement string
 	}{
-		{"candidate root equals captured root", `UPDATE pending_publications SET candidate_root = captured_root WHERE worktree = ?`},
-		{"zero changed paths", `UPDATE pending_publications SET changed_path_count = 0 WHERE worktree = ?`},
-		{"statistics mismatch", `UPDATE pending_publications SET created_count = 0 WHERE worktree = ?`},
+		{name: "candidate root equals captured root", statement: `UPDATE pending_publications SET candidate_root = captured_root WHERE worktree = ?`},
+		{name: "zero changed paths", statement: `UPDATE pending_publications SET changed_path_count = 0 WHERE worktree = ?`},
+		{name: "statistics mismatch", statement: `UPDATE pending_publications SET created_count = 0 WHERE worktree = ?`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := db.ExecContext(t.Context(), test.statement, "/work"); err == nil {
@@ -143,7 +143,7 @@ func TestClientV23ToV24SyncPendingMigrationPreservesFields(t *testing.T) {
 	if err != nil || loaded == nil {
 		t.Fatalf("load migrated sync publication=%+v err=%v", loaded, err)
 	}
-	expected.ChangedPathPreview = append([]byte(nil), _emptyRestorePreview...)
+	expected.ChangedPathPreview = []byte(_emptyRestorePreview)
 	if !reflect.DeepEqual(*loaded, expected) {
 		t.Fatalf("v23 sync publication changed during migration:\nwant=%+v\n got=%+v", expected, *loaded)
 	}
@@ -163,22 +163,22 @@ func TestRestorePublicationRejectsInvalidCrossFieldsAndPreview(t *testing.T) {
 		mutate func(*pendingPublication)
 		want   string
 	}{
-		{"wrong candidate parent", func(value *pendingPublication) { value.CandidateData = []byte("invalid") }, "candidate commit"},
-		{"candidate root equals captured root", func(value *pendingPublication) { value.CandidateRoot = value.CapturedRoot }, "candidate root must differ"},
-		{"zero changed paths", func(value *pendingPublication) {
+		{name: "wrong candidate parent", mutate: func(value *pendingPublication) { value.CandidateData = []byte("invalid") }, want: "candidate commit"},
+		{name: "candidate root equals captured root", mutate: func(value *pendingPublication) { value.CandidateRoot = value.CapturedRoot }, want: "candidate root must differ"},
+		{name: "zero changed paths", mutate: func(value *pendingPublication) {
 			value.CreatedCount, value.UpdatedCount, value.TypeReplacementCount = 0, 0, 0
-			value.ChangedPathPreview, value.ChangedPathCount, value.PreviewTruncated = append([]byte(nil), _emptyRestorePreview...), 0, false
-		}, "must contain changed paths"},
-		{"statistics mismatch", func(value *pendingPublication) {
+			value.ChangedPathPreview, value.ChangedPathCount, value.PreviewTruncated = []byte(_emptyRestorePreview), 0, false
+		}, want: "must contain changed paths"},
+		{name: "statistics mismatch", mutate: func(value *pendingPublication) {
 			value.CreatedCount, value.UpdatedCount, value.TypeReplacementCount = 1, 0, 0
-		}, "statistics do not match"},
-		{"deletion confirmation", func(value *pendingPublication) { value.RequiresDeleteConfirmation = true }, "synchronization-only"},
-		{"candidate history", func(value *pendingPublication) { value.CandidateHistory = []byte("history") }, "synchronization-only"},
-		{"invalid source commit", func(value *pendingPublication) { value.SourceCommit = "short" }, "source fields"},
-		{"invalid source path", func(value *pendingPublication) { value.SourcePath = "../outside" }, "source fields"},
-		{"negative statistic", func(value *pendingPublication) { value.UpdatedCount = -1 }, "statistics"},
-		{"preview count mismatch", func(value *pendingPublication) { value.ChangedPathCount = 1 }, "changed path count"},
-		{"noncanonical preview", func(value *pendingPublication) { value.ChangedPathPreview = []byte("paths") }, "invalid encoding"},
+		}, want: "statistics do not match"},
+		{name: "deletion confirmation", mutate: func(value *pendingPublication) { value.RequiresDeleteConfirmation = true }, want: "synchronization-only"},
+		{name: "candidate history", mutate: func(value *pendingPublication) { value.CandidateHistory = []byte("history") }, want: "synchronization-only"},
+		{name: "invalid source commit", mutate: func(value *pendingPublication) { value.SourceCommit = "short" }, want: "source fields"},
+		{name: "invalid source path", mutate: func(value *pendingPublication) { value.SourcePath = "../outside" }, want: "source fields"},
+		{name: "negative statistic", mutate: func(value *pendingPublication) { value.UpdatedCount = -1 }, want: "statistics"},
+		{name: "preview count mismatch", mutate: func(value *pendingPublication) { value.ChangedPathCount = 1 }, want: "changed path count"},
+		{name: "noncanonical preview", mutate: func(value *pendingPublication) { value.ChangedPathPreview = []byte("paths") }, want: "invalid encoding"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

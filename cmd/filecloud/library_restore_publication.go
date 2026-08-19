@@ -18,7 +18,7 @@ const (
 	_restorePreviewMaxBytes = _restorePreviewHeader + _restorePreviewPathLimit*(4+_mergeMaxPath)
 )
 
-var _emptyRestorePreview = []byte{'F', 'R', 'P', '1', 0, 0, 0, 0}
+const _emptyRestorePreview = "FRP1\x00\x00\x00\x00"
 
 func _encodeRestorePreview(paths []string) ([]byte, error) {
 	if len(paths) > _restorePreviewPathLimit {
@@ -35,7 +35,7 @@ func _encodeRestorePreview(paths []string) ([]byte, error) {
 		}
 	}
 	result := make([]byte, _restorePreviewHeader)
-	copy(result, _emptyRestorePreview[:4])
+	copy(result, []byte(_emptyRestorePreview))
 	binary.BigEndian.PutUint32(result[4:8], uint32(len(ordered)))
 	for _, path := range ordered {
 		if len(path) > _mergeMaxPath || len(result) > _restorePreviewMaxBytes-4-len(path) {
@@ -50,7 +50,7 @@ func _encodeRestorePreview(paths []string) ([]byte, error) {
 }
 
 func _decodeRestorePreview(data []byte) ([]string, error) {
-	if len(data) < _restorePreviewHeader || len(data) > _restorePreviewMaxBytes || !bytes.Equal(data[:4], _emptyRestorePreview[:4]) {
+	if len(data) < _restorePreviewHeader || len(data) > _restorePreviewMaxBytes || !bytes.Equal(data[:4], []byte(_emptyRestorePreview[:4])) {
 		return nil, errors.New("restore preview has an invalid encoding")
 	}
 	count := binary.BigEndian.Uint32(data[4:8])
@@ -170,7 +170,7 @@ func isEmptyRestoreFields(value pendingPublication) bool {
 	return value.SourceCommit == "" && value.SourcePath == "" && value.SourceRoot == "" &&
 		value.CreatedCount == 0 && value.UpdatedCount == 0 && value.TypeReplacementCount == 0 &&
 		value.RemovedDescendantCount == 0 && value.PreservedCurrentOnlyCount == 0 &&
-		bytes.Equal(value.ChangedPathPreview, _emptyRestorePreview) && value.ChangedPathCount == 0 &&
+		bytes.Equal(value.ChangedPathPreview, []byte(_emptyRestorePreview)) && value.ChangedPathCount == 0 &&
 		!value.PreviewTruncated && !value.RestoreConfirmed
 }
 

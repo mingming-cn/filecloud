@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -190,6 +191,55 @@ func TestLibraryRestoreConfirmationDiscardsStaleHead(t *testing.T) {
 	}
 	if countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 || readTestBinding(t, state.clientDir, state.worktree) != beforeBinding {
 		t.Fatalf("stale Head changed local state: binding=%+v", readTestBinding(t, state.clientDir, state.worktree))
+	}
+}
+
+func TestLibraryRestoreConfirmDiscardsETagOnlyChangeBeforeHeadCAS(t *testing.T) {
+	state := newImportedBinding(t)
+	sourceCommit := state.binding.SyncBase
+	if err := os.WriteFile(filepath.Join(state.worktree, "local"), []byte("current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", state.clientDir, "--worktree", state.worktree}, nil, io.Discard, io.Discard,
+		libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--commit", sourceCommit, "--path", "local"}, nil, io.Discard, io.Discard, libraryClientConfig{
+		checkFilesystem: func(*os.File) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending := readTestPendingPublication(t, state.clientDir, state.worktree)
+	beforeBinding := readTestBinding(t, state.clientDir, state.worktree)
+	beforeRoot := scanTestRoot(t, state.worktree)
+	beforeIndex := captureTestPathIndex(t, state.clientDir, state.worktree)
+	beforeHead, err := getRemoteHead(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+		[]byte(state.environment.token))
+	if err != nil || beforeHead.CommitID == nil || *beforeHead.CommitID != pending.ExpectedHead || beforeHead.ETag != pending.ExpectedETag {
+		t.Fatalf("pending restore did not capture current Head: head=%+v pending=%+v err=%v", beforeHead, pending, err)
+	}
+	err = runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--confirm", pending.CandidateCommit[:deleteCandidatePrefixLen]}, nil, io.Discard, io.Discard, libraryClientConfig{
+		checkFilesystem: func(*os.File) error { return nil },
+		beforeHeadCAS: func() error {
+			_, err := state.environment.store.DB().ExecContext(t.Context(),
+				`UPDATE libraries SET head_version = head_version + 1 WHERE owner_user_id = ? AND id = ?`,
+				testClientUserID, testClientLibraryID)
+			return err
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "rerun restore preview") {
+		t.Fatalf("ETag-only restore confirmation error=%v", err)
+	}
+	afterHead, headErr := getRemoteHead(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+		[]byte(state.environment.token))
+	afterBinding := readTestBinding(t, state.clientDir, state.worktree)
+	if headErr != nil || afterHead.CommitID == nil || *afterHead.CommitID != *beforeHead.CommitID || afterHead.ETag == beforeHead.ETag ||
+		countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 || afterBinding != beforeBinding ||
+		scanTestRoot(t, state.worktree) != beforeRoot || !reflect.DeepEqual(captureTestPathIndex(t, state.clientDir, state.worktree), beforeIndex) {
+		t.Fatalf("ETag-only restore changed durable state: beforeHead=%+v afterHead=%+v beforeBinding=%+v afterBinding=%+v beforeRoot=%s afterRoot=%s",
+			beforeHead, afterHead, beforeBinding, afterBinding, beforeRoot, scanTestRoot(t, state.worktree))
 	}
 }
 
