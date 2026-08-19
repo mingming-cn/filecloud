@@ -258,8 +258,10 @@ func (c *historyInspectClient) resolvePath(ctx context.Context, rootID, path str
 		return historyInspectTarget{kind: "Directory", id: rootID, directory: directory}, err
 	}
 	currentID := rootID
-	components := strings.Split(path, "/")
-	for index, component := range components {
+	componentCount := strings.Count(path, "/") + 1
+	index := 0
+	for component := range strings.SplitSeq(path, "/") {
+		index++
 		directory, err := c.fetchDirectory(ctx, currentID)
 		if err != nil {
 			return historyInspectTarget{}, err
@@ -271,7 +273,7 @@ func (c *historyInspectClient) resolvePath(ctx context.Context, rootID, path str
 			return historyInspectTarget{}, _errHistoryInspectPathNotFound
 		}
 		entry := directory.Entries[entryIndex]
-		if index+1 < len(components) {
+		if index < componentCount {
 			if entry.Type != "Directory" {
 				return historyInspectTarget{}, _errHistoryInspectPathNotFound
 			}

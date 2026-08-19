@@ -150,13 +150,15 @@ func TestLibraryHistoryInspectFileAndDirectoryPagesWithoutBlocks(t *testing.T) {
 	if err := runTest(t.Context(), rootArgs, strings.NewReader(""), &firstPage, io.Discard); err != nil {
 		t.Fatalf("inspect historical root page 1: %v", err)
 	}
-	if !strings.Contains(firstPage.String(), "Type=Directory") || !strings.Contains(firstPage.String(), "DirectoryId="+fixture.rootID) ||
-		!strings.Contains(firstPage.String(), "Entry name=a.txt type=File") || strings.Contains(firstPage.String(), "readme.txt") {
-		t.Fatalf("root page 1 output = %q", firstPage.String())
+	firstPageValid := strings.Contains(firstPage.String(), "Type=Directory") &&
+		strings.Contains(firstPage.String(), "DirectoryId="+fixture.rootID) &&
+		strings.Contains(firstPage.String(), "Entry name=a.txt type=File") && !strings.Contains(firstPage.String(), "readme.txt")
+	if !firstPageValid {
+		t.Fatal("root page 1 omitted directory metadata, returned the wrong entry, or traversed descendants")
 	}
 	token := outputValue(firstPage.String(), "next_page_token=")
 	if token == "" {
-		t.Fatalf("root page 1 omitted token: %q", firstPage.String())
+		t.Fatal("root page 1 omitted its continuation token")
 	}
 
 	var secondPage bytes.Buffer
@@ -164,7 +166,7 @@ func TestLibraryHistoryInspectFileAndDirectoryPagesWithoutBlocks(t *testing.T) {
 		t.Fatalf("inspect historical root page 2: %v", err)
 	}
 	if !strings.Contains(secondPage.String(), "Entry name=docs type=Directory") || strings.Contains(secondPage.String(), "readme.txt") {
-		t.Fatalf("root page 2 output = %q", secondPage.String())
+		t.Fatal("root page 2 returned the wrong direct entry or traversed descendants")
 	}
 
 	const pathCanary = "docs/path-canary"
@@ -321,7 +323,7 @@ func TestLibraryHistoryInspectDirectoryPaginates500Of501Entries(t *testing.T) {
 		t.Fatalf("inspect final directory page: %v", err)
 	}
 	if got := strings.Count(second.String(), "\nEntry name="); got != 1 || outputValue(second.String(), "next_page_token=") != "" {
-		t.Fatalf("final directory page entries = %d, output=%q", got, second.String())
+		t.Fatalf("final directory page entries = %d, want 1 with no continuation token", got)
 	}
 	if fixture.forbidden.Load() != 0 {
 		t.Fatalf("directory pagination attempted %d GetBlock or write requests", fixture.forbidden.Load())

@@ -65,12 +65,10 @@ func ValidPath(value string) bool {
 	if value == "" || len(value) > _maxPathBytes || !utf8.ValidString(value) {
 		return false
 	}
-	components := strings.Split(value, "/")
-	if len(components) > _maxPathDepth {
-		return false
-	}
-	for _, component := range components {
-		if !validName(component) {
+	depth := 0
+	for component := range strings.SplitSeq(value, "/") {
+		depth++
+		if depth > _maxPathDepth || !validName(component) {
 			return false
 		}
 	}

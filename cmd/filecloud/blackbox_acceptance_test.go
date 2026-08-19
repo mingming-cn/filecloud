@@ -249,13 +249,13 @@ func TestBuiltBinaryHistoryInspectReadOnlyAcceptance(t *testing.T) {
 	rootOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientDir,
 		"--worktree", worktree, "--commit", binding.SyncBase, "--path", ".", "--page-size", "1")
 	pageToken := outputValue(string(rootOutput), "next_page_token=")
-	if !bytes.Contains(rootOutput, []byte("Entry name=a.txt type=File")) || pageToken == "" {
-		t.Fatalf("history directory first page is incomplete: token_present=%t output=%s", pageToken != "", rootOutput)
+	if entryPresent := bytes.Contains(rootOutput, []byte("Entry name=a.txt type=File")); !entryPresent || pageToken == "" {
+		t.Fatalf("history directory first page: entry_present=%t token_present=%t, want both true", entryPresent, pageToken != "")
 	}
 	secondOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientDir,
 		"--worktree", worktree, "--commit", binding.SyncBase, "--path", ".", "--page-size", "1", "--page-token", pageToken)
 	if !bytes.Contains(secondOutput, []byte("Entry name=b.txt type=File")) {
-		t.Fatalf("history directory second page is incomplete: %s", secondOutput)
+		t.Fatal("history directory second page omitted b.txt")
 	}
 	if forbidden.Load() != 0 {
 		t.Fatalf("history inspect attempted %d block, write, or Head requests, want 0", forbidden.Load())
