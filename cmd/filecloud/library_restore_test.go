@@ -560,12 +560,12 @@ func TestLibraryRestoreTypeReplacementRequiresPreviewAndExactConfirmation(t *tes
 		!equalStrings(changed, []string{"target", "target/child.txt"}) || pending.PreviewTruncated ||
 		!strings.Contains(output.String(), "type replacements: 1") ||
 		!strings.Contains(output.String(), "candidate: "+pending.CandidateCommit[:deleteCandidatePrefixLen]) {
-		t.Fatalf("type replacement preview=%q pending=%+v changed=%v", output.String(), pending, changed)
+		t.Fatalf("type replacement preview=%q pending=%+v changed=%v, want created=1 updated=0 replacements=1 removed=0 preserved=0 changed=[target target/child.txt]", output.String(), pending, changed)
 	}
 	if puts.Load() != 0 || beforeBinding != readTestBinding(t, state.clientDir, state.worktree) ||
 		beforeHead != restoreTestHead(t, state) || !reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
 		!reflect.DeepEqual(beforeWorktree, captureHistoryInspectWorktree(t, state.worktree)) {
-		t.Fatalf("type replacement preview changed published or local state: puts=%d", puts.Load())
+		t.Fatalf("type replacement preview state puts=%d binding=%+v head=%q, want puts=0 binding=%+v head=%q with unchanged index/worktree", puts.Load(), readTestBinding(t, state.clientDir, state.worktree), restoreTestHead(t, state), beforeBinding, beforeHead)
 	}
 
 	wrongPrefix := strings.Repeat("0", deleteCandidatePrefixLen)
@@ -575,13 +575,13 @@ func TestLibraryRestoreTypeReplacementRequiresPreviewAndExactConfirmation(t *tes
 	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir,
 		"--worktree", state.worktree, "--confirm", wrongPrefix}, nil, io.Discard, io.Discard, config); err == nil ||
 		!strings.Contains(err.Error(), "must exactly match") {
-		t.Fatalf("wrong type replacement confirmation error=%v", err)
+		t.Fatalf("wrong type replacement confirmation error=%v, want exact-candidate mismatch", err)
 	}
 	if after := readTestPendingPublication(t, state.clientDir, state.worktree); !reflect.DeepEqual(after, pending) ||
 		puts.Load() != 0 || beforeBinding != readTestBinding(t, state.clientDir, state.worktree) ||
 		beforeHead != restoreTestHead(t, state) || !reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
 		!reflect.DeepEqual(beforeWorktree, captureHistoryInspectWorktree(t, state.worktree)) {
-		t.Fatalf("wrong confirmation changed state: before=%+v after=%+v puts=%d", pending, after, puts.Load())
+		t.Fatalf("wrong confirmation state before=%+v after=%+v puts=%d, want identical pending state and puts=0", pending, after, puts.Load())
 	}
 
 	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir,
@@ -591,7 +591,7 @@ func TestLibraryRestoreTypeReplacementRequiresPreviewAndExactConfirmation(t *tes
 	}
 	content, err := os.ReadFile(filepath.Join(state.worktree, "target", "child.txt"))
 	if err != nil || string(content) != "source child" {
-		t.Fatalf("restored replacement content=%q err=%v", content, err)
+		t.Fatalf("restored replacement content=%q err=%v, want %q", content, err, "source child")
 	}
 	afterBinding := readTestBinding(t, state.clientDir, state.worktree)
 	commit, err := getRemoteCommit(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
@@ -602,7 +602,7 @@ func TestLibraryRestoreTypeReplacementRequiresPreviewAndExactConfirmation(t *tes
 	if puts.Load() == 0 || afterBinding.SyncBase != pending.CandidateCommit || afterBinding.SyncBaseRoot != pending.CandidateRoot ||
 		len(commit.Parents) != 1 || commit.Parents[0] != pending.ExpectedHead || commit.Root != pending.CandidateRoot ||
 		countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 {
-		t.Fatalf("published type replacement binding=%+v commit=%+v puts=%d", afterBinding, commit, puts.Load())
+		t.Fatalf("published type replacement binding=%+v commit=%+v puts=%d, want SyncBase=%s Root=%s Parent=%s and puts>0", afterBinding, commit, puts.Load(), pending.CandidateCommit, pending.CandidateRoot, pending.ExpectedHead)
 	}
 }
 
@@ -634,10 +634,11 @@ func TestLibraryRestorePlannerBudgetsRejectBeforeWrites(t *testing.T) {
 		budget restorePlanBudget
 		want   string
 	}{
-		{name: "objects", budget: restorePlanBudget{maxDepth: 256, maxObjects: 1, maxPathBytes: 1024, maxDirectoryEntries: 100000}, want: "object budget"},
-		{name: "path", budget: restorePlanBudget{maxDepth: 256, maxObjects: 100, maxPathBytes: 4, maxDirectoryEntries: 100000}, want: "path budget"},
-		{name: "directory entries", budget: restorePlanBudget{maxDepth: 256, maxObjects: 100, maxPathBytes: 1024, maxDirectoryEntries: 1}, want: "directory entry budget"},
-		{name: "depth", budget: restorePlanBudget{maxDepth: 2, maxObjects: 100, maxPathBytes: 1024, maxDirectoryEntries: 100000}, want: "depth budget"},
+		{name: "objects", budget: restorePlanBudget{maxDepth: 256, maxObjects: 1, maxPaths: 100, maxPathBytes: 1024, maxDirectoryEntries: 100000}, want: "object budget"},
+		{name: "path count", budget: restorePlanBudget{maxDepth: 256, maxObjects: 100, maxPaths: 1, maxPathBytes: 1024, maxDirectoryEntries: 100000}, want: "path count budget"},
+		{name: "path", budget: restorePlanBudget{maxDepth: 256, maxObjects: 100, maxPaths: 100, maxPathBytes: 4, maxDirectoryEntries: 100000}, want: "path budget"},
+		{name: "directory entries", budget: restorePlanBudget{maxDepth: 256, maxObjects: 100, maxPaths: 100, maxPathBytes: 1024, maxDirectoryEntries: 1}, want: "directory entry budget"},
+		{name: "depth", budget: restorePlanBudget{maxDepth: 2, maxObjects: 100, maxPaths: 100, maxPathBytes: 1024, maxDirectoryEntries: 100000}, want: "depth budget"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -653,7 +654,7 @@ func TestLibraryRestorePlannerBudgetsRejectBeforeWrites(t *testing.T) {
 				beforeBinding != readTestBinding(t, state.clientDir, state.worktree) || beforeHead != restoreTestHead(t, state) ||
 				!reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
 				!reflect.DeepEqual(beforeWorktree, captureHistoryInspectWorktree(t, state.worktree)) {
-				t.Fatalf("restore budget rejection changed state: output=%q puts=%d", output.String(), puts.Load())
+				t.Fatalf("restore budget=%s rejection state output=%q puts=%d binding=%+v head=%q, want empty output, puts=0, binding=%+v head=%q and no local mutations", test.name, output.String(), puts.Load(), readTestBinding(t, state.clientDir, state.worktree), restoreTestHead(t, state), beforeBinding, beforeHead)
 			}
 		})
 	}

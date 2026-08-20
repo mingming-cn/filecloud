@@ -237,7 +237,7 @@ func uploadAndPublishRestore(ctx context.Context, db *sql.DB, options bindOption
 	if err != nil {
 		return err
 	}
-	plan, err := planRestoreSnapshotWithOptions(ctx, options, snapshot, source, pending.SourcePath)
+	plan, err := planRestoreSnapshotWithBudget(ctx, options, snapshot, source, pending.SourcePath, nil)
 	if err != nil {
 		return err
 	}

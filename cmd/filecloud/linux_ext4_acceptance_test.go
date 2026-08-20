@@ -218,7 +218,7 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		Head: id, SyncBase: id, HeadRoot: root, BaseRoot: root, Snapshot: root, ReachableObjects: 8,
 		SourceCommit: digest, SourceRoot: strings.Repeat("d", 64), SourcePath: ".", PreviousHead: strings.Repeat("e", 64),
 		ExpectedHead: strings.Repeat("e", 64), CandidateCommit: id, ResultRoot: root,
-		CreatedCount: new(int64(3)), UpdatedCount: new(int64(1)), TypeReplacementCount: new(int64(2)),
+		CreatedCount: new(int64(3)), UpdatedCount: new(int64(102)), TypeReplacementCount: new(int64(2)),
 		RemovedDescendantCount: new(int64(3)), PreservedCurrentOnlyCount: new(int64(2)),
 		PendingPublicationRows: new(0), PendingCheckoutRows: new(0),
 		SourceReachable: true, PreviousHeadReachable: true,

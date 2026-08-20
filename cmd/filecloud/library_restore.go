@@ -462,11 +462,6 @@ func planRestoreSnapshot(ctx context.Context, state *restoreClientState, snapsho
 	return planRestoreSnapshotWithBudget(ctx, state.options, snapshot, source, sourcePath, state.config.restorePlanBudget)
 }
 
-func planRestoreSnapshotWithOptions(ctx context.Context, options bindOptions, snapshot worktreeSnapshot,
-	source historyInspectCommit, sourcePath string) (restorePlan, error) {
-	return planRestoreSnapshotWithBudget(ctx, options, snapshot, source, sourcePath, nil)
-}
-
 func planRestoreSnapshotWithBudget(ctx context.Context, options bindOptions, snapshot worktreeSnapshot,
 	source historyInspectCommit, sourcePath string, budget *restorePlanBudget) (restorePlan, error) {
 	local := restoreLocalObjectMap(snapshot)

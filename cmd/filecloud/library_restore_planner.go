@@ -21,6 +21,7 @@ type restoreObjectLoader func(kind, id string) ([]byte, error)
 type restorePlanBudget struct {
 	maxDepth            int
 	maxObjects          int
+	maxPaths            int
 	maxPathBytes        int
 	maxDirectoryEntries int
 }
@@ -68,6 +69,7 @@ type restorePlanner struct {
 	typeReplacements     map[string]struct{}
 	removedDescendants   map[string]struct{}
 	preservedCurrentOnly map[string]struct{}
+	validatedPaths       map[string]struct{}
 	objectCount          int
 
 	createdCount int64
@@ -142,19 +144,20 @@ func newRestorePlanner(input restorePlanInput) (*restorePlanner, error) {
 	if input.Load == nil {
 		return nil, errors.New("restore object loader is required")
 	}
-	budget := restorePlanBudget{maxDepth: _mergeMaxDepth, maxObjects: _mergeMaxObjects,
+	budget := restorePlanBudget{maxDepth: _mergeMaxDepth, maxObjects: _mergeMaxObjects, maxPaths: _mergeMaxObjects,
 		maxPathBytes: _mergeMaxPath, maxDirectoryEntries: _restoreMaxDirectoryEntries}
 	if input.Budget != nil {
 		budget = *input.Budget
 	}
-	if budget.maxDepth < 1 || budget.maxObjects < 1 || budget.maxPathBytes < 1 || budget.maxDirectoryEntries < 1 {
+	if budget.maxDepth < 1 || budget.maxObjects < 1 || budget.maxPaths < 1 || budget.maxPathBytes < 1 ||
+		budget.maxDirectoryEntries < 1 {
 		return nil, errors.New("restore planner budgets must be positive")
 	}
 	return &restorePlanner{input: input, budget: budget, directories: make(map[string]object.Directory),
 		files: make(map[string]object.File), synthesized: make(map[string][]byte), active: make(map[string]bool),
 		activeWalk: make(map[string]bool), changed: make(map[string]struct{}),
 		typeReplacements: make(map[string]struct{}), removedDescendants: make(map[string]struct{}),
-		preservedCurrentOnly: make(map[string]struct{})}, nil
+		preservedCurrentOnly: make(map[string]struct{}), validatedPaths: make(map[string]struct{})}, nil
 }
 
 func restorePathParts(path string) []string {
@@ -322,6 +325,9 @@ func (planner *restorePlanner) applyPath(current, source restorePlanNode, parts 
 	if path != "" {
 		childPath = path + "/" + name
 	}
+	if err := planner.validateResultPath(childPath); err != nil {
+		return restorePlanNode{}, err
+	}
 	child, err := planner.applyPath(currentChild,
 		restorePlanNode{present: true, kind: sourceEntry.Type, id: sourceEntry.ID, mtime: sourceEntry.ModifiedAt},
 		parts, index+1, childPath, false)
@@ -377,6 +383,9 @@ func (planner *restorePlanner) buildMissingPath(source restorePlanNode, parts []
 	childPath := name
 	if path != "" {
 		childPath = path + "/" + name
+	}
+	if err := planner.validateResultPath(childPath); err != nil {
+		return restorePlanNode{}, err
 	}
 	var child restorePlanNode
 	if index+1 == len(parts) {
@@ -521,6 +530,9 @@ func (planner *restorePlanner) mergeDirectories(current, source restorePlanNode,
 		childPath := name
 		if path != "" {
 			childPath = path + "/" + name
+		}
+		if err := planner.validateResultPath(childPath); err != nil {
+			return restorePlanNode{}, err
 		}
 		var child restorePlanNode
 		switch {
@@ -711,5 +723,12 @@ func (planner *restorePlanner) validateResultPath(path string) error {
 	if !object.ValidPath(path) || path == "." || len(path) > planner.budget.maxPathBytes {
 		return errors.New("restore planner exceeds path budget")
 	}
+	if _, exists := planner.validatedPaths[path]; exists {
+		return nil
+	}
+	if len(planner.validatedPaths) >= planner.budget.maxPaths {
+		return errors.New("restore planner exceeds path count budget")
+	}
+	planner.validatedPaths[path] = struct{}{}
 	return nil
 }

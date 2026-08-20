@@ -287,11 +287,11 @@ func TestRestorePlannerFileReplacesDirectoryAndCountsRemovedDescendants(t *testi
 	if plan.resultRoot != sourceRootID || plan.createdCount != 0 || plan.updatedCount != 0 ||
 		plan.typeReplacementCount != 1 || plan.removedDescendantCount != 3 || plan.preservedCurrentOnlyCount != 0 ||
 		plan.changedPathCount != 1 || !equalStrings(plan.changedPaths, []string{"target"}) || plan.previewTruncated {
-		t.Fatalf("file replacement plan=%+v", plan)
+		t.Fatalf("file replacement plan=%+v, want source root with created=0 updated=0 replacements=1 removed=3 preserved=0 changed=1", plan)
 	}
 	if len(plan.paths) != 1 || plan.paths[0].path != "target" || plan.paths[0].kind != "File" ||
 		plan.paths[0].id != sourceID {
-		t.Fatalf("file replacement paths=%+v", plan.paths)
+		t.Fatalf("file replacement paths=%+v, want one source File at target", plan.paths)
 	}
 }
 
@@ -550,7 +550,8 @@ func TestRestorePlannerPreviewCapAndDeterminism(t *testing.T) {
 			wantPreviewCount := min(count, _restorePreviewPathLimit)
 			if first.resultRoot != sourceID || first.updatedCount != int64(count) || first.changedPathCount != int64(count) ||
 				len(first.changedPaths) != wantPreviewCount || first.previewTruncated != (count > _restorePreviewPathLimit) {
-				t.Fatalf("preview stats=%+v", first)
+				t.Fatalf("preview count=%d stats=%+v, want changed=%d preview=%d truncated=%t", count, first,
+					count, wantPreviewCount, count > _restorePreviewPathLimit)
 			}
 			for index, path := range first.changedPaths {
 				want := fmt.Sprintf("file-%03d.txt", index)
@@ -578,8 +579,8 @@ func TestRestorePlannerRejectsBudgetsAndNonCanonicalObjects(t *testing.T) {
 		"files/" + fileID:       fileData,
 	}}
 	budget := func(depth, objects, pathBytes, directoryEntries int) *restorePlanBudget {
-		return &restorePlanBudget{maxDepth: depth, maxObjects: objects, maxPathBytes: pathBytes,
-			maxDirectoryEntries: directoryEntries}
+		return &restorePlanBudget{maxDepth: depth, maxObjects: objects, maxPaths: 100,
+			maxPathBytes: pathBytes, maxDirectoryEntries: directoryEntries}
 	}
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: rootID, SourceRoot: rootID, SourcePath: "same.txt",
 		Load: loader.loadRestoreObject, Budget: budget(256, 2, 1024, 100000)}); err != nil {
@@ -587,7 +588,7 @@ func TestRestorePlannerRejectsBudgetsAndNonCanonicalObjects(t *testing.T) {
 	}
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: rootID, SourceRoot: rootID, SourcePath: "same.txt",
 		Load: loader.loadRestoreObject, Budget: budget(256, 1, 1024, 100000)}); err == nil || !strings.Contains(err.Error(), "object budget") {
-		t.Fatalf("object budget error=%v", err)
+		t.Fatalf("object budget error=%v, want object budget rejection above 1 unique object", err)
 	}
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: rootID, SourceRoot: rootID, SourcePath: "same.txt",
 		Load: loader.loadRestoreObject, Budget: budget(256, 100, len("same.txt"), 100000)}); err != nil {
@@ -595,7 +596,7 @@ func TestRestorePlannerRejectsBudgetsAndNonCanonicalObjects(t *testing.T) {
 	}
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: rootID, SourceRoot: rootID, SourcePath: "same.txt",
 		Load: loader.loadRestoreObject, Budget: budget(256, 100, len("same.txt")-1, 100000)}); err == nil || !strings.Contains(err.Error(), "path budget") {
-		t.Fatalf("path budget error=%v", err)
+		t.Fatalf("path budget error=%v, want path budget rejection above %d bytes", err, len("same.txt")-1)
 	}
 
 	leafData, leafID, err := canonicalFile("leaf.txt", 1, []string{strings.Repeat("b", 64)})
@@ -630,9 +631,16 @@ func TestRestorePlannerRejectsBudgetsAndNonCanonicalObjects(t *testing.T) {
 		Load: deepLoader.loadRestoreObject, Budget: budget(3, 100, 1024, 100000)}); err != nil {
 		t.Fatalf("exact depth budget rejected: %v", err)
 	}
+	rejectDeepLoader := &restorePlannerTestLoader{objects: deepLoader.objects}
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: deepRootID, SourceRoot: deepRootID, SourcePath: ".",
-		Load: deepLoader.loadRestoreObject, Budget: budget(2, 100, 1024, 100000)}); err == nil || !strings.Contains(err.Error(), "depth budget") {
-		t.Fatalf("depth budget error=%v", err)
+		Load: rejectDeepLoader.loadRestoreObject, Budget: budget(2, 100, 1024, 100000)}); err == nil ||
+		!strings.Contains(err.Error(), "depth budget") {
+		t.Fatalf("depth budget error=%v, want depth budget rejection", err)
+	}
+	for _, load := range rejectDeepLoader.loads {
+		if load == "files/"+leafID {
+			t.Fatalf("depth rejection loaded %q, want rejection before the over-depth object", load)
+		}
 	}
 
 	twoEntryRootData, twoEntryRootID, err := canonicalDirectory("", []scanEntry{
@@ -653,7 +661,39 @@ func TestRestorePlannerRejectsBudgetsAndNonCanonicalObjects(t *testing.T) {
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: twoEntryRootID, SourceRoot: twoEntryRootID,
 		SourcePath: ".", Load: twoEntryLoader.loadRestoreObject, Budget: budget(256, 100, 1024, 1)}); err == nil ||
 		!strings.Contains(err.Error(), "directory entry budget") {
-		t.Fatalf("directory entry budget error=%v", err)
+		t.Fatalf("directory entry budget error=%v, want directory entry budget rejection", err)
+	}
+
+	sharedData, sharedID, err := canonicalDirectory("shared", []scanEntry{
+		{name: "x.txt", kind: "File", id: fileID, modified: "2026-05-01T00:00:00Z"},
+		{name: "y.txt", kind: "File", id: fileID, modified: "2026-05-01T00:00:00Z"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dagRootData, dagRootID, err := canonicalDirectory("", []scanEntry{
+		{name: "a", kind: "Directory", id: sharedID, modified: "2026-05-01T00:00:00Z"},
+		{name: "b", kind: "Directory", id: sharedID, modified: "2026-05-01T00:00:00Z"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dagObjects := map[string][]byte{
+		"directories/" + dagRootID: dagRootData,
+		"directories/" + sharedID:  sharedData,
+		"files/" + fileID:          fileData,
+	}
+	dagBudget := restorePlanBudget{maxDepth: 256, maxObjects: 3, maxPaths: 6,
+		maxPathBytes: 1024, maxDirectoryEntries: 100000}
+	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: dagRootID, SourceRoot: dagRootID, SourcePath: ".",
+		Load: (&restorePlannerTestLoader{objects: dagObjects}).loadRestoreObject, Budget: &dagBudget}); err != nil {
+		t.Fatalf("exact shared DAG path budget rejected: %v", err)
+	}
+	dagBudget.maxPaths = 5
+	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: dagRootID, SourceRoot: dagRootID, SourcePath: ".",
+		Load: (&restorePlannerTestLoader{objects: dagObjects}).loadRestoreObject, Budget: &dagBudget}); err == nil ||
+		!strings.Contains(err.Error(), "path count budget") {
+		t.Fatalf("shared DAG path budget error=%v, want path count budget rejection", err)
 	}
 
 	badID := strings.Repeat("c", 64)
@@ -707,12 +747,12 @@ func TestRestorePlannerDirectoryReplacesFileAtSelectedAncestor(t *testing.T) {
 		plan.typeReplacementCount != 1 || plan.removedDescendantCount != 0 || plan.preservedCurrentOnlyCount != 0 ||
 		plan.changedPathCount != 2 || !equalStrings(plan.changedPaths, []string{"target", "target/child.txt"}) ||
 		plan.previewTruncated {
-		t.Fatalf("directory replacement plan=%+v", plan)
+		t.Fatalf("directory replacement plan=%+v, want source root with created=1 updated=0 replacements=1 removed=0 preserved=0 changed=2", plan)
 	}
 	if len(plan.paths) != 2 || plan.paths[0].path != "target" || plan.paths[0].kind != "Directory" ||
 		plan.paths[0].id != sourceDirectoryID || plan.paths[1].path != "target/child.txt" ||
 		plan.paths[1].kind != "File" || plan.paths[1].id != sourceChildID {
-		t.Fatalf("directory replacement paths=%+v", plan.paths)
+		t.Fatalf("directory replacement paths=%+v, want source Directory target and File target/child.txt", plan.paths)
 	}
 }
 
