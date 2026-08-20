@@ -280,7 +280,7 @@ func TestBuiltBinaryDirectoryRestoreAcceptance(t *testing.T) {
 	}
 	for _, content := range []string{"source-deleted", "source-overwritten", "current-file", "current-nested"} {
 		if bytes.Contains(directoryPreview, []byte(content)) {
-			t.Fatalf("built directory preview leaked file content")
+			t.Fatalf("built directory preview=%q contains content=%q, want metadata only", directoryPreview, content)
 		}
 	}
 	runBlackBoxCLI(t, binary, nil, "library", "restore", "--client-dir", clientB, "--worktree", worktreeB,
@@ -323,7 +323,7 @@ func TestBuiltBinaryDirectoryRestoreAcceptance(t *testing.T) {
 	}
 	for _, content := range []string{"source-root", "current-root-only"} {
 		if bytes.Contains(rootPreview, []byte(content)) {
-			t.Fatal("built root preview leaked file content")
+			t.Fatalf("built root preview=%q contains content=%q, want metadata only", rootPreview, content)
 		}
 	}
 	beforeWrongConfirmation := captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken,

@@ -548,12 +548,12 @@ func TestLibraryRestoreTypeReplacementRequiresPreviewAndExactConfirmation(t *tes
 	var output bytes.Buffer
 	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
 		"--commit", sourceCommit, "--path", "target"}, nil, &output, io.Discard, config); err != nil {
-		t.Fatal(err)
+		t.Fatalf("preview type replacement error=%v, want nil", err)
 	}
 	pending := readTestPendingPublication(t, state.clientDir, state.worktree)
 	changed, err := _decodeRestorePreview(pending.ChangedPathPreview)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("decode type replacement preview error=%v, want nil", err)
 	}
 	if pending.TypeReplacementCount != 1 || pending.CreatedCount != 1 || pending.UpdatedCount != 0 ||
 		pending.RemovedDescendantCount != 0 || pending.PreservedCurrentOnlyCount != 0 || pending.ChangedPathCount != 2 ||
@@ -657,6 +657,44 @@ func TestLibraryRestorePlannerBudgetsRejectBeforeWrites(t *testing.T) {
 				t.Fatalf("restore budget=%s rejection state output=%q puts=%d binding=%+v head=%q, want empty output, puts=0, binding=%+v head=%q and no local mutations", test.name, output.String(), puts.Load(), readTestBinding(t, state.clientDir, state.worktree), restoreTestHead(t, state), beforeBinding, beforeHead)
 			}
 		})
+	}
+
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir,
+		"--worktree", state.worktree, "--commit", sourceCommit, "--path", "."}, nil, io.Discard, io.Discard, config); err != nil {
+		t.Fatalf("create resumable restore preview: %v", err)
+	}
+	db, err := openClientDB(filepath.Join(state.clientDir, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		"UPDATE pending_publications SET restore_confirmed = 1 WHERE worktree = ?", state.worktree); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	confirmed := readTestPendingPublication(t, state.clientDir, state.worktree)
+	if !confirmed.RestoreConfirmed {
+		t.Fatalf("confirmed restore state=%+v, want RestoreConfirmed=true", confirmed)
+	}
+	puts.Store(0)
+	resumeBudget := restorePlanBudget{maxDepth: 256, maxObjects: 1, maxPaths: 100,
+		maxPathBytes: 1024, maxDirectoryEntries: 100000}
+	config.restorePlanBudget = &resumeBudget
+	err = runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", state.clientDir,
+		"--worktree", state.worktree}, nil, io.Discard, io.Discard, config)
+	if err == nil || !strings.Contains(err.Error(), "object budget") {
+		t.Fatalf("resume restore budget error=%v, want object budget rejection", err)
+	}
+	afterResume := readTestPendingPublication(t, state.clientDir, state.worktree)
+	if !reflect.DeepEqual(afterResume, confirmed) || puts.Load() != 0 ||
+		beforeBinding != readTestBinding(t, state.clientDir, state.worktree) || beforeHead != restoreTestHead(t, state) ||
+		!reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
+		!reflect.DeepEqual(beforeWorktree, captureHistoryInspectWorktree(t, state.worktree)) {
+		t.Fatalf("resume restore budget state pending=%+v puts=%d binding=%+v head=%q, want pending=%+v puts=0 binding=%+v head=%q and no local mutations", afterResume, puts.Load(), readTestBinding(t, state.clientDir, state.worktree), restoreTestHead(t, state), confirmed, beforeBinding, beforeHead)
 	}
 }
 

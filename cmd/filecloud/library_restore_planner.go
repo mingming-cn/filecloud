@@ -81,6 +81,11 @@ func planRestoreOverlay(input restorePlanInput) (restorePlan, error) {
 	if err != nil {
 		return restorePlan{}, err
 	}
+	if input.SourcePath != "." {
+		if err := planner.validateResultPath(input.SourcePath); err != nil {
+			return restorePlan{}, err
+		}
+	}
 	if _, err := planner.loadDirectory(input.CurrentRoot); err != nil {
 		return restorePlan{}, fmt.Errorf("load current restore root: %w", err)
 	}
