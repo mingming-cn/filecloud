@@ -67,6 +67,7 @@ type libraryClientConfig struct {
 	fsActionFault                   fsActionFault
 	fsTransactionFault              func(string) error
 	fallbackOccupied                func(string) bool
+	restorePlanBudget               *restorePlanBudget
 	bindingLockHeld                 bool
 }
 

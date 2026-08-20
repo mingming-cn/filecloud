@@ -218,8 +218,8 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		Head: id, SyncBase: id, HeadRoot: root, BaseRoot: root, Snapshot: root, ReachableObjects: 8,
 		SourceCommit: digest, SourceRoot: strings.Repeat("d", 64), SourcePath: ".", PreviousHead: strings.Repeat("e", 64),
 		ExpectedHead: strings.Repeat("e", 64), CandidateCommit: id, ResultRoot: root,
-		CreatedCount: new(int64(0)), UpdatedCount: new(int64(1)), TypeReplacementCount: new(int64(0)),
-		RemovedDescendantCount: new(int64(0)), PreservedCurrentOnlyCount: new(int64(2)),
+		CreatedCount: new(int64(3)), UpdatedCount: new(int64(1)), TypeReplacementCount: new(int64(2)),
+		RemovedDescendantCount: new(int64(3)), PreservedCurrentOnlyCount: new(int64(2)),
 		PendingPublicationRows: new(0), PendingCheckoutRows: new(0),
 		SourceReachable: true, PreviousHeadReachable: true,
 	}
@@ -245,8 +245,19 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		{name: "valid restore", attestations: []platformAttestation{restore}, required: map[string]string{"real binary directory and root restore": "restore"}},
 		{name: "restore Head drift", attestations: []platformAttestation{func() platformAttestation { value := restore; value.Head = digest; return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
 		{name: "restore invalid source path", attestations: []platformAttestation{func() platformAttestation { value := restore; value.SourcePath = "../outside"; return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
-		{name: "restore type replacement", attestations: []platformAttestation{func() platformAttestation { value := restore; value.TypeReplacementCount = new(int64(1)); return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
-		{name: "restore no changes", attestations: []platformAttestation{func() platformAttestation { value := restore; value.UpdatedCount = new(int64(0)); return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
+		{name: "restore missing type replacement", attestations: []platformAttestation{func() platformAttestation { value := restore; value.TypeReplacementCount = new(int64(0)); return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
+		{name: "restore no changes", attestations: []platformAttestation{func() platformAttestation {
+			value := restore
+			value.CreatedCount = new(int64(0))
+			value.UpdatedCount = new(int64(0))
+			value.TypeReplacementCount = new(int64(0))
+			return value
+		}()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
+		{name: "restore missing removed descendants", attestations: []platformAttestation{func() platformAttestation {
+			value := restore
+			value.RemovedDescendantCount = new(int64(0))
+			return value
+		}()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
 		{name: "restore source unreachable", attestations: []platformAttestation{func() platformAttestation { value := restore; value.SourceReachable = false; return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
 		{name: "restore pending checkout", attestations: []platformAttestation{func() platformAttestation { value := restore; value.PendingCheckoutRows = new(1); return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
 		{name: "restore missing explicit zero", attestations: []platformAttestation{func() platformAttestation { value := restore; value.RemovedDescendantCount = nil; return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
@@ -388,8 +399,9 @@ func validatePlatformAttestations(attestations []platformAttestation, required m
 				attestation.PreservedCurrentOnlyCount != nil && attestation.PendingPublicationRows != nil &&
 				attestation.PendingCheckoutRows != nil
 			validStats := statsPresent && *attestation.CreatedCount >= 0 && *attestation.UpdatedCount >= 0 &&
-				*attestation.CreatedCount+*attestation.UpdatedCount > 0 && *attestation.TypeReplacementCount == 0 &&
-				*attestation.RemovedDescendantCount == 0 && *attestation.PreservedCurrentOnlyCount > 0
+				*attestation.CreatedCount+*attestation.UpdatedCount+*attestation.TypeReplacementCount > 0 &&
+				*attestation.TypeReplacementCount > 0 && *attestation.RemovedDescendantCount > 0 &&
+				*attestation.PreservedCurrentOnlyCount > 0
 			if !validIDs || !object.ValidPath(attestation.SourcePath) || !validResult || !validStats ||
 				*attestation.PendingPublicationRows != 0 || *attestation.PendingCheckoutRows != 0 ||
 				!attestation.SourceReachable || !attestation.PreviousHeadReachable || attestation.ReachableObjects < 2 {

@@ -459,11 +459,16 @@ func restoreLocalObjectMap(snapshot worktreeSnapshot) map[string][]byte {
 
 func planRestoreSnapshot(ctx context.Context, state *restoreClientState, snapshot worktreeSnapshot,
 	source historyInspectCommit, sourcePath string) (restorePlan, error) {
-	return planRestoreSnapshotWithOptions(ctx, state.options, snapshot, source, sourcePath)
+	return planRestoreSnapshotWithBudget(ctx, state.options, snapshot, source, sourcePath, state.config.restorePlanBudget)
 }
 
 func planRestoreSnapshotWithOptions(ctx context.Context, options bindOptions, snapshot worktreeSnapshot,
 	source historyInspectCommit, sourcePath string) (restorePlan, error) {
+	return planRestoreSnapshotWithBudget(ctx, options, snapshot, source, sourcePath, nil)
+}
+
+func planRestoreSnapshotWithBudget(ctx context.Context, options bindOptions, snapshot worktreeSnapshot,
+	source historyInspectCommit, sourcePath string, budget *restorePlanBudget) (restorePlan, error) {
 	local := restoreLocalObjectMap(snapshot)
 	loader := func(kind, id string) ([]byte, error) {
 		if data, ok := local[kind+"\x00"+id]; ok {
@@ -472,7 +477,7 @@ func planRestoreSnapshotWithOptions(ctx context.Context, options bindOptions, sn
 		return fetchRestoreObject(ctx, options, kind, id)
 	}
 	return planRestoreOverlay(restorePlanInput{CurrentRoot: snapshot.root, SourceRoot: source.Root,
-		SourcePath: sourcePath, Load: loader})
+		SourcePath: sourcePath, Load: loader, Budget: budget})
 }
 
 func fetchRestoreHeadCommit(ctx context.Context, state *restoreClientState, commitID, rootID string) ([]byte, object.Commit, error) {

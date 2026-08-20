@@ -521,7 +521,7 @@ func TestLibraryRestoreMissingSourceDirectoryHasNoWrites(t *testing.T) {
 	}
 }
 
-func TestLibraryRestoreTypeConflictRejectsBeforeWrites(t *testing.T) {
+func TestLibraryRestoreTypeReplacementRequiresPreviewAndExactConfirmation(t *testing.T) {
 	state, puts := newRestoreRequestFixture(t)
 	if err := os.Mkdir(filepath.Join(state.worktree, "target"), 0o700); err != nil {
 		t.Fatal(err)
@@ -543,19 +543,119 @@ func TestLibraryRestoreTypeConflictRejectsBeforeWrites(t *testing.T) {
 	beforeIndex := captureTestPathIndex(t, state.clientDir, state.worktree)
 	beforeWorktree := captureHistoryInspectWorktree(t, state.worktree)
 	puts.Store(0)
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}
 
 	var output bytes.Buffer
-	err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
-		"--commit", sourceCommit, "--path", "target/child.txt"}, nil, &output, io.Discard,
-		libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
-	if !errors.Is(err, _errRestoreTypeConflict) {
-		t.Fatalf("public type conflict error=%v, want _errRestoreTypeConflict", err)
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--commit", sourceCommit, "--path", "target"}, nil, &output, io.Discard, config); err != nil {
+		t.Fatal(err)
 	}
-	if puts.Load() != 0 || output.Len() != 0 || countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 ||
-		beforeBinding != readTestBinding(t, state.clientDir, state.worktree) || beforeHead != restoreTestHead(t, state) ||
-		!reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
+	pending := readTestPendingPublication(t, state.clientDir, state.worktree)
+	changed, err := _decodeRestorePreview(pending.ChangedPathPreview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.TypeReplacementCount != 1 || pending.CreatedCount != 1 || pending.UpdatedCount != 0 ||
+		pending.RemovedDescendantCount != 0 || pending.PreservedCurrentOnlyCount != 0 || pending.ChangedPathCount != 2 ||
+		!equalStrings(changed, []string{"target", "target/child.txt"}) || pending.PreviewTruncated ||
+		!strings.Contains(output.String(), "type replacements: 1") ||
+		!strings.Contains(output.String(), "candidate: "+pending.CandidateCommit[:deleteCandidatePrefixLen]) {
+		t.Fatalf("type replacement preview=%q pending=%+v changed=%v", output.String(), pending, changed)
+	}
+	if puts.Load() != 0 || beforeBinding != readTestBinding(t, state.clientDir, state.worktree) ||
+		beforeHead != restoreTestHead(t, state) || !reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
 		!reflect.DeepEqual(beforeWorktree, captureHistoryInspectWorktree(t, state.worktree)) {
-		t.Fatalf("type conflict changed state or sent PUT: puts=%d output=%q", puts.Load(), output.String())
+		t.Fatalf("type replacement preview changed published or local state: puts=%d", puts.Load())
+	}
+
+	wrongPrefix := strings.Repeat("0", deleteCandidatePrefixLen)
+	if wrongPrefix == pending.CandidateCommit[:deleteCandidatePrefixLen] {
+		wrongPrefix = strings.Repeat("1", deleteCandidatePrefixLen)
+	}
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir,
+		"--worktree", state.worktree, "--confirm", wrongPrefix}, nil, io.Discard, io.Discard, config); err == nil ||
+		!strings.Contains(err.Error(), "must exactly match") {
+		t.Fatalf("wrong type replacement confirmation error=%v", err)
+	}
+	if after := readTestPendingPublication(t, state.clientDir, state.worktree); !reflect.DeepEqual(after, pending) ||
+		puts.Load() != 0 || beforeBinding != readTestBinding(t, state.clientDir, state.worktree) ||
+		beforeHead != restoreTestHead(t, state) || !reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
+		!reflect.DeepEqual(beforeWorktree, captureHistoryInspectWorktree(t, state.worktree)) {
+		t.Fatalf("wrong confirmation changed state: before=%+v after=%+v puts=%d", pending, after, puts.Load())
+	}
+
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir,
+		"--worktree", state.worktree, "--confirm", pending.CandidateCommit[:deleteCandidatePrefixLen]},
+		nil, io.Discard, io.Discard, config); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(state.worktree, "target", "child.txt"))
+	if err != nil || string(content) != "source child" {
+		t.Fatalf("restored replacement content=%q err=%v", content, err)
+	}
+	afterBinding := readTestBinding(t, state.clientDir, state.worktree)
+	commit, err := getRemoteCommit(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+		[]byte(state.environment.token), pending.CandidateCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if puts.Load() == 0 || afterBinding.SyncBase != pending.CandidateCommit || afterBinding.SyncBaseRoot != pending.CandidateRoot ||
+		len(commit.Parents) != 1 || commit.Parents[0] != pending.ExpectedHead || commit.Root != pending.CandidateRoot ||
+		countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 {
+		t.Fatalf("published type replacement binding=%+v commit=%+v puts=%d", afterBinding, commit, puts.Load())
+	}
+}
+
+func TestLibraryRestorePlannerBudgetsRejectBeforeWrites(t *testing.T) {
+	state, puts := newRestoreRequestFixture(t)
+	if err := os.MkdirAll(filepath.Join(state.worktree, "target", "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state.worktree, "target", "nested", "child.txt"), []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state.worktree, "keep.txt"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRestoreTestSync(t, state.clientDir, state.worktree)
+	sourceCommit := readTestBinding(t, state.clientDir, state.worktree).SyncBase
+	if err := os.WriteFile(filepath.Join(state.worktree, "target", "nested", "child.txt"), []byte("current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRestoreTestSync(t, state.clientDir, state.worktree)
+	beforeBinding := readTestBinding(t, state.clientDir, state.worktree)
+	beforeHead := restoreTestHead(t, state)
+	beforeIndex := captureTestPathIndex(t, state.clientDir, state.worktree)
+	beforeWorktree := captureHistoryInspectWorktree(t, state.worktree)
+	puts.Store(0)
+
+	tests := []struct {
+		name   string
+		budget restorePlanBudget
+		want   string
+	}{
+		{name: "objects", budget: restorePlanBudget{maxDepth: 256, maxObjects: 1, maxPathBytes: 1024, maxDirectoryEntries: 100000}, want: "object budget"},
+		{name: "path", budget: restorePlanBudget{maxDepth: 256, maxObjects: 100, maxPathBytes: 4, maxDirectoryEntries: 100000}, want: "path budget"},
+		{name: "directory entries", budget: restorePlanBudget{maxDepth: 256, maxObjects: 100, maxPathBytes: 1024, maxDirectoryEntries: 1}, want: "directory entry budget"},
+		{name: "depth", budget: restorePlanBudget{maxDepth: 2, maxObjects: 100, maxPathBytes: 1024, maxDirectoryEntries: 100000}, want: "depth budget"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }, restorePlanBudget: &test.budget}
+			err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir,
+				"--worktree", state.worktree, "--commit", sourceCommit, "--path", "."}, nil, &output, io.Discard, config)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("restore budget error=%v, want %q", err, test.want)
+			}
+			if output.Len() != 0 || puts.Load() != 0 ||
+				countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 ||
+				beforeBinding != readTestBinding(t, state.clientDir, state.worktree) || beforeHead != restoreTestHead(t, state) ||
+				!reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
+				!reflect.DeepEqual(beforeWorktree, captureHistoryInspectWorktree(t, state.worktree)) {
+				t.Fatalf("restore budget rejection changed state: output=%q puts=%d", output.String(), puts.Load())
+			}
+		})
 	}
 }
 

@@ -225,9 +225,12 @@ func TestBuiltBinaryDirectoryRestoreAcceptance(t *testing.T) {
 		writeBlackBoxFile(t, worktreeA, path, content)
 		setBlackBoxMtime(t, filepath.Join(worktreeA, filepath.FromSlash(path)), sourceMtime)
 	}
-	for index := range 10 {
+	for index := range 50 {
 		writeBlackBoxFile(t, worktreeA, filepath.ToSlash(filepath.Join("docs", "stable-"+fmt.Sprintf("%02d", index)+".txt")), "stable")
 	}
+	writeBlackBoxFile(t, worktreeA, "replace-file", "source replacement file")
+	writeBlackBoxFile(t, worktreeA, "replace-dir/child.txt", "source replacement child")
+	writeBlackBoxFile(t, worktreeA, "replace-dir/nested/deep.txt", "source replacement deep")
 	setBlackBoxMtime(t, filepath.Join(worktreeA, "docs"), sourceMtime.Add(time.Minute))
 	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientA, "--worktree", worktreeA)
 	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientB, "--worktree", worktreeB)
@@ -249,6 +252,15 @@ func TestBuiltBinaryDirectoryRestoreAcceptance(t *testing.T) {
 	}
 	writeBlackBoxFile(t, worktreeA, "root.txt", "current-root")
 	writeBlackBoxFile(t, worktreeA, "root-current-only.txt", "current-root-only")
+	if err := os.Remove(filepath.Join(worktreeA, "replace-file")); err != nil {
+		t.Fatal(err)
+	}
+	writeBlackBoxFile(t, worktreeA, "replace-file/child.txt", "current replacement child")
+	writeBlackBoxFile(t, worktreeA, "replace-file/nested/deep.txt", "current replacement deep")
+	if err := os.RemoveAll(filepath.Join(worktreeA, "replace-dir")); err != nil {
+		t.Fatal(err)
+	}
+	writeBlackBoxFile(t, worktreeA, "replace-dir", "current replacement file")
 	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientA, "--worktree", worktreeA)
 	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientB, "--worktree", worktreeB)
 
@@ -288,9 +300,14 @@ func TestBuiltBinaryDirectoryRestoreAcceptance(t *testing.T) {
 	rootPreview := runBlackBoxCLI(t, binary, nil, "library", "restore", "--client-dir", clientB,
 		"--worktree", worktreeB, "--commit", sourceBinding.SyncBase, "--path", ".")
 	rootPending := readTestPendingPublication(t, clientB, worktreeB)
-	if rootPending.UpdatedCount != 1 || rootPending.PreservedCurrentOnlyCount != 5 || rootPending.CreatedCount != 0 ||
-		rootPending.TypeReplacementCount != 0 || rootPending.RemovedDescendantCount != 0 ||
-		outputValue(string(rootPreview), "candidate: ") != rootPending.CandidateCommit[:deleteCandidatePrefixLen] {
+	if rootPending.UpdatedCount != 1 || rootPending.PreservedCurrentOnlyCount != 5 || rootPending.CreatedCount != 3 ||
+		rootPending.TypeReplacementCount != 2 || rootPending.RemovedDescendantCount != 3 || rootPending.ChangedPathCount != 6 ||
+		rootPending.PreviewTruncated || outputValue(string(rootPreview), "candidate: ") != rootPending.CandidateCommit[:deleteCandidatePrefixLen] ||
+		outputValue(string(rootPreview), "created paths: ") != "3" ||
+		outputValue(string(rootPreview), "updated paths: ") != "1" ||
+		outputValue(string(rootPreview), "type replacements: ") != "2" ||
+		outputValue(string(rootPreview), "removed descendants by type replacement: ") != "3" ||
+		outputValue(string(rootPreview), "preserved current-only paths: ") != "5" {
 		t.Fatalf("built root preview=%s pending=%+v", rootPreview, rootPending)
 	}
 	for _, content := range []string{"source-root", "current-root-only"} {
@@ -298,15 +315,34 @@ func TestBuiltBinaryDirectoryRestoreAcceptance(t *testing.T) {
 			t.Fatal("built root preview leaked file content")
 		}
 	}
+	beforeWrongConfirmation := captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken,
+		clientA, worktreeA, clientB, worktreeB)
+	wrongPrefix := strings.Repeat("0", deleteCandidatePrefixLen)
+	if wrongPrefix == rootPending.CandidateCommit[:deleteCandidatePrefixLen] {
+		wrongPrefix = strings.Repeat("1", deleteCandidatePrefixLen)
+	}
+	wrongStdout, wrongStderr, wrongErr := runBlackBoxCLIResult(t, binary, nil, "library", "restore",
+		"--client-dir", clientB, "--worktree", worktreeB, "--confirm", wrongPrefix)
+	if wrongErr == nil || len(wrongStdout) != 0 || !bytes.Contains(wrongStderr, []byte("must exactly match")) {
+		t.Fatalf("built wrong restore confirmation error=%v stdout=%q stderr=%q", wrongErr, wrongStdout, wrongStderr)
+	}
+	assertBlackBoxRestoreState(t, "wrong type replacement confirmation", beforeWrongConfirmation,
+		captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken, clientA, worktreeA, clientB, worktreeB))
+
 	runBlackBoxCLI(t, binary, nil, "library", "restore", "--client-dir", clientB, "--worktree", worktreeB,
 		"--confirm", rootPending.CandidateCommit[:deleteCandidatePrefixLen])
 	assertBlackBoxFile(t, worktreeB, "root.txt", "source-root")
 	assertBlackBoxFile(t, worktreeB, "root-current-only.txt", "current-root-only")
+	assertBlackBoxFile(t, worktreeB, "replace-file", "source replacement file")
+	assertBlackBoxFile(t, worktreeB, "replace-dir/child.txt", "source replacement child")
+	assertBlackBoxFile(t, worktreeB, "replace-dir/nested/deep.txt", "source replacement deep")
 	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientA, "--worktree", worktreeA)
 
 	oracle := libraryCLIEnvironment{server: &httptest.Server{URL: serverURL}, token: login.Session.AccessToken}
 	confirmed := platformConfirmedInputs("source-deleted", "source-overwritten", "current-overwritten", "current-file",
-		"current-nested", "source-root", "current-root", "current-root-only")
+		"current-nested", "source-root", "current-root", "current-root-only", "source replacement file",
+		"source replacement child", "source replacement deep", "current replacement file", "current replacement child",
+		"current replacement deep")
 	bindingA := assertPlatformConvergedWithoutAttestation(t, "real binary restore first client", oracle, clientA, worktreeA, confirmed)
 	bindingB := assertPlatformConvergedWithoutAttestation(t, "real binary restore second client", oracle, clientB, worktreeB, confirmed)
 	if bindingA.SyncBase != bindingB.SyncBase || bindingA.SyncBaseRoot != bindingB.SyncBaseRoot ||

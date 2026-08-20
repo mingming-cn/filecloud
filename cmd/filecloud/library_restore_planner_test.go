@@ -231,7 +231,7 @@ func TestRestorePlannerNoOpAndMissingSourcePath(t *testing.T) {
 	}
 }
 
-func TestRestorePlannerRejectsFileReplacingDirectory(t *testing.T) {
+func TestRestorePlannerFileReplacesDirectoryAndCountsRemovedDescendants(t *testing.T) {
 	childData, childID, err := canonicalFile("child.txt", 1, []string{strings.Repeat("c", 64)})
 	if err != nil {
 		t.Fatal(err)
@@ -281,11 +281,17 @@ func TestRestorePlannerRejectsFileReplacingDirectory(t *testing.T) {
 	plan, err := planRestoreOverlay(restorePlanInput{
 		CurrentRoot: currentRootID, SourceRoot: sourceRootID, SourcePath: "target", Load: loader.loadRestoreObject,
 	})
-	if !errors.Is(err, _errRestoreTypeConflict) {
-		t.Fatalf("type conflict error=%v, want _errRestoreTypeConflict", err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(plan, restorePlan{}) {
-		t.Fatalf("rejected type conflict returned plan=%+v", plan)
+	if plan.resultRoot != sourceRootID || plan.createdCount != 0 || plan.updatedCount != 0 ||
+		plan.typeReplacementCount != 1 || plan.removedDescendantCount != 3 || plan.preservedCurrentOnlyCount != 0 ||
+		plan.changedPathCount != 1 || !equalStrings(plan.changedPaths, []string{"target"}) || plan.previewTruncated {
+		t.Fatalf("file replacement plan=%+v", plan)
+	}
+	if len(plan.paths) != 1 || plan.paths[0].path != "target" || plan.paths[0].kind != "File" ||
+		plan.paths[0].id != sourceID {
+		t.Fatalf("file replacement paths=%+v", plan.paths)
 	}
 }
 
@@ -506,47 +512,53 @@ func TestRestorePlannerPreviewCapAndDeterminism(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	currentEntries := make([]scanEntry, 101)
-	sourceEntries := make([]scanEntry, 101)
-	for index := range 101 {
-		name := fmt.Sprintf("file-%03d.txt", index)
-		currentEntries[index] = scanEntry{name: name, kind: "File", id: fileID, modified: "2026-03-01T00:00:00Z"}
-		sourceEntries[index] = scanEntry{name: name, kind: "File", id: fileID, modified: "2026-04-01T00:00:00Z"}
-	}
-	currentData, currentID, err := canonicalDirectory("", currentEntries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sourceData, sourceID, err := canonicalDirectory("", sourceEntries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	loader := &restorePlannerTestLoader{objects: map[string][]byte{
-		"directories/" + currentID: currentData,
-		"directories/" + sourceID:  sourceData,
-		"files/" + fileID:          fileData,
-	}}
-	input := restorePlanInput{CurrentRoot: currentID, SourceRoot: sourceID, SourcePath: ".", Load: loader.loadRestoreObject}
-	first, err := planRestoreOverlay(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := planRestoreOverlay(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.resultRoot != second.resultRoot || !equalStrings(first.changedPaths, second.changedPaths) || first.changedPathCount != second.changedPathCount {
-		t.Fatalf("planner is not deterministic: first=%+v second=%+v", first, second)
-	}
-	if first.resultRoot != sourceID || first.updatedCount != 101 || first.changedPathCount != 101 ||
-		len(first.changedPaths) != _restorePreviewPathLimit || !first.previewTruncated {
-		t.Fatalf("preview stats=%+v", first)
-	}
-	for index, path := range first.changedPaths {
-		want := fmt.Sprintf("file-%03d.txt", index)
-		if path != want {
-			t.Fatalf("preview path %d=%q, want %q", index, path, want)
-		}
+	for _, count := range []int{100, 101} {
+		t.Run(fmt.Sprintf("%d paths", count), func(t *testing.T) {
+			currentEntries := make([]scanEntry, count)
+			sourceEntries := make([]scanEntry, count)
+			for index := range count {
+				name := fmt.Sprintf("file-%03d.txt", index)
+				currentEntries[index] = scanEntry{name: name, kind: "File", id: fileID, modified: "2026-03-01T00:00:00Z"}
+				sourceEntries[index] = scanEntry{name: name, kind: "File", id: fileID, modified: "2026-04-01T00:00:00Z"}
+			}
+			currentData, currentID, err := canonicalDirectory("", currentEntries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sourceData, sourceID, err := canonicalDirectory("", sourceEntries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			loader := &restorePlannerTestLoader{objects: map[string][]byte{
+				"directories/" + currentID: currentData,
+				"directories/" + sourceID:  sourceData,
+				"files/" + fileID:          fileData,
+			}}
+			input := restorePlanInput{CurrentRoot: currentID, SourceRoot: sourceID, SourcePath: ".", Load: loader.loadRestoreObject}
+			first, err := planRestoreOverlay(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := planRestoreOverlay(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.resultRoot != second.resultRoot || !equalStrings(first.changedPaths, second.changedPaths) ||
+				first.changedPathCount != second.changedPathCount {
+				t.Fatalf("planner is not deterministic: first=%+v second=%+v", first, second)
+			}
+			wantPreviewCount := min(count, _restorePreviewPathLimit)
+			if first.resultRoot != sourceID || first.updatedCount != int64(count) || first.changedPathCount != int64(count) ||
+				len(first.changedPaths) != wantPreviewCount || first.previewTruncated != (count > _restorePreviewPathLimit) {
+				t.Fatalf("preview stats=%+v", first)
+			}
+			for index, path := range first.changedPaths {
+				want := fmt.Sprintf("file-%03d.txt", index)
+				if path != want {
+					t.Fatalf("preview path %d=%q, want %q", index, path, want)
+				}
+			}
+		})
 	}
 }
 
@@ -565,12 +577,24 @@ func TestRestorePlannerRejectsBudgetsAndNonCanonicalObjects(t *testing.T) {
 		"directories/" + rootID: rootData,
 		"files/" + fileID:       fileData,
 	}}
+	budget := func(depth, objects, pathBytes, directoryEntries int) *restorePlanBudget {
+		return &restorePlanBudget{maxDepth: depth, maxObjects: objects, maxPathBytes: pathBytes,
+			maxDirectoryEntries: directoryEntries}
+	}
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: rootID, SourceRoot: rootID, SourcePath: "same.txt",
-		Load: loader.loadRestoreObject, Budget: &restorePlanBudget{maxDepth: 256, maxObjects: 1, maxPathBytes: 1024}}); err == nil || !strings.Contains(err.Error(), "object budget") {
+		Load: loader.loadRestoreObject, Budget: budget(256, 2, 1024, 100000)}); err != nil {
+		t.Fatalf("exact object budget rejected: %v", err)
+	}
+	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: rootID, SourceRoot: rootID, SourcePath: "same.txt",
+		Load: loader.loadRestoreObject, Budget: budget(256, 1, 1024, 100000)}); err == nil || !strings.Contains(err.Error(), "object budget") {
 		t.Fatalf("object budget error=%v", err)
 	}
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: rootID, SourceRoot: rootID, SourcePath: "same.txt",
-		Load: loader.loadRestoreObject, Budget: &restorePlanBudget{maxDepth: 256, maxObjects: 100, maxPathBytes: 4}}); err == nil || !strings.Contains(err.Error(), "path budget") {
+		Load: loader.loadRestoreObject, Budget: budget(256, 100, len("same.txt"), 100000)}); err != nil {
+		t.Fatalf("exact path budget rejected: %v", err)
+	}
+	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: rootID, SourceRoot: rootID, SourcePath: "same.txt",
+		Load: loader.loadRestoreObject, Budget: budget(256, 100, len("same.txt")-1, 100000)}); err == nil || !strings.Contains(err.Error(), "path budget") {
 		t.Fatalf("path budget error=%v", err)
 	}
 
@@ -603,9 +627,35 @@ func TestRestorePlannerRejectsBudgetsAndNonCanonicalObjects(t *testing.T) {
 		"files/" + leafID:           leafData,
 	}}
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: deepRootID, SourceRoot: deepRootID, SourcePath: ".",
-		Load: deepLoader.loadRestoreObject, Budget: &restorePlanBudget{maxDepth: 1, maxObjects: 100, maxPathBytes: 1024}}); err == nil || !strings.Contains(err.Error(), "depth budget") {
+		Load: deepLoader.loadRestoreObject, Budget: budget(3, 100, 1024, 100000)}); err != nil {
+		t.Fatalf("exact depth budget rejected: %v", err)
+	}
+	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: deepRootID, SourceRoot: deepRootID, SourcePath: ".",
+		Load: deepLoader.loadRestoreObject, Budget: budget(2, 100, 1024, 100000)}); err == nil || !strings.Contains(err.Error(), "depth budget") {
 		t.Fatalf("depth budget error=%v", err)
 	}
+
+	twoEntryRootData, twoEntryRootID, err := canonicalDirectory("", []scanEntry{
+		{name: "a.txt", kind: "File", id: fileID, modified: "2026-05-01T00:00:00Z"},
+		{name: "b.txt", kind: "File", id: fileID, modified: "2026-05-01T00:00:00Z"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	twoEntryLoader := &restorePlannerTestLoader{objects: map[string][]byte{
+		"directories/" + twoEntryRootID: twoEntryRootData,
+		"files/" + fileID:               fileData,
+	}}
+	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: twoEntryRootID, SourceRoot: twoEntryRootID,
+		SourcePath: ".", Load: twoEntryLoader.loadRestoreObject, Budget: budget(256, 100, 1024, 2)}); err != nil {
+		t.Fatalf("exact directory entry budget rejected: %v", err)
+	}
+	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: twoEntryRootID, SourceRoot: twoEntryRootID,
+		SourcePath: ".", Load: twoEntryLoader.loadRestoreObject, Budget: budget(256, 100, 1024, 1)}); err == nil ||
+		!strings.Contains(err.Error(), "directory entry budget") {
+		t.Fatalf("directory entry budget error=%v", err)
+	}
+
 	badID := strings.Repeat("c", 64)
 	badLoader := &restorePlannerTestLoader{objects: map[string][]byte{"directories/" + badID: []byte(`{"Type":"Directory"}`)}}
 	if _, err := planRestoreOverlay(restorePlanInput{CurrentRoot: badID, SourceRoot: badID, SourcePath: ".", Load: badLoader.loadRestoreObject}); err == nil || !strings.Contains(err.Error(), "not canonical") {
@@ -613,7 +663,7 @@ func TestRestorePlannerRejectsBudgetsAndNonCanonicalObjects(t *testing.T) {
 	}
 }
 
-func TestRestorePlannerRejectsDirectoryReplacingFile(t *testing.T) {
+func TestRestorePlannerDirectoryReplacesFileAtSelectedAncestor(t *testing.T) {
 	currentData, currentID, err := canonicalFile("target", 1, []string{strings.Repeat("a", 64)})
 	if err != nil {
 		t.Fatal(err)
@@ -650,11 +700,19 @@ func TestRestorePlannerRejectsDirectoryReplacingFile(t *testing.T) {
 	plan, err := planRestoreOverlay(restorePlanInput{
 		CurrentRoot: currentRootID, SourceRoot: sourceRootID, SourcePath: "target/child.txt", Load: loader.loadRestoreObject,
 	})
-	if !errors.Is(err, _errRestoreTypeConflict) {
-		t.Fatalf("ancestor type conflict error=%v, want _errRestoreTypeConflict", err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(plan, restorePlan{}) {
-		t.Fatalf("rejected ancestor type conflict returned plan=%+v", plan)
+	if plan.resultRoot != sourceRootID || plan.createdCount != 1 || plan.updatedCount != 0 ||
+		plan.typeReplacementCount != 1 || plan.removedDescendantCount != 0 || plan.preservedCurrentOnlyCount != 0 ||
+		plan.changedPathCount != 2 || !equalStrings(plan.changedPaths, []string{"target", "target/child.txt"}) ||
+		plan.previewTruncated {
+		t.Fatalf("directory replacement plan=%+v", plan)
+	}
+	if len(plan.paths) != 2 || plan.paths[0].path != "target" || plan.paths[0].kind != "Directory" ||
+		plan.paths[0].id != sourceDirectoryID || plan.paths[1].path != "target/child.txt" ||
+		plan.paths[1].kind != "File" || plan.paths[1].id != sourceChildID {
+		t.Fatalf("directory replacement paths=%+v", plan.paths)
 	}
 }
 

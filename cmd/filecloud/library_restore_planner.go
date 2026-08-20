@@ -9,19 +9,20 @@ import (
 	"github.com/mingming-cn/filecloud/internal/object"
 )
 
-const _restorePreviewPathLimit = 100
-
-var (
-	_errRestoreSourcePathNotFound = errors.New("restore source path not found")
-	_errRestoreTypeConflict       = errors.New("restore source and current path types conflict")
+const (
+	_restorePreviewPathLimit    = 100
+	_restoreMaxDirectoryEntries = 100000
 )
+
+var _errRestoreSourcePathNotFound = errors.New("restore source path not found")
 
 type restoreObjectLoader func(kind, id string) ([]byte, error)
 
 type restorePlanBudget struct {
-	maxDepth     int
-	maxObjects   int
-	maxPathBytes int
+	maxDepth            int
+	maxObjects          int
+	maxPathBytes        int
+	maxDirectoryEntries int
 }
 
 type restorePlanInput struct {
@@ -58,17 +59,19 @@ type restorePlanner struct {
 	input  restorePlanInput
 	budget restorePlanBudget
 
-	directories map[string]object.Directory
-	files       map[string]object.File
-	synthesized map[string][]byte
-	active      map[string]bool
-	activeWalk  map[string]bool
-	changed     map[string]struct{}
-	objectCount int
+	directories          map[string]object.Directory
+	files                map[string]object.File
+	synthesized          map[string][]byte
+	active               map[string]bool
+	activeWalk           map[string]bool
+	changed              map[string]struct{}
+	typeReplacements     map[string]struct{}
+	removedDescendants   map[string]struct{}
+	preservedCurrentOnly map[string]struct{}
+	objectCount          int
 
-	createdCount              int64
-	updatedCount              int64
-	preservedCurrentOnlyCount int64
+	createdCount int64
+	updatedCount int64
 }
 
 func planRestoreOverlay(input restorePlanInput) (restorePlan, error) {
@@ -115,7 +118,9 @@ func planRestoreOverlay(input restorePlanInput) (restorePlan, error) {
 		paths:                     paths,
 		createdCount:              planner.createdCount,
 		updatedCount:              planner.updatedCount,
-		preservedCurrentOnlyCount: planner.preservedCurrentOnlyCount,
+		typeReplacementCount:      int64(len(planner.typeReplacements)),
+		removedDescendantCount:    int64(len(planner.removedDescendants)),
+		preservedCurrentOnlyCount: int64(len(planner.preservedCurrentOnly)),
 		changedPathCount:          int64(len(changed)),
 		previewTruncated:          len(changed) > _restorePreviewPathLimit,
 	}
@@ -137,16 +142,19 @@ func newRestorePlanner(input restorePlanInput) (*restorePlanner, error) {
 	if input.Load == nil {
 		return nil, errors.New("restore object loader is required")
 	}
-	budget := restorePlanBudget{maxDepth: _mergeMaxDepth, maxObjects: _mergeMaxObjects, maxPathBytes: _mergeMaxPath}
+	budget := restorePlanBudget{maxDepth: _mergeMaxDepth, maxObjects: _mergeMaxObjects,
+		maxPathBytes: _mergeMaxPath, maxDirectoryEntries: _restoreMaxDirectoryEntries}
 	if input.Budget != nil {
 		budget = *input.Budget
 	}
-	if budget.maxDepth < 1 || budget.maxObjects < 1 || budget.maxPathBytes < 1 {
+	if budget.maxDepth < 1 || budget.maxObjects < 1 || budget.maxPathBytes < 1 || budget.maxDirectoryEntries < 1 {
 		return nil, errors.New("restore planner budgets must be positive")
 	}
 	return &restorePlanner{input: input, budget: budget, directories: make(map[string]object.Directory),
 		files: make(map[string]object.File), synthesized: make(map[string][]byte), active: make(map[string]bool),
-		activeWalk: make(map[string]bool), changed: make(map[string]struct{})}, nil
+		activeWalk: make(map[string]bool), changed: make(map[string]struct{}),
+		typeReplacements: make(map[string]struct{}), removedDescendants: make(map[string]struct{}),
+		preservedCurrentOnly: make(map[string]struct{})}, nil
 }
 
 func restorePathParts(path string) []string {
@@ -171,6 +179,9 @@ func (planner *restorePlanner) loadDirectory(id string) (object.Directory, error
 		if err != nil {
 			return object.Directory{}, fmt.Errorf("restore synthesized directory %s is not canonical: %w", id, err)
 		}
+		if err := planner.checkDirectoryEntries(len(directory.Entries)); err != nil {
+			return object.Directory{}, err
+		}
 		planner.directories[id] = directory
 		return directory, nil
 	}
@@ -184,6 +195,9 @@ func (planner *restorePlanner) loadDirectory(id string) (object.Directory, error
 	directory, err := object.VerifyDirectory(data, id)
 	if err != nil {
 		return object.Directory{}, fmt.Errorf("restore directory %s is not canonical: %w", id, err)
+	}
+	if err := planner.checkDirectoryEntries(len(directory.Entries)); err != nil {
+		return object.Directory{}, err
 	}
 	planner.directories[id] = directory
 	return directory, nil
@@ -215,6 +229,13 @@ func (planner *restorePlanner) countObject() error {
 	planner.objectCount++
 	if planner.objectCount > planner.budget.maxObjects {
 		return errors.New("restore planner exceeds object budget")
+	}
+	return nil
+}
+
+func (planner *restorePlanner) checkDirectoryEntries(count int) error {
+	if count > planner.budget.maxDirectoryEntries {
+		return errors.New("restore planner exceeds directory entry budget")
 	}
 	return nil
 }
@@ -277,7 +298,7 @@ func (planner *restorePlanner) applyPath(current, source restorePlanNode, parts 
 		return planner.buildMissingPath(source, parts, index, path, root)
 	}
 	if current.kind != source.kind {
-		return restorePlanNode{}, _errRestoreTypeConflict
+		return planner.replaceNode(current, source, path, root)
 	}
 	currentDirectory, err := planner.loadDirectory(current.id)
 	if err != nil {
@@ -321,6 +342,9 @@ func (planner *restorePlanner) applyPath(current, source restorePlanNode, parts 
 		entries = append(entries, scanEntry{name: name, kind: child.kind, id: child.id, modified: child.mtime})
 	}
 	sort.Slice(entries, func(left, right int) bool { return entries[left].name < entries[right].name })
+	if err := planner.checkDirectoryEntries(len(entries)); err != nil {
+		return restorePlanNode{}, err
+	}
 	data, id, err := canonicalDirectory(path, entries)
 	if err != nil {
 		return restorePlanNode{}, err
@@ -365,7 +389,11 @@ func (planner *restorePlanner) buildMissingPath(source restorePlanNode, parts []
 	if err != nil {
 		return restorePlanNode{}, err
 	}
-	data, id, err := canonicalDirectory(path, []scanEntry{{name: name, kind: child.kind, id: child.id, modified: child.mtime}})
+	entries := []scanEntry{{name: name, kind: child.kind, id: child.id, modified: child.mtime}}
+	if err := planner.checkDirectoryEntries(len(entries)); err != nil {
+		return restorePlanNode{}, err
+	}
+	data, id, err := canonicalDirectory(path, entries)
 	if err != nil {
 		return restorePlanNode{}, err
 	}
@@ -391,7 +419,7 @@ func (planner *restorePlanner) mergeNode(current, source restorePlanNode, path s
 		return source, nil
 	}
 	if current.kind != source.kind {
-		return restorePlanNode{}, _errRestoreTypeConflict
+		return planner.replaceNode(current, source, path, root)
 	}
 	switch source.kind {
 	case "File":
@@ -413,6 +441,45 @@ func (planner *restorePlanner) mergeNode(current, source restorePlanNode, path s
 	default:
 		return restorePlanNode{}, errors.New("restore tree contains an invalid object type")
 	}
+}
+
+func (planner *restorePlanner) replaceNode(current, source restorePlanNode, path string, root bool) (restorePlanNode, error) {
+	if root {
+		return restorePlanNode{}, errors.New("restore cannot replace the root object type")
+	}
+	if err := planner.validateResultPath(path); err != nil {
+		return restorePlanNode{}, err
+	}
+	if err := planner.walkNodeDescendants(current, path, planner.recordRemovedDescendant); err != nil {
+		return restorePlanNode{}, err
+	}
+	if err := planner.walkNodeDescendants(source, path, planner.recordCreated); err != nil {
+		return restorePlanNode{}, err
+	}
+	planner.recordTypeReplacement(path)
+	return source, nil
+}
+
+func (planner *restorePlanner) walkNodeDescendants(node restorePlanNode, path string, visit func(string)) error {
+	if node.kind == "File" {
+		_, err := planner.loadFile(node.id)
+		return err
+	}
+	if node.kind != "Directory" {
+		return errors.New("restore tree contains an invalid object type")
+	}
+	directory, err := planner.loadDirectory(node.id)
+	if err != nil {
+		return err
+	}
+	for _, entry := range directory.Entries {
+		childPath := path + "/" + entry.Name
+		if err := planner.walkSubtree(restorePlanNode{present: true, kind: entry.Type, id: entry.ID,
+			mtime: entry.ModifiedAt}, childPath, visit); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (planner *restorePlanner) mergeDirectories(current, source restorePlanNode, path string, root bool) (restorePlanNode, error) {
@@ -444,6 +511,9 @@ func (planner *restorePlanner) mergeDirectories(current, source restorePlanNode,
 		ordered = append(ordered, name)
 	}
 	sort.Strings(ordered)
+	if err := planner.checkDirectoryEntries(len(ordered)); err != nil {
+		return restorePlanNode{}, err
+	}
 	entries := make([]scanEntry, 0, len(ordered))
 	for _, name := range ordered {
 		currentEntry, currentOK := currentEntries[name]
@@ -518,13 +588,31 @@ func (planner *restorePlanner) recordSynthesizedDirectory(id string, data []byte
 }
 
 func (planner *restorePlanner) recordCreated(path string) {
+	if _, exists := planner.changed[path]; exists {
+		return
+	}
 	planner.createdCount++
 	planner.changed[path] = struct{}{}
 }
 
 func (planner *restorePlanner) recordUpdated(path string) {
+	if _, exists := planner.changed[path]; exists {
+		return
+	}
 	planner.updatedCount++
 	planner.changed[path] = struct{}{}
+}
+
+func (planner *restorePlanner) recordTypeReplacement(path string) {
+	if _, exists := planner.changed[path]; exists {
+		return
+	}
+	planner.typeReplacements[path] = struct{}{}
+	planner.changed[path] = struct{}{}
+}
+
+func (planner *restorePlanner) recordRemovedDescendant(path string) {
+	planner.removedDescendants[path] = struct{}{}
 }
 
 func (planner *restorePlanner) recordCreatedSubtree(node restorePlanNode, path string, root bool) error {
@@ -535,7 +623,9 @@ func (planner *restorePlanner) recordCreatedSubtree(node restorePlanNode, path s
 }
 
 func (planner *restorePlanner) recordPreservedSubtree(node restorePlanNode, path string) error {
-	return planner.walkSubtree(node, path, func(string) { planner.preservedCurrentOnlyCount++ })
+	return planner.walkSubtree(node, path, func(path string) {
+		planner.preservedCurrentOnly[path] = struct{}{}
+	})
 }
 
 func (planner *restorePlanner) walkSubtree(node restorePlanNode, path string, visit func(string)) error {
@@ -615,6 +705,9 @@ func (planner *restorePlanner) resultPaths(id, prefix string, depth int) ([]chec
 }
 
 func (planner *restorePlanner) validateResultPath(path string) error {
+	if strings.Count(path, "/")+1 > planner.budget.maxDepth {
+		return errors.New("restore planner exceeds directory depth budget")
+	}
 	if !object.ValidPath(path) || path == "." || len(path) > planner.budget.maxPathBytes {
 		return errors.New("restore planner exceeds path budget")
 	}
