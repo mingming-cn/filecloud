@@ -667,6 +667,69 @@ func TestLibraryRestoreConfirmPublishesFileRestoreAndConverges(t *testing.T) {
 	}
 }
 
+func TestLibraryRestoreAcceptsPublishedMergeSource(t *testing.T) {
+	state := newImportedBinding(t)
+	baseURL := mustServerURL(t, state.environment.server.URL)
+	token := []byte(state.environment.token)
+	base := state.binding.SyncBase
+	sourceData, sourceCommit, err := canonicalCommit(testClientUserID, testClientDeviceID, state.binding.SyncBaseRoot,
+		[]string{base}, func() time.Time { return time.Date(2026, 8, 9, 1, 2, 1, 0, time.UTC) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := putMetadata(t.Context(), baseURL, testClientLibraryID, token, "commits", sourceCommit, sourceData); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(state.worktree, "local"), []byte("current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRestoreTestSync(t, state.clientDir, state.worktree)
+	current := readTestBinding(t, state.clientDir, state.worktree)
+	mergedData, mergedCommit, err := canonicalCommit(testClientUserID, testClientDeviceID, current.SyncBaseRoot,
+		[]string{current.SyncBase, sourceCommit}, func() time.Time { return time.Date(2026, 8, 9, 1, 2, 2, 0, time.UTC) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := putMetadata(t.Context(), baseURL, testClientLibraryID, token, "commits", mergedCommit, mergedData); err != nil {
+		t.Fatal(err)
+	}
+	if _, conflict, err := updateRemoteHead(t.Context(), baseURL, testClientLibraryID, token, current.HeadETag, mergedCommit); err != nil || conflict {
+		t.Fatalf("publish merged history: conflict=%t err=%v", conflict, err)
+	}
+	runRestoreTestSync(t, state.clientDir, state.worktree)
+
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}
+	var preview bytes.Buffer
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--commit", sourceCommit, "--path", "local"}, nil, &preview, io.Discard, config); err != nil {
+		t.Fatalf("preview merge-source restore: %v", err)
+	}
+	pending := readTestPendingPublication(t, state.clientDir, state.worktree)
+	if pending.SourceCommit != sourceCommit || !strings.Contains(preview.String(), "source commit: "+sourceCommit) {
+		t.Fatalf("merge-source preview=%q pending=%+v", preview.String(), pending)
+	}
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--confirm", pending.CandidateCommit[:deleteCandidatePrefixLen]}, nil, io.Discard, io.Discard, config); err != nil {
+		t.Fatalf("confirm merge-source restore: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(state.worktree, "local")); err != nil || string(data) != "data" {
+		t.Fatalf("merge-source restored file=%q err=%v", data, err)
+	}
+	finalBinding := assertTestConverged(t, state.environment, state.clientDir, state.worktree)
+	options := bindOptions{base: baseURL, libraryID: testClientLibraryID, token: token}
+	for name, commitID := range map[string]string{
+		"source": sourceCommit, "previous Head": pending.ExpectedHead, "restore candidate": pending.CandidateCommit,
+	} {
+		reachable, err := _remoteCommitDescendsFrom(t.Context(), options, finalBinding.SyncBase, commitID,
+			finalBinding.UserID, _newReplayBudget())
+		if err != nil || !reachable {
+			t.Fatalf("%s Commit %s reachable from final Head %s = %t, error=%v",
+				name, commitID, finalBinding.SyncBase, reachable, err)
+		}
+	}
+}
+
 func TestLibraryRestorePreviewPersistsFixedCandidateWithoutMutation(t *testing.T) {
 	state := newImportedBinding(t)
 	sourceCommit := state.binding.SyncBase

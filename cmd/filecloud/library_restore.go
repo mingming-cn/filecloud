@@ -412,8 +412,8 @@ func fetchRestoreSourceWithOptions(ctx context.Context, options bindOptions, bin
 	if err != nil {
 		return historyInspectCommit{}, err
 	}
-	if commit.Role != "mainline" {
-		return historyInspectCommit{}, errors.New("restore source commit is not a published mainline commit")
+	if commit.Role != "mainline" && commit.Role != "merge-source" {
+		return historyInspectCommit{}, errors.New("restore source commit does not have a supported published history role")
 	}
 	return commit, nil
 }

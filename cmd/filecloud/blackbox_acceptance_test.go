@@ -453,6 +453,26 @@ func TestBuiltBinaryHistoryInspectReadOnlyAcceptance(t *testing.T) {
 	writeBlackBoxFile(t, worktree, "b.txt", "history-b\n")
 	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientDir, "--worktree", worktree)
 	binding := readTestBinding(t, clientDir, worktree)
+	baseURL := mustServerURL(t, spy.URL)
+	token := []byte(login.Session.AccessToken)
+	capturedData, capturedCommit, err := canonicalCommit(binding.UserID, binding.DeviceID, binding.SyncBaseRoot,
+		[]string{binding.SyncBase}, func() time.Time { return time.Date(2026, 8, 9, 1, 2, 1, 0, time.UTC) })
+	if err != nil {
+		t.Fatalf("construct built history merge source: %v", err)
+	}
+	mergedData, mergedCommit, err := canonicalCommit(binding.UserID, binding.DeviceID, binding.SyncBaseRoot,
+		[]string{binding.SyncBase, capturedCommit}, func() time.Time { return time.Date(2026, 8, 9, 1, 2, 2, 0, time.UTC) })
+	if err != nil {
+		t.Fatalf("construct built history merge: %v", err)
+	}
+	for id, data := range map[string][]byte{capturedCommit: capturedData, mergedCommit: mergedData} {
+		if err := putMetadata(t.Context(), baseURL, _blackBoxLibraryID, token, "commits", id, data); err != nil {
+			t.Fatalf("upload built history commit: %v", err)
+		}
+	}
+	if _, conflict, err := updateRemoteHead(t.Context(), baseURL, _blackBoxLibraryID, token, binding.HeadETag, mergedCommit); err != nil || conflict {
+		t.Fatalf("publish built history merge: conflict=%t err=%v", conflict, err)
+	}
 	stateDB, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
 		t.Fatalf("open history inspect state observer: %v", err)
@@ -466,10 +486,22 @@ func TestBuiltBinaryHistoryInspectReadOnlyAcceptance(t *testing.T) {
 	beforeWorktree := captureHistoryInspectWorktree(t, worktree)
 	armed.Store(true)
 
+	listOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "list", "--client-dir", clientDir,
+		"--worktree", worktree, "--include-merged")
+	if !bytes.Contains(listOutput, []byte(mergedCommit+" role=head ")) ||
+		!bytes.Contains(listOutput, []byte("  "+capturedCommit+" role=merge-source mainline="+mergedCommit+" ")) {
+		t.Fatalf("built merged history output missing attributed lineage: %s", listOutput)
+	}
 	commitOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientDir,
 		"--worktree", worktree, "--commit", binding.SyncBase)
 	if !bytes.Contains(commitOutput, []byte("CommitId="+binding.SyncBase)) || !bytes.Contains(commitOutput, []byte("Root="+binding.SyncBaseRoot)) {
 		t.Fatalf("history commit output missing identity: %s", commitOutput)
+	}
+	mergedSourceOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientDir,
+		"--worktree", worktree, "--commit", capturedCommit)
+	if !bytes.Contains(mergedSourceOutput, []byte("Role=merge-source")) ||
+		!bytes.Contains(mergedSourceOutput, []byte("MainlineCommitId="+mergedCommit)) {
+		t.Fatalf("history merge-source output missing role attribution: %s", mergedSourceOutput)
 	}
 	fileOutput := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientDir,
 		"--worktree", worktree, "--commit", binding.SyncBase, "--path", "a.txt")

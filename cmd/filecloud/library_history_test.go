@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -81,6 +82,171 @@ func TestLibraryHistoryListUsesBindingReadOnlyAndPrintsCompleteCommitIDs(t *test
 	}
 	if strings.Contains(output.String(), parent[:12]) && !strings.Contains(output.String(), parent+" ") {
 		t.Fatal("history output used a short commit id")
+	}
+}
+
+func TestLibraryHistoryListIncludesVerifiedMergedLineage(t *testing.T) {
+	state := newImportedBinding(t)
+	base := state.binding.SyncBase
+	root := state.binding.SyncBaseRoot
+	baseURL := mustServerURL(t, state.environment.server.URL)
+	token := []byte(state.environment.token)
+	now := func(second int) func() time.Time {
+		return func() time.Time { return time.Date(2026, 8, 9, 12, 0, second, 0, time.UTC) }
+	}
+	capturedData, captured, err := canonicalCommit(testClientUserID, testClientDeviceID, root, []string{base}, now(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nestedData, nested, err := canonicalCommit(testClientUserID, testClientDeviceID, root, []string{base, captured}, now(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mergedData, merged, err := canonicalCommit(testClientUserID, testClientDeviceID, root, []string{base, nested}, now(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, data := range map[string][]byte{captured: capturedData, nested: nestedData, merged: mergedData} {
+		if err := putMetadata(t.Context(), baseURL, testClientLibraryID, token, "commits", id, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, conflict, err := updateRemoteHead(t.Context(), baseURL, testClientLibraryID, token, state.binding.HeadETag, merged); err != nil || conflict {
+		t.Fatalf("publish merged history: conflict=%t err=%v", conflict, err)
+	}
+
+	baseArgs := []string{"library", "history", "list", "--client-dir", state.clientDir, "--worktree", state.worktree}
+	var defaultOutput bytes.Buffer
+	if err := runTest(t.Context(), baseArgs, strings.NewReader(""), &defaultOutput, io.Discard); err != nil {
+		t.Fatalf("list default history: %v", err)
+	}
+	if strings.Contains(defaultOutput.String(), captured) || strings.Contains(defaultOutput.String(), nested) {
+		t.Fatalf("default history exposed merge sources: %q", defaultOutput.String())
+	}
+
+	var mergedOutput bytes.Buffer
+	if err := runTest(t.Context(), append(baseArgs, "--include-merged"), strings.NewReader(""), &mergedOutput, io.Discard); err != nil {
+		t.Fatalf("list merged history: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(mergedOutput.String()), "\n")
+	if len(lines) < 4 || !strings.HasPrefix(lines[0], merged+" role=head ") ||
+		!strings.HasPrefix(lines[1], "  "+nested+" role=merge-source mainline="+merged+" ") ||
+		!strings.HasPrefix(lines[2], "  "+captured+" role=merge-source mainline="+merged+" ") ||
+		!strings.HasPrefix(lines[3], base+" role=head ") {
+		t.Fatalf("merged history output = %q", mergedOutput.String())
+	}
+
+	if _, err := state.environment.store.DB().ExecContext(t.Context(), `
+		UPDATE published_commit_roles SET mainline_commit_id = ?
+		WHERE owner_user_id = ? AND library_id = ? AND commit_id = ?`,
+		base, testClientUserID, testClientLibraryID, nested); err != nil {
+		t.Fatal(err)
+	}
+	var rejectedOutput bytes.Buffer
+	err = runTest(t.Context(), append(baseArgs, "--include-merged"), strings.NewReader(""), &rejectedOutput, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), _incompleteMergedHistoryError) || rejectedOutput.Len() != 0 {
+		t.Fatalf("wrongly attributed source error=%v output=%q", err, rejectedOutput.String())
+	}
+}
+
+func TestLibraryHistoryListMergedSourceBudgetIsAtomic(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		count          int
+		invalid        string
+		repeatMainline bool
+		wantSources    int
+	}{
+		{name: "1024 sources", count: 1024, wantSources: 1024},
+		{name: "1025 sources", count: 1025},
+		{name: "deduplicated sources", count: 2, repeatMainline: true, wantSources: 2},
+		{name: "cycle", count: 2, invalid: "cycle"},
+		{name: "zero-parent source", count: 1, invalid: "zero-parent"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			environment := newLibraryCLIEnvironment(t, library.Config{})
+			clientDir, worktree := newClientPaths(t)
+			sources := make([]string, test.count)
+			indexes := make(map[string]int, test.count)
+			for index := range test.count {
+				sources[index] = fmt.Sprintf("%064x", index+1)
+				indexes[sources[index]] = index
+			}
+			mainline := fmt.Sprintf("%064x", test.count+1)
+			base := fmt.Sprintf("%064x", test.count+2)
+			root := fmt.Sprintf("%064x", test.count+3)
+			var armed atomic.Bool
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !armed.Load() {
+					environment.handler.ServeHTTP(w, r)
+					return
+				}
+				historyPath := "/v1/libraries/" + testClientLibraryID + "/history"
+				if r.URL.Path == historyPath {
+					commit := historyCommandCommit{
+						CommitID: mainline, AuthorUserID: testClientUserID, CreatedAt: "2026-08-09T12:00:00Z",
+						DeviceID: testClientDeviceID, Message: "sync", Parents: []string{base, sources[0]}, Root: root,
+					}
+					commits := []historyCommandCommit{commit}
+					if test.repeatMainline {
+						commits = append(commits, commit)
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"RetCode": 0, "Message": "success", "History": map[string]any{
+							"AnchorCommitId": mainline, "NextPageToken": "", "Commits": commits,
+						},
+					})
+					return
+				}
+				commitID, found := strings.CutPrefix(r.URL.Path, historyPath+"/")
+				index, exists := indexes[commitID]
+				if !found || !exists {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				parents := []string{base}
+				switch {
+				case index+1 < len(sources):
+					parents = append(parents, sources[index+1])
+				case test.invalid == "cycle":
+					parents = append(parents, sources[0])
+				case test.invalid == "zero-parent":
+					parents = []string{}
+				}
+				w.Header().Set("ETag", `"`+commitID+`"`)
+				w.Header().Set("Cache-Control", "private, immutable")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"RetCode": 0, "Message": "success", "HistoryCommit": historyInspectCommit{
+						CommitID: commitID, Role: "merge-source", MainlineCommitID: mainline,
+						AuthorUserID: testClientUserID, CreatedAt: "2026-08-09T12:00:00Z", DeviceID: testClientDeviceID,
+						Message: "sync", Parents: parents, Root: root,
+					},
+				})
+			}))
+			t.Cleanup(proxy.Close)
+			if err := runTest(t.Context(), bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testClientDeviceID),
+				strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+				t.Fatalf("bind budget fixture: %v", err)
+			}
+			armed.Store(true)
+
+			var output bytes.Buffer
+			err := runTest(t.Context(), []string{"library", "history", "list", "--client-dir", clientDir,
+				"--worktree", worktree, "--include-merged"}, strings.NewReader(""), &output, io.Discard)
+			if test.wantSources != 0 {
+				if err != nil || strings.Count(output.String(), "role=merge-source") != test.wantSources {
+					t.Fatalf("history budget count=%d error=%v source lines=%d, want %d", test.count, err,
+						strings.Count(output.String(), "role=merge-source"), test.wantSources)
+				}
+				for _, sourceID := range sources {
+					if count := strings.Count(output.String(), "  "+sourceID+" role=merge-source "); count != 1 {
+						t.Fatalf("merge source %s output count=%d, want 1", sourceID, count)
+					}
+				}
+			} else if err == nil || !strings.Contains(err.Error(), _incompleteMergedHistoryError) || output.Len() != 0 {
+				t.Fatalf("rejected merged history error=%v output bytes=%d", err, output.Len())
+			}
+		})
 	}
 }
 

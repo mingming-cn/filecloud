@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	_maximumHistoryPageTokenSize = 4096
-	_historyReadAttempts         = 3
+	_maximumHistoryPageTokenSize  = 4096
+	_maximumMergedHistoryCommits  = 1024
+	_historyReadAttempts          = 3
+	_incompleteMergedHistoryError = "merged history could not be fully expanded"
 )
 
 type historyCommandCommit struct {
@@ -39,16 +41,23 @@ type historyCommandResponse struct {
 	NextPageToken  string                 `json:"NextPageToken"`
 }
 
+type historyListEntry struct {
+	commit     historyCommandCommit
+	role       string
+	mainlineID string
+}
+
 func runLibraryHistoryList(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr error) {
 	flags := newFlagSet("library history list", stderr)
 	clientDir := flags.String("client-dir", "", "Filecloud client state directory")
 	worktree := flags.String("worktree", "", "Bound worktree directory")
 	pageSize := flags.Int("page-size", 100, "Commits per page")
 	pageToken := flags.String("page-token", "", "Opaque next-page token")
+	includeMerged := flags.Bool("include-merged", false, "Expand published merge-source lineage")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	const usage = "usage: filecloud library history list --client-dir path --worktree path [--page-size n] [--page-token token]"
+	const usage = "usage: filecloud library history list --client-dir path --worktree path [--page-size n] [--page-token token] [--include-merged]"
 	if *clientDir == "" || *worktree == "" || flags.NArg() != 0 {
 		return errors.New(usage)
 	}
@@ -109,16 +118,85 @@ func runLibraryHistoryList(ctx context.Context, args []string, stdout, stderr io
 	if err != nil {
 		return fmt.Errorf("invalid list library history response: %w", err)
 	}
-	for _, commit := range response.Commits {
-		if _, err := fmt.Fprintf(stdout, "%s author=%s created_at=%s device=%s message=%q parents=%d root=%s\n",
-			commit.CommitID, commit.AuthorUserID, commit.CreatedAt, commit.DeviceID[:8], commit.Message, len(commit.Parents), commit.Root); err != nil {
-			return fmt.Errorf("write library history: %w", err)
+	client := historyInspectClient{binding: binding, base: base, token: token}
+	entries, err := buildHistoryListEntries(ctx, &client, response.Commits, *includeMerged)
+	if err != nil {
+		return err
+	}
+	var output bytes.Buffer
+	for _, entry := range entries {
+		if err := writeHistoryListEntry(&output, entry); err != nil {
+			return err
 		}
 	}
 	if response.NextPageToken != "" {
-		if _, err := fmt.Fprintf(stdout, "next_page_token=%s\n", response.NextPageToken); err != nil {
-			return fmt.Errorf("write library history cursor: %w", err)
+		if _, err := fmt.Fprintf(&output, "next_page_token=%s\n", response.NextPageToken); err != nil {
+			return fmt.Errorf("format library history cursor: %w", err)
 		}
+	}
+	if _, err := io.Copy(stdout, &output); err != nil {
+		return fmt.Errorf("write library history: %w", err)
+	}
+	return nil
+}
+
+func buildHistoryListEntries(ctx context.Context, client *historyInspectClient, mainline []historyCommandCommit, includeMerged bool) ([]historyListEntry, error) {
+	entries := make([]historyListEntry, 0, len(mainline))
+	seenSources := make(map[string]struct{})
+	for _, commit := range mainline {
+		entries = append(entries, historyListEntry{commit: commit, role: "head"})
+		if !includeMerged || len(commit.Parents) != 2 {
+			continue
+		}
+		current := commit.Parents[1]
+		lineageSeen := make(map[string]struct{})
+		for {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("%s: %w", _incompleteMergedHistoryError, err)
+			}
+			if _, exists := lineageSeen[current]; exists {
+				return nil, errors.New(_incompleteMergedHistoryError + ": invalid lineage")
+			}
+			lineageSeen[current] = struct{}{}
+			source, err := client.fetchCommit(ctx, current)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", _incompleteMergedHistoryError, err)
+			}
+			if source.Role != "merge-source" || source.MainlineCommitID != commit.CommitID || len(source.Parents) == 0 {
+				return nil, errors.New(_incompleteMergedHistoryError + ": invalid lineage")
+			}
+			if _, exists := seenSources[current]; exists {
+				break
+			}
+			if len(seenSources) == _maximumMergedHistoryCommits {
+				return nil, errors.New(_incompleteMergedHistoryError + ": source limit exceeds 1024 commits")
+			}
+			seenSources[current] = struct{}{}
+			entries = append(entries, historyListEntry{commit: historyCommandCommit{
+				CommitID: source.CommitID, AuthorUserID: source.AuthorUserID, CreatedAt: source.CreatedAt,
+				DeviceID: source.DeviceID, Message: source.Message, Parents: source.Parents, Root: source.Root,
+			}, role: source.Role, mainlineID: source.MainlineCommitID})
+			if len(source.Parents) == 1 {
+				break
+			}
+			current = source.Parents[1]
+		}
+	}
+	return entries, nil
+}
+
+func writeHistoryListEntry(output io.Writer, entry historyListEntry) error {
+	indent := ""
+	attribution := ""
+	if entry.mainlineID != "" {
+		indent = "  "
+		attribution = " mainline=" + entry.mainlineID
+	}
+	commit := entry.commit
+	if _, err := fmt.Fprintf(output, "%s%s role=%s%s author=%s created_at=%s device=%s message=%q parents=%d root=%s\n",
+		indent, commit.CommitID, entry.role, attribution, commit.AuthorUserID, commit.CreatedAt, commit.DeviceID[:8],
+		commit.Message, len(commit.Parents), commit.Root); err != nil {
+		return fmt.Errorf("format library history: %w", err)
 	}
 	return nil
 }
@@ -184,7 +262,7 @@ func decodeHistoryCommandResponse(data []byte) (historyCommandResponse, error) {
 	}
 	for _, commit := range response.Commits {
 		if !object.ValidID(commit.CommitID) || !validClientUUID(commit.AuthorUserID) || !validClientUUID(commit.DeviceID) ||
-			!validHistoryTimestamp(commit.CreatedAt) || !object.ValidID(commit.Root) || commit.Parents == nil {
+			!validHistoryTimestamp(commit.CreatedAt) || !object.ValidID(commit.Root) || commit.Parents == nil || len(commit.Parents) > 2 {
 			return historyCommandResponse{}, errors.New("invalid history commit")
 		}
 		for _, parent := range commit.Parents {
