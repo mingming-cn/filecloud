@@ -35,10 +35,12 @@ func platformMatrixScenarios() []platformMatrixScenario {
 		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestConflictFallbackAttestedVectors"},
 		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestLibrarySyncLongFallbackCandidateHistoryFixedReplayVector"},
 		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestCrossPlatformFixedObjectIDs"},
+		{category: "fixed vectors", packagePath: "./cmd/filecloud", test: "TestRestorePlannerDirectoryOverlayFixedVector"},
 		{category: "fixed convergence", packagePath: "./cmd/filecloud", test: "TestCrossPlatformDeterministicConvergence"},
 		{category: "correctness oracle", packagePath: "./cmd/filecloud", test: "TestPlatformCorrectnessLoop"},
 		{category: "real process acceptance", packagePath: "./cmd/filecloud", test: "TestBuiltBinaryEndToEndAcceptance"},
 		{category: "real process acceptance", packagePath: "./cmd/filecloud", test: "TestBuiltBinaryHistoryInspectReadOnlyAcceptance"},
+		{category: "real process acceptance", packagePath: "./cmd/filecloud", test: "TestBuiltBinaryDirectoryRestoreAcceptance"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindConcurrentInitializationAdoptsWinner"},
 		{category: "first binding", packagePath: "./cmd/filecloud", test: "TestLibraryBindImportsLocalSnapshotAndSyncNoOps"},
@@ -117,10 +119,12 @@ func TestPlatformMatrixWiresFullScenarioSet(t *testing.T) {
 		"TestConflictFallbackAttestedVectors",
 		"TestLibrarySyncLongFallbackCandidateHistoryFixedReplayVector",
 		"TestCrossPlatformFixedObjectIDs",
+		"TestRestorePlannerDirectoryOverlayFixedVector",
 		"TestCrossPlatformDeterministicConvergence",
 		"TestPlatformCorrectnessLoop",
 		"TestBuiltBinaryEndToEndAcceptance",
 		"TestBuiltBinaryHistoryInspectReadOnlyAcceptance",
+		"TestBuiltBinaryDirectoryRestoreAcceptance",
 		"TestLibraryBindDoubleEmptyConvergesAndUnbindIsLocalOnly",
 		"TestScanRegularFileRetriesConcurrentRewrite",
 		"TestFSActionSubprocessCrashMatrix",
@@ -203,6 +207,16 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		Kind: "fixed-vectors", Scenario: "cross-platform fixed vectors", Platform: "linux", Filesystem: "ext4",
 		VectorIDs: expectedCrossPlatformVectorIDs(),
 	}
+	restore := platformAttestation{
+		Kind: "restore", Scenario: "real binary directory and root restore", Platform: "linux", Filesystem: "ext4",
+		Head: id, SyncBase: id, HeadRoot: root, BaseRoot: root, Snapshot: root, ReachableObjects: 8,
+		SourceCommit: digest, SourceRoot: strings.Repeat("d", 64), SourcePath: ".", PreviousHead: strings.Repeat("e", 64),
+		ExpectedHead: strings.Repeat("e", 64), CandidateCommit: id, ResultRoot: root,
+		CreatedCount: new(int64(0)), UpdatedCount: new(int64(1)), TypeReplacementCount: new(int64(0)),
+		RemovedDescendantCount: new(int64(0)), PreservedCurrentOnlyCount: new(int64(2)),
+		PendingPublicationRows: new(0), PendingCheckoutRows: new(0),
+		SourceReachable: true, PreviousHeadReachable: true,
+	}
 	for _, test := range []struct {
 		name                 string
 		attestations         []platformAttestation
@@ -222,6 +236,14 @@ func TestPlatformAttestationValidation(t *testing.T) {
 		{name: "valid APFS primitives", attestations: []platformAttestation{primitives}, required: map[string]string{"filesystem primitives": "filesystem-primitives"}, platform: "darwin", filesystem: "apfs"},
 		{name: "unknown APFS casefold lookup", attestations: []platformAttestation{func() platformAttestation { value := primitives; value.CasefoldLookup = "unknown"; return value }()}, required: map[string]string{"filesystem primitives": "filesystem-primitives"}, platform: "darwin", filesystem: "apfs", wantErr: true},
 		{name: "valid fixed vectors", attestations: []platformAttestation{vectors}, required: map[string]string{"cross-platform fixed vectors": "fixed-vectors"}},
+		{name: "valid restore", attestations: []platformAttestation{restore}, required: map[string]string{"real binary directory and root restore": "restore"}},
+		{name: "restore Head drift", attestations: []platformAttestation{func() platformAttestation { value := restore; value.Head = digest; return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
+		{name: "restore invalid source path", attestations: []platformAttestation{func() platformAttestation { value := restore; value.SourcePath = "../outside"; return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
+		{name: "restore type replacement", attestations: []platformAttestation{func() platformAttestation { value := restore; value.TypeReplacementCount = new(int64(1)); return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
+		{name: "restore no changes", attestations: []platformAttestation{func() platformAttestation { value := restore; value.UpdatedCount = new(int64(0)); return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
+		{name: "restore source unreachable", attestations: []platformAttestation{func() platformAttestation { value := restore; value.SourceReachable = false; return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
+		{name: "restore pending checkout", attestations: []platformAttestation{func() platformAttestation { value := restore; value.PendingCheckoutRows = new(1); return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
+		{name: "restore missing explicit zero", attestations: []platformAttestation{func() platformAttestation { value := restore; value.RemovedDescendantCount = nil; return value }()}, required: map[string]string{"real binary directory and root restore": "restore"}, wantErr: true},
 		{name: "fixed vector drift", attestations: []platformAttestation{func() platformAttestation {
 			value := vectors
 			value.VectorIDs = maps.Clone(value.VectorIDs)
@@ -344,6 +366,28 @@ func validatePlatformAttestations(attestations []platformAttestation, required m
 				!slices.Equal(confirmed, preserved) ||
 				slices.ContainsFunc(confirmed, func(id string) bool { return !object.ValidID(id) }) {
 				return fmt.Errorf("platform recovery attestation %q is invalid", attestation.Scenario)
+			}
+		case "restore":
+			validIDs := object.ValidID(attestation.SourceCommit) && object.ValidID(attestation.SourceRoot) &&
+				object.ValidID(attestation.PreviousHead) && object.ValidID(attestation.ExpectedHead) &&
+				object.ValidID(attestation.CandidateCommit) && object.ValidID(attestation.ResultRoot) &&
+				object.ValidID(attestation.Head) && object.ValidID(attestation.SyncBase) &&
+				object.ValidID(attestation.HeadRoot) && object.ValidID(attestation.BaseRoot) && object.ValidID(attestation.Snapshot)
+			validResult := attestation.PreviousHead == attestation.ExpectedHead &&
+				attestation.CandidateCommit == attestation.Head && attestation.Head == attestation.SyncBase &&
+				attestation.ResultRoot == attestation.HeadRoot && attestation.HeadRoot == attestation.BaseRoot &&
+				attestation.HeadRoot == attestation.Snapshot
+			statsPresent := attestation.CreatedCount != nil && attestation.UpdatedCount != nil &&
+				attestation.TypeReplacementCount != nil && attestation.RemovedDescendantCount != nil &&
+				attestation.PreservedCurrentOnlyCount != nil && attestation.PendingPublicationRows != nil &&
+				attestation.PendingCheckoutRows != nil
+			validStats := statsPresent && *attestation.CreatedCount >= 0 && *attestation.UpdatedCount >= 0 &&
+				*attestation.CreatedCount+*attestation.UpdatedCount > 0 && *attestation.TypeReplacementCount == 0 &&
+				*attestation.RemovedDescendantCount == 0 && *attestation.PreservedCurrentOnlyCount > 0
+			if !validIDs || !object.ValidPath(attestation.SourcePath) || !validResult || !validStats ||
+				*attestation.PendingPublicationRows != 0 || *attestation.PendingCheckoutRows != 0 ||
+				!attestation.SourceReachable || !attestation.PreviousHeadReachable || attestation.ReachableObjects < 2 {
+				return fmt.Errorf("platform restore attestation %q is invalid", attestation.Scenario)
 			}
 		case "fixed-vectors":
 			if !maps.Equal(attestation.VectorIDs, expectedCrossPlatformVectorIDs()) {
@@ -589,7 +633,7 @@ func TestCrossPlatformFixedObjectIDs(t *testing.T) {
 }
 
 func computeCrossPlatformVectorIDs() (map[string]string, error) {
-	result := make(map[string]string, 7)
+	result := make(map[string]string, 9)
 	result["block/one-byte"] = object.ID([]byte("a"))
 
 	_, emptyFileID, err := object.Canonicalize("files", []byte(`{"Version":1,"Size":"0","Blocks":[],"Type":"File"}`))
@@ -656,6 +700,13 @@ func computeCrossPlatformVectorIDs() (map[string]string, error) {
 		return nil, err
 	}
 	result["merge/directory"] = mergedID
+
+	restore, err := computeRestoreFixedVector()
+	if err != nil {
+		return nil, err
+	}
+	result["restore/result-root"] = restore.plan.resultRoot
+	result["restore/candidate-commit"] = restore.candidateID
 	return result, nil
 }
 
@@ -668,6 +719,8 @@ func expectedCrossPlatformVectorIDs() map[string]string {
 		"mtime/commit":             "9fdc5eae97573252943f980fdeea40022078064e3c977d2d194561b8fbb0002b",
 		"conflict/directory":       "4c4f5c0368f699b0b1c2dcc5bcf8245f5850bba8e68a85038272ef1482baa84c",
 		"merge/directory":          "46fd9a1f6679629303c712ce883d20252ea078e6f7983ebeb1afdaab340f8ce8",
+		"restore/result-root":      "cbdaed3bd32f21da9876622b002c75d8bd986be6e0bfd13c5f8e924146331059",
+		"restore/candidate-commit": "f6439d57b0b22e7f068143b9e5c9d8a4bbee9efe97e6d995b48a7fab7a1916d1",
 	}
 }
 
@@ -680,8 +733,8 @@ func TestRequiredPlatformAttestationCounts(t *testing.T) {
 		{platform: "darwin", filesystem: "apfs"},
 		{platform: "windows", filesystem: "ntfs"},
 	} {
-		if got := len(requiredPlatformAttestations(test.platform, test.filesystem)); got != 113 {
-			t.Fatalf("%s/%s attestations=%d, want 113", test.platform, test.filesystem, got)
+		if got := len(requiredPlatformAttestations(test.platform, test.filesystem)); got != 114 {
+			t.Fatalf("%s/%s attestations=%d, want 114", test.platform, test.filesystem, got)
 		}
 	}
 }
@@ -695,6 +748,7 @@ func uniqueSortedDigests(values []string) []string {
 func requiredPlatformAttestations(platform, filesystem string) map[string]string {
 	result := map[string]string{
 		"real binary CLI lifecycle":                       "convergence",
+		"real binary directory and root restore":          "restore",
 		"publisher import":                                "convergence",
 		"subscriber checkout":                             "convergence",
 		"independent merge subscriber":                    "convergence",

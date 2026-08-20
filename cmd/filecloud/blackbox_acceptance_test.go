@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
@@ -20,6 +21,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mingming-cn/filecloud/internal/acceptance"
 )
 
 const (
@@ -145,6 +148,233 @@ func TestBuiltBinaryEndToEndAcceptance(t *testing.T) {
 	if output, err := command.CombinedOutput(); err == nil || !bytes.Contains(output, []byte("Unauthorized")) {
 		t.Fatalf("inspect with revoked token error=%v output=%s", err, output)
 	}
+	server.stop(t)
+}
+
+func TestBuiltBinaryDirectoryRestoreAcceptance(t *testing.T) {
+	if os.Getenv("FILECLOUD_PLATFORM_MATRIX_CHILD") != "1" {
+		t.Skip("runs inside the native 1B platform matrix")
+	}
+	root := os.Getenv("FILECLOUD_ACCEPTANCE_ROOT")
+	if root == "" {
+		t.Fatal("FILECLOUD_ACCEPTANCE_ROOT is required")
+	}
+	testRoot, err := os.MkdirTemp(root, ".filecloud-restore-blackbox-")
+	if err != nil {
+		t.Fatalf("create restore black-box root: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(testRoot); err != nil {
+			t.Errorf("remove restore black-box root: %v", err)
+		}
+	})
+
+	binaryName := "filecloud"
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
+	binary := filepath.Join(testRoot, binaryName)
+	build := exec.CommandContext(t.Context(), "go", "build", "-trimpath", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build restore CLI: %v\n%s", err, output)
+	}
+	dataDir := filepath.Join(testRoot, "data")
+	password := []byte("restore-black-box-password-1234\n")
+	defer clear(password)
+	runBlackBoxCLI(t, binary, nil, "init", "--data-dir", dataDir)
+	runBlackBoxCLI(t, binary, password, "user", "add", "--data-dir", dataDir, "--username", "restore-black-box", "--password-stdin")
+	server := startBlackBoxServer(t, binary, dataDir, "127.0.0.1:0")
+	serverURL := "http://" + server.address
+	loginOutput := runBlackBoxCLI(t, binary, password, "login", "--server", serverURL, "--username", "restore-black-box",
+		"--device-name", "restore-acceptance", "--password-stdin")
+	var login struct {
+		Session struct{ AccessToken string }
+	}
+	if err := json.Unmarshal(loginOutput, &login); err != nil || login.Session.AccessToken == "" {
+		t.Fatalf("decode restore login: token_present=%t error=%v", login.Session.AccessToken != "", err)
+	}
+	tokenInput := []byte(login.Session.AccessToken + "\n")
+	defer clear(tokenInput)
+	runBlackBoxCLI(t, binary, tokenInput, "library", "create", "--server", serverURL,
+		"--library-id", _blackBoxLibraryID, "--name", "Restore Acceptance", "--token-stdin")
+
+	clientA := filepath.Join(testRoot, "client-a")
+	clientB := filepath.Join(testRoot, "client-b")
+	worktreeA := filepath.Join(testRoot, "worktree-a")
+	worktreeB := filepath.Join(testRoot, "worktree-b")
+	for _, worktree := range []string{worktreeA, worktreeB} {
+		if err := os.Mkdir(worktree, 0o755); err != nil {
+			t.Fatalf("create restore worktree %s: %v", filepath.Base(worktree), err)
+		}
+	}
+	runBlackBoxCLI(t, binary, tokenInput, "library", "bind", "--client-dir", clientA, "--server", serverURL,
+		"--library-id", _blackBoxLibraryID, "--worktree", worktreeA, "--device-id", _blackBoxDeviceAID, "--token-stdin")
+	runBlackBoxCLI(t, binary, tokenInput, "library", "bind", "--client-dir", clientB, "--server", serverURL,
+		"--library-id", _blackBoxLibraryID, "--worktree", worktreeB, "--device-id", _blackBoxDeviceBID, "--token-stdin")
+
+	sourceMtime := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := os.Mkdir(filepath.Join(worktreeA, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		"docs/deleted.txt":     "source-deleted",
+		"docs/mtime-only.txt":  "stable-mtime-content",
+		"docs/overwritten.txt": "source-overwritten",
+		"root.txt":             "source-root",
+	} {
+		writeBlackBoxFile(t, worktreeA, path, content)
+		setBlackBoxMtime(t, filepath.Join(worktreeA, filepath.FromSlash(path)), sourceMtime)
+	}
+	for index := range 10 {
+		writeBlackBoxFile(t, worktreeA, filepath.ToSlash(filepath.Join("docs", "stable-"+fmt.Sprintf("%02d", index)+".txt")), "stable")
+	}
+	setBlackBoxMtime(t, filepath.Join(worktreeA, "docs"), sourceMtime.Add(time.Minute))
+	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientA, "--worktree", worktreeA)
+	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientB, "--worktree", worktreeB)
+	sourceBinding := readTestBinding(t, clientA, worktreeA)
+
+	writeBlackBoxFile(t, worktreeA, "docs/overwritten.txt", "current-overwritten")
+	setBlackBoxMtime(t, filepath.Join(worktreeA, "docs", "overwritten.txt"), sourceMtime.Add(2*time.Hour))
+	setBlackBoxMtime(t, filepath.Join(worktreeA, "docs", "mtime-only.txt"), sourceMtime.Add(2*time.Hour))
+	if err := os.Remove(filepath.Join(worktreeA, "docs", "deleted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	writeBlackBoxFile(t, worktreeA, "docs/current.txt", "current-file")
+	if err := os.Mkdir(filepath.Join(worktreeA, "docs", "current-dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeBlackBoxFile(t, worktreeA, "docs/current-dir/nested.txt", "current-nested")
+	if err := os.Mkdir(filepath.Join(worktreeA, "docs", "current-empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeBlackBoxFile(t, worktreeA, "root.txt", "current-root")
+	writeBlackBoxFile(t, worktreeA, "root-current-only.txt", "current-root-only")
+	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientA, "--worktree", worktreeA)
+	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientB, "--worktree", worktreeB)
+
+	directoryPreview := runBlackBoxCLI(t, binary, nil, "library", "restore", "--client-dir", clientB,
+		"--worktree", worktreeB, "--commit", sourceBinding.SyncBase, "--path", "docs")
+	directoryPending := readTestPendingPublication(t, clientB, worktreeB)
+	if directoryPending.CreatedCount != 1 || directoryPending.UpdatedCount != 3 ||
+		directoryPending.PreservedCurrentOnlyCount != 4 || directoryPending.TypeReplacementCount != 0 ||
+		outputValue(string(directoryPreview), "candidate: ") != directoryPending.CandidateCommit[:deleteCandidatePrefixLen] {
+		t.Fatalf("built directory preview=%s pending=%+v", directoryPreview, directoryPending)
+	}
+	for _, content := range []string{"source-deleted", "source-overwritten", "current-file", "current-nested"} {
+		if bytes.Contains(directoryPreview, []byte(content)) {
+			t.Fatalf("built directory preview leaked file content")
+		}
+	}
+	runBlackBoxCLI(t, binary, nil, "library", "restore", "--client-dir", clientB, "--worktree", worktreeB,
+		"--confirm", directoryPending.CandidateCommit[:deleteCandidatePrefixLen])
+	for path, want := range map[string]string{
+		"docs/deleted.txt":            "source-deleted",
+		"docs/mtime-only.txt":         "stable-mtime-content",
+		"docs/overwritten.txt":        "source-overwritten",
+		"docs/current.txt":            "current-file",
+		"docs/current-dir/nested.txt": "current-nested",
+	} {
+		assertBlackBoxFile(t, worktreeB, path, want)
+	}
+	if info, err := os.Stat(filepath.Join(worktreeB, "docs", "current-empty")); err != nil || !info.IsDir() {
+		t.Fatalf("built directory restore current empty: info=%v err=%v", info, err)
+	}
+	assertBlackBoxMtime(t, filepath.Join(worktreeB, "docs", "deleted.txt"), sourceMtime)
+	assertBlackBoxMtime(t, filepath.Join(worktreeB, "docs", "mtime-only.txt"), sourceMtime)
+	assertBlackBoxMtime(t, filepath.Join(worktreeB, "docs", "overwritten.txt"), sourceMtime)
+	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientA, "--worktree", worktreeA)
+
+	setBlackBoxMtime(t, worktreeB, time.Date(2026, 7, 8, 9, 10, 11, 0, time.UTC))
+	rootPreview := runBlackBoxCLI(t, binary, nil, "library", "restore", "--client-dir", clientB,
+		"--worktree", worktreeB, "--commit", sourceBinding.SyncBase, "--path", ".")
+	rootPending := readTestPendingPublication(t, clientB, worktreeB)
+	if rootPending.UpdatedCount != 1 || rootPending.PreservedCurrentOnlyCount != 5 || rootPending.CreatedCount != 0 ||
+		rootPending.TypeReplacementCount != 0 || rootPending.RemovedDescendantCount != 0 ||
+		outputValue(string(rootPreview), "candidate: ") != rootPending.CandidateCommit[:deleteCandidatePrefixLen] {
+		t.Fatalf("built root preview=%s pending=%+v", rootPreview, rootPending)
+	}
+	for _, content := range []string{"source-root", "current-root-only"} {
+		if bytes.Contains(rootPreview, []byte(content)) {
+			t.Fatal("built root preview leaked file content")
+		}
+	}
+	runBlackBoxCLI(t, binary, nil, "library", "restore", "--client-dir", clientB, "--worktree", worktreeB,
+		"--confirm", rootPending.CandidateCommit[:deleteCandidatePrefixLen])
+	assertBlackBoxFile(t, worktreeB, "root.txt", "source-root")
+	assertBlackBoxFile(t, worktreeB, "root-current-only.txt", "current-root-only")
+	runBlackBoxCLI(t, binary, nil, "library", "sync", "--client-dir", clientA, "--worktree", worktreeA)
+
+	oracle := libraryCLIEnvironment{server: &httptest.Server{URL: serverURL}, token: login.Session.AccessToken}
+	confirmed := platformConfirmedInputs("source-deleted", "source-overwritten", "current-overwritten", "current-file",
+		"current-nested", "source-root", "current-root", "current-root-only")
+	bindingA := assertPlatformConvergedWithoutAttestation(t, "real binary restore first client", oracle, clientA, worktreeA, confirmed)
+	bindingB := assertPlatformConvergedWithoutAttestation(t, "real binary restore second client", oracle, clientB, worktreeB, confirmed)
+	if bindingA.SyncBase != bindingB.SyncBase || bindingA.SyncBaseRoot != bindingB.SyncBaseRoot ||
+		bindingB.SyncBase != rootPending.CandidateCommit || bindingB.SyncBaseRoot != rootPending.CandidateRoot {
+		t.Fatalf("built restore clients differ: A=%+v B=%+v pending=%+v", bindingA, bindingB, rootPending)
+	}
+
+	beforeMissing := captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken,
+		clientA, worktreeA, clientB, worktreeB)
+	missingStdout, missingStderr, missingErr := runBlackBoxCLIResult(t, binary, nil, "library", "restore",
+		"--client-dir", clientB, "--worktree", worktreeB, "--commit", sourceBinding.SyncBase,
+		"--path", "missing-directory")
+	if missingErr == nil || !bytes.Contains(missingStderr, []byte("restore source path not found")) || len(missingStdout) != 0 {
+		t.Fatalf("built missing directory restore error=%v stdout=%q stderr=%q", missingErr, missingStdout, missingStderr)
+	}
+	for _, content := range []string{"source-deleted", "source-overwritten", "current-file", "current-nested"} {
+		if bytes.Contains(missingStderr, []byte(content)) {
+			t.Fatal("built missing directory restore leaked file content")
+		}
+	}
+	assertBlackBoxRestoreState(t, "missing source directory", beforeMissing,
+		captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken, clientA, worktreeA, clientB, worktreeB))
+
+	beforeNoOp := captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken,
+		clientA, worktreeA, clientB, worktreeB)
+	noOpOutput := runBlackBoxCLI(t, binary, nil, "library", "restore", "--client-dir", clientB,
+		"--worktree", worktreeB, "--commit", sourceBinding.SyncBase, "--path", ".")
+	if !bytes.Contains(noOpOutput, []byte("restore no-op")) || bytes.Contains(noOpOutput, []byte("confirm:")) ||
+		bytes.Contains(noOpOutput, []byte("candidate:")) {
+		t.Fatalf("built root no-op output=%q", noOpOutput)
+	}
+	for _, content := range []string{"source-root", "current-root-only"} {
+		if bytes.Contains(noOpOutput, []byte(content)) {
+			t.Fatal("built root no-op leaked file content")
+		}
+	}
+	assertBlackBoxRestoreState(t, "root no-op", beforeNoOp,
+		captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken, clientA, worktreeA, clientB, worktreeB))
+
+	sourceHistory := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientB,
+		"--worktree", worktreeB, "--commit", sourceBinding.SyncBase)
+	previousHistory := runBlackBoxCLI(t, binary, nil, "library", "history", "inspect", "--client-dir", clientB,
+		"--worktree", worktreeB, "--commit", rootPending.ExpectedHead)
+	sourceReachable := bytes.Contains(sourceHistory, []byte("CommitId="+sourceBinding.SyncBase))
+	previousReachable := bytes.Contains(previousHistory, []byte("CommitId="+rootPending.ExpectedHead))
+	owner, err := getLibraryOwner(t.Context(), mustServerURL(t, serverURL), _blackBoxLibraryID, []byte(login.Session.AccessToken))
+	if err != nil {
+		t.Fatalf("read restore acceptance owner: %v", err)
+	}
+	reachability := inspectPlatformReachability(t, oracle, bindingB.SyncBase, owner)
+	platform, filesystem, enabled := acceptance.ActivePlatform()
+	if !enabled {
+		t.Fatal("built restore acceptance requires an active platform")
+	}
+	emitPlatformAttestation(t, platformAttestation{
+		Kind: "restore", Scenario: "real binary directory and root restore", Platform: platform, Filesystem: filesystem,
+		Head: bindingB.SyncBase, SyncBase: bindingB.SyncBase, HeadRoot: bindingB.SyncBaseRoot, BaseRoot: bindingB.SyncBaseRoot,
+		Snapshot: scanTestRoot(t, worktreeB), ReachableObjects: reachability.objects, SourceCommit: sourceBinding.SyncBase,
+		SourceRoot: sourceBinding.SyncBaseRoot, SourcePath: ".", PreviousHead: rootPending.ExpectedHead,
+		ExpectedHead: rootPending.ExpectedHead, CandidateCommit: rootPending.CandidateCommit, ResultRoot: rootPending.CandidateRoot,
+		CreatedCount: new(rootPending.CreatedCount), UpdatedCount: new(rootPending.UpdatedCount),
+		TypeReplacementCount: new(rootPending.TypeReplacementCount), RemovedDescendantCount: new(rootPending.RemovedDescendantCount),
+		PreservedCurrentOnlyCount: new(rootPending.PreservedCurrentOnlyCount),
+		PendingPublicationRows:    new(countClientRows(t, clientB, "pending_publications", worktreeB)),
+		PendingCheckoutRows:       new(countClientRows(t, clientB, "pending_checkouts", worktreeB)),
+		ResidualJournalRows:       countClientRows(t, clientB, "fs_actions", worktreeB), SourceReachable: sourceReachable,
+		PreviousHeadReachable: previousReachable,
+	})
 	server.stop(t)
 }
 
@@ -344,21 +574,99 @@ func (s *blackBoxServer) stop(t *testing.T) {
 
 func runBlackBoxCLI(t *testing.T, binary string, stdin []byte, args ...string) []byte {
 	t.Helper()
+	stdout, stderr, err := runBlackBoxCLIResult(t, binary, stdin, args...)
+	if err != nil {
+		t.Fatalf("run real CLI %s: %v: %s", strings.Join(args, " "), err, stderr)
+	}
+	return stdout
+}
+
+func runBlackBoxCLIResult(t *testing.T, binary string, stdin []byte, args ...string) ([]byte, []byte, error) {
+	t.Helper()
 	command := exec.CommandContext(t.Context(), binary, args...)
 	command.Stdin = bytes.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		t.Fatalf("run real CLI %s: %v: %s", strings.Join(args, " "), err, stderr.String())
+	err := command.Run()
+	return stdout.Bytes(), stderr.Bytes(), err
+}
+
+type blackBoxRestoreState struct {
+	head                string
+	bindingA            clientBinding
+	bindingB            clientBinding
+	worktreeA           []string
+	worktreeB           []string
+	pendingPublicationA int
+	pendingPublicationB int
+	pendingCheckoutA    int
+	pendingCheckoutB    int
+}
+
+func captureBlackBoxRestoreState(t *testing.T, serverURL, token, clientA, worktreeA, clientB, worktreeB string) blackBoxRestoreState {
+	t.Helper()
+	head, err := getRemoteHead(t.Context(), mustServerURL(t, serverURL), _blackBoxLibraryID, []byte(token))
+	if err != nil || head.CommitID == nil {
+		t.Fatalf("capture black-box restore Head: head=%+v err=%v", head, err)
 	}
-	return stdout.Bytes()
+	return blackBoxRestoreState{
+		head:                *head.CommitID + "\x00" + head.ETag,
+		bindingA:            readTestBinding(t, clientA, worktreeA),
+		bindingB:            readTestBinding(t, clientB, worktreeB),
+		worktreeA:           captureHistoryInspectWorktree(t, worktreeA),
+		worktreeB:           captureHistoryInspectWorktree(t, worktreeB),
+		pendingPublicationA: countClientRows(t, clientA, "pending_publications", worktreeA),
+		pendingPublicationB: countClientRows(t, clientB, "pending_publications", worktreeB),
+		pendingCheckoutA:    countClientRows(t, clientA, "pending_checkouts", worktreeA),
+		pendingCheckoutB:    countClientRows(t, clientB, "pending_checkouts", worktreeB),
+	}
+}
+
+func assertBlackBoxRestoreState(t *testing.T, scenario string, before, after blackBoxRestoreState) {
+	t.Helper()
+	if before.head != after.head || before.bindingA != after.bindingA || before.bindingB != after.bindingB ||
+		!slices.Equal(before.worktreeA, after.worktreeA) || !slices.Equal(before.worktreeB, after.worktreeB) ||
+		before.pendingPublicationA != after.pendingPublicationA || before.pendingPublicationB != after.pendingPublicationB ||
+		before.pendingCheckoutA != after.pendingCheckoutA || before.pendingCheckoutB != after.pendingCheckoutB {
+		t.Fatalf("built %s changed state:\nbefore=%+v\n after=%+v", scenario, before, after)
+	}
 }
 
 func writeBlackBoxFile(t *testing.T, root, name, content string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
+	path := filepath.Join(root, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create parent for %s: %v", name, err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func setBlackBoxMtime(t *testing.T, path string, value time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, value, value); err != nil {
+		t.Fatalf("set %s mtime: %v", path, err)
+	}
+}
+
+func assertBlackBoxMtime(t *testing.T, path string, want time.Time) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if !info.ModTime().Equal(want) {
+		t.Fatalf("%s mtime=%v, want %v", path, info.ModTime(), want)
+	}
+}
+
+func assertBlackBoxFile(t *testing.T, root, name, want string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+	if err != nil || string(data) != want {
+		t.Fatalf("%s=%q err=%v, want %q", name, data, err, want)
 	}
 }
 

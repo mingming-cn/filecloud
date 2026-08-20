@@ -2,14 +2,19 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	libraryapi "github.com/mingming-cn/filecloud/internal/library"
 	"github.com/mingming-cn/filecloud/internal/object"
 )
 
@@ -316,6 +321,307 @@ func TestLibraryRestoreNoOpCreatesNoPendingOrPublication(t *testing.T) {
 	if !strings.Contains(output.String(), "restore no-op") || cas != 0 || countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 {
 		t.Fatalf("no-op output=%q cas=%d pending=%d", output.String(), cas, countClientRows(t, state.clientDir, "pending_publications", state.worktree))
 	}
+}
+
+func TestLibraryRestoreDirectoryOverlayPreservesCurrentOnlyAndConverges(t *testing.T) {
+	state := newImportedBinding(t)
+	sourceFileMtime := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	sourceDirectoryMtime := time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC)
+	if err := os.Mkdir(filepath.Join(state.worktree, "docs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		"docs/deleted.txt":     "restore deleted",
+		"docs/mtime-only.txt":  "same content",
+		"docs/overwritten.txt": "restore old",
+	} {
+		if err := os.WriteFile(filepath.Join(state.worktree, filepath.FromSlash(path)), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		setRestoreTestMtime(t, filepath.Join(state.worktree, filepath.FromSlash(path)), sourceFileMtime)
+	}
+	setRestoreTestMtime(t, filepath.Join(state.worktree, "docs"), sourceDirectoryMtime)
+	runRestoreTestSync(t, state.clientDir, state.worktree)
+	sourceBinding := readTestBinding(t, state.clientDir, state.worktree)
+	sourceCommit, sourceRoot := sourceBinding.SyncBase, sourceBinding.SyncBaseRoot
+
+	if err := os.WriteFile(filepath.Join(state.worktree, "docs", "overwritten.txt"), []byte("current overwrite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(state.worktree, "docs", "deleted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	currentFileMtime := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	for _, path := range []string{"docs/overwritten.txt", "docs/mtime-only.txt"} {
+		setRestoreTestMtime(t, filepath.Join(state.worktree, filepath.FromSlash(path)), currentFileMtime)
+	}
+	if err := os.WriteFile(filepath.Join(state.worktree, "docs", "current.txt"), []byte("current file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(state.worktree, "docs", "current-dir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state.worktree, "docs", "current-dir", "nested.txt"), []byte("current nested"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(state.worktree, "docs", "current-empty"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	currentOnlyMtime := time.Date(2026, 2, 4, 5, 6, 7, 0, time.UTC)
+	for _, path := range []string{"docs/current.txt", "docs/current-dir/nested.txt", "docs/current-dir", "docs/current-empty"} {
+		setRestoreTestMtime(t, filepath.Join(state.worktree, filepath.FromSlash(path)), currentOnlyMtime)
+	}
+	currentDirectoryMtime := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	setRestoreTestMtime(t, filepath.Join(state.worktree, "docs"), currentDirectoryMtime)
+	runRestoreTestSync(t, state.clientDir, state.worktree)
+	beforeBinding := readTestBinding(t, state.clientDir, state.worktree)
+	beforeHead := restoreTestHead(t, state)
+	beforeIndex := captureTestPathIndex(t, state.clientDir, state.worktree)
+	beforeWorktree := captureHistoryInspectWorktree(t, state.worktree)
+
+	var preview bytes.Buffer
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }, now: func() time.Time {
+		return time.Date(2026, 8, 9, 1, 2, 3, 0, time.UTC)
+	}}
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--commit", sourceCommit, "--path", "docs"}, nil, &preview, io.Discard, config); err != nil {
+		t.Fatal(err)
+	}
+	pending := readTestPendingPublication(t, state.clientDir, state.worktree)
+	wantChanged := []string{"docs", "docs/deleted.txt", "docs/mtime-only.txt", "docs/overwritten.txt"}
+	changed, err := _decodeRestorePreview(pending.ChangedPathPreview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.SourceRoot != sourceRoot || pending.CreatedCount != 1 || pending.UpdatedCount != 3 ||
+		pending.PreservedCurrentOnlyCount != 4 || pending.TypeReplacementCount != 0 || pending.RemovedDescendantCount != 0 ||
+		pending.ChangedPathCount != int64(len(wantChanged)) || !equalStrings(changed, wantChanged) {
+		t.Fatalf("directory restore pending=%+v changed=%v, want changed=%v", pending, changed, wantChanged)
+	}
+	for _, line := range []string{"created paths: 1", "updated paths: 3", "preserved current-only paths: 4"} {
+		if !strings.Contains(preview.String(), line) {
+			t.Fatalf("directory preview %q does not contain %q", preview.String(), line)
+		}
+	}
+	afterPreviewHead := restoreTestHead(t, state)
+	if beforeBinding != readTestBinding(t, state.clientDir, state.worktree) || beforeHead != afterPreviewHead ||
+		!reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
+		!reflect.DeepEqual(beforeWorktree, captureHistoryInspectWorktree(t, state.worktree)) {
+		t.Fatal("directory restore preview mutated Head, binding, index, or worktree")
+	}
+
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--confirm", pending.CandidateCommit[:deleteCandidatePrefixLen]}, nil, io.Discard, io.Discard, config); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{
+		"docs/deleted.txt":            "restore deleted",
+		"docs/mtime-only.txt":         "same content",
+		"docs/overwritten.txt":        "restore old",
+		"docs/current.txt":            "current file",
+		"docs/current-dir/nested.txt": "current nested",
+	} {
+		data, err := os.ReadFile(filepath.Join(state.worktree, filepath.FromSlash(path)))
+		if err != nil || string(data) != want {
+			t.Fatalf("restored %s=%q err=%v, want %q", path, data, err, want)
+		}
+	}
+	if info, err := os.Stat(filepath.Join(state.worktree, "docs", "current-empty")); err != nil || !info.IsDir() {
+		t.Fatalf("current-only empty directory: info=%v err=%v", info, err)
+	}
+	assertRestoreTestMtime(t, filepath.Join(state.worktree, "docs", "deleted.txt"), sourceFileMtime)
+	assertRestoreTestMtime(t, filepath.Join(state.worktree, "docs", "mtime-only.txt"), sourceFileMtime)
+	assertRestoreTestMtime(t, filepath.Join(state.worktree, "docs", "overwritten.txt"), sourceFileMtime)
+	for _, path := range []string{"docs/current.txt", "docs/current-dir/nested.txt", "docs/current-dir", "docs/current-empty"} {
+		assertRestoreTestMtime(t, filepath.Join(state.worktree, filepath.FromSlash(path)), currentOnlyMtime)
+	}
+	assertRestoreTestMtime(t, filepath.Join(state.worktree, "docs"), currentDirectoryMtime)
+
+	binding := assertTestConverged(t, state.environment, state.clientDir, state.worktree)
+	for _, table := range []string{"pending_publications", "pending_checkouts", "checkout_paths", "fs_actions"} {
+		if rows := countClientRows(t, state.clientDir, table, state.worktree); rows != 0 {
+			t.Fatalf("directory restore left %d %s rows", rows, table)
+		}
+	}
+	commit, err := getRemoteCommit(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+		[]byte(state.environment.token), binding.SyncBase)
+	if err != nil || len(commit.Parents) != 1 || commit.Parents[0] != beforeBinding.SyncBase || commit.Root != pending.CandidateRoot {
+		t.Fatalf("directory restore commit=%+v err=%v pending=%+v", commit, err, pending)
+	}
+	for description, commitID := range map[string]string{"source": sourceCommit, "previous Head": beforeBinding.SyncBase} {
+		if historical, err := getRemoteCommit(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+			[]byte(state.environment.token), commitID); err != nil || historical.Root == "" {
+			t.Fatalf("%s commit remains reachable: commit=%+v err=%v", description, historical, err)
+		}
+	}
+}
+
+func TestLibraryRestoreRootOverlayAndNoOpIgnoreFilesystemRootMtime(t *testing.T) {
+	state, puts := newRestoreRequestFixture(t)
+	sourceCommit := state.binding.SyncBase
+	if err := os.WriteFile(filepath.Join(state.worktree, "local"), []byte("current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state.worktree, "root-current-only.txt"), []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRestoreTestSync(t, state.clientDir, state.worktree)
+	setRestoreTestMtime(t, state.worktree, time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC))
+	puts.Store(0)
+
+	var preview bytes.Buffer
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }, now: func() time.Time {
+		return time.Date(2026, 8, 9, 2, 3, 4, 0, time.UTC)
+	}}
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--commit", sourceCommit, "--path", "."}, nil, &preview, io.Discard, config); err != nil {
+		t.Fatal(err)
+	}
+	pending := readTestPendingPublication(t, state.clientDir, state.worktree)
+	if pending.SourcePath != "." || pending.UpdatedCount != 1 || pending.PreservedCurrentOnlyCount != 1 ||
+		pending.CreatedCount != 0 || pending.TypeReplacementCount != 0 || puts.Load() != 0 {
+		t.Fatalf("root preview pending=%+v puts=%d", pending, puts.Load())
+	}
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--confirm", pending.CandidateCommit[:deleteCandidatePrefixLen]}, nil, io.Discard, io.Discard, config); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(state.worktree, "local")); err != nil || string(data) != "data" {
+		t.Fatalf("root restored local=%q err=%v", data, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(state.worktree, "root-current-only.txt")); err != nil || string(data) != "preserved" {
+		t.Fatalf("root current-only=%q err=%v", data, err)
+	}
+	assertTestConverged(t, state.environment, state.clientDir, state.worktree)
+
+	puts.Store(0)
+	var noOp bytes.Buffer
+	if err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--commit", sourceCommit, "--path", "."}, nil, &noOp, io.Discard, config); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(noOp.String(), "restore no-op") || puts.Load() != 0 ||
+		countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 {
+		t.Fatalf("root no-op output=%q puts=%d", noOp.String(), puts.Load())
+	}
+}
+
+func TestLibraryRestoreMissingSourceDirectoryHasNoWrites(t *testing.T) {
+	state, puts := newRestoreRequestFixture(t)
+	puts.Store(0)
+	var output bytes.Buffer
+	err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--commit", state.binding.SyncBase, "--path", "missing-directory"}, nil, &output, io.Discard,
+		libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
+	if err == nil || !strings.Contains(err.Error(), "source path not found") {
+		t.Fatalf("missing source directory error=%v", err)
+	}
+	if puts.Load() != 0 || output.Len() != 0 || countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 {
+		t.Fatalf("missing source directory output=%q puts=%d", output.String(), puts.Load())
+	}
+}
+
+func TestLibraryRestoreTypeConflictRejectsBeforeWrites(t *testing.T) {
+	state, puts := newRestoreRequestFixture(t)
+	if err := os.Mkdir(filepath.Join(state.worktree, "target"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state.worktree, "target", "child.txt"), []byte("source child"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRestoreTestSync(t, state.clientDir, state.worktree)
+	sourceCommit := readTestBinding(t, state.clientDir, state.worktree).SyncBase
+	if err := os.RemoveAll(filepath.Join(state.worktree, "target")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state.worktree, "target"), []byte("current file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRestoreTestSync(t, state.clientDir, state.worktree)
+	beforeBinding := readTestBinding(t, state.clientDir, state.worktree)
+	beforeHead := restoreTestHead(t, state)
+	beforeIndex := captureTestPathIndex(t, state.clientDir, state.worktree)
+	beforeWorktree := captureHistoryInspectWorktree(t, state.worktree)
+	puts.Store(0)
+
+	var output bytes.Buffer
+	err := runLibraryWithConfig(t.Context(), []string{"restore", "--client-dir", state.clientDir, "--worktree", state.worktree,
+		"--commit", sourceCommit, "--path", "target/child.txt"}, nil, &output, io.Discard,
+		libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }})
+	if !errors.Is(err, _errRestoreTypeConflict) {
+		t.Fatalf("public type conflict error=%v, want _errRestoreTypeConflict", err)
+	}
+	if puts.Load() != 0 || output.Len() != 0 || countClientRows(t, state.clientDir, "pending_publications", state.worktree) != 0 ||
+		beforeBinding != readTestBinding(t, state.clientDir, state.worktree) || beforeHead != restoreTestHead(t, state) ||
+		!reflect.DeepEqual(beforeIndex, captureTestPathIndex(t, state.clientDir, state.worktree)) ||
+		!reflect.DeepEqual(beforeWorktree, captureHistoryInspectWorktree(t, state.worktree)) {
+		t.Fatalf("type conflict changed state or sent PUT: puts=%d output=%q", puts.Load(), output.String())
+	}
+}
+
+func runRestoreTestSync(t *testing.T, clientDir, worktree string) {
+	t.Helper()
+	config := libraryClientConfig{checkFilesystem: func(*os.File) error { return nil }}
+	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", clientDir, "--worktree", worktree},
+		nil, io.Discard, io.Discard, config)
+	confirmation, ok := errors.AsType[*deleteConfirmationRequiredError](err)
+	if ok {
+		err = confirmTestDeletion(t, clientDir, worktree, confirmation.candidate[:deleteCandidatePrefixLen], config)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setRestoreTestMtime(t *testing.T, path string, value time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, value, value); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertRestoreTestMtime(t *testing.T, path string, want time.Time) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s mtime: %v", path, err)
+	}
+	if !info.ModTime().Equal(want) {
+		t.Fatalf("%s mtime=%v, want %v", path, info.ModTime(), want)
+	}
+}
+
+func restoreTestHead(t *testing.T, state importedBinding) string {
+	t.Helper()
+	head, err := getRemoteHead(t.Context(), mustServerURL(t, state.environment.server.URL), testClientLibraryID,
+		[]byte(state.environment.token))
+	if err != nil || head.CommitID == nil {
+		t.Fatalf("read restore test Head: head=%+v err=%v", head, err)
+	}
+	return *head.CommitID + "\x00" + head.ETag
+}
+
+func newRestoreRequestFixture(t *testing.T) (importedBinding, *atomic.Int32) {
+	t.Helper()
+	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	var puts atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			puts.Add(1)
+		}
+		environment.handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	clientDir, worktree := newClientPaths(t)
+	if err := os.WriteFile(filepath.Join(worktree, "local"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := append(bindArgs(clientDir, proxy.URL, testClientLibraryID, worktree, testClientDeviceID), "--import-local")
+	if err := runTest(t.Context(), args, strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	return importedBinding{environment: environment, clientDir: clientDir, worktree: worktree, args: args,
+		binding: readTestBinding(t, clientDir, worktree)}, &puts
 }
 
 func TestLibraryRestoreConfirmPublishesFileRestoreAndConverges(t *testing.T) {

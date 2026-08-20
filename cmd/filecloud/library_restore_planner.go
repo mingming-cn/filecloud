@@ -11,7 +11,10 @@ import (
 
 const _restorePreviewPathLimit = 100
 
-var _errRestoreSourcePathNotFound = errors.New("restore source path not found")
+var (
+	_errRestoreSourcePathNotFound = errors.New("restore source path not found")
+	_errRestoreTypeConflict       = errors.New("restore source and current path types conflict")
+)
 
 type restoreObjectLoader func(kind, id string) ([]byte, error)
 
@@ -65,8 +68,6 @@ type restorePlanner struct {
 
 	createdCount              int64
 	updatedCount              int64
-	typeReplacementCount      int64
-	removedDescendantCount    int64
 	preservedCurrentOnlyCount int64
 }
 
@@ -114,8 +115,6 @@ func planRestoreOverlay(input restorePlanInput) (restorePlan, error) {
 		paths:                     paths,
 		createdCount:              planner.createdCount,
 		updatedCount:              planner.updatedCount,
-		typeReplacementCount:      planner.typeReplacementCount,
-		removedDescendantCount:    planner.removedDescendantCount,
 		preservedCurrentOnlyCount: planner.preservedCurrentOnlyCount,
 		changedPathCount:          int64(len(changed)),
 		previewTruncated:          len(changed) > _restorePreviewPathLimit,
@@ -274,8 +273,11 @@ func (planner *restorePlanner) applyPath(current, source restorePlanNode, parts 
 	if !source.present || source.kind != "Directory" {
 		return restorePlanNode{}, _errRestoreSourcePathNotFound
 	}
-	if !current.present || current.kind != "Directory" {
-		return planner.buildMissingPath(current, source, parts, index, path, root)
+	if !current.present {
+		return planner.buildMissingPath(source, parts, index, path, root)
+	}
+	if current.kind != source.kind {
+		return restorePlanNode{}, _errRestoreTypeConflict
 	}
 	currentDirectory, err := planner.loadDirectory(current.id)
 	if err != nil {
@@ -335,7 +337,7 @@ func (planner *restorePlanner) applyPath(current, source restorePlanNode, parts 
 	return result, nil
 }
 
-func (planner *restorePlanner) buildMissingPath(current, source restorePlanNode, parts []string, index int, path string, root bool) (restorePlanNode, error) {
+func (planner *restorePlanner) buildMissingPath(source restorePlanNode, parts []string, index int, path string, root bool) (restorePlanNode, error) {
 	if !source.present || source.kind != "Directory" {
 		return restorePlanNode{}, _errRestoreSourcePathNotFound
 	}
@@ -357,7 +359,7 @@ func (planner *restorePlanner) buildMissingPath(current, source restorePlanNode,
 		child, err = planner.mergeNode(restorePlanNode{}, restorePlanNode{present: true, kind: sourceEntry.Type,
 			id: sourceEntry.ID, mtime: sourceEntry.ModifiedAt}, childPath, false)
 	} else {
-		child, err = planner.buildMissingPath(restorePlanNode{}, restorePlanNode{present: true, kind: sourceEntry.Type,
+		child, err = planner.buildMissingPath(restorePlanNode{present: true, kind: sourceEntry.Type,
 			id: sourceEntry.ID, mtime: sourceEntry.ModifiedAt}, parts, index+1, childPath, false)
 	}
 	if err != nil {
@@ -373,12 +375,7 @@ func (planner *restorePlanner) buildMissingPath(current, source restorePlanNode,
 		result.mtime = ""
 	}
 	if !root {
-		switch {
-		case !current.present:
-			planner.recordCreated(path)
-		case current.kind != "Directory":
-			planner.recordTypeReplacement(path)
-		}
+		planner.recordCreated(path)
 	}
 	return result, nil
 }
@@ -394,17 +391,7 @@ func (planner *restorePlanner) mergeNode(current, source restorePlanNode, path s
 		return source, nil
 	}
 	if current.kind != source.kind {
-		if !root {
-			planner.recordTypeReplacement(path)
-		}
-		if current.kind == "Directory" {
-			removed, err := planner.countDescendants(current.id, path, strings.Count(path, "/")+1)
-			if err != nil {
-				return restorePlanNode{}, err
-			}
-			planner.removedDescendantCount += removed
-		}
-		return source, nil
+		return restorePlanNode{}, _errRestoreTypeConflict
 	}
 	switch source.kind {
 	case "File":
@@ -540,11 +527,6 @@ func (planner *restorePlanner) recordUpdated(path string) {
 	planner.changed[path] = struct{}{}
 }
 
-func (planner *restorePlanner) recordTypeReplacement(path string) {
-	planner.typeReplacementCount++
-	planner.changed[path] = struct{}{}
-}
-
 func (planner *restorePlanner) recordCreatedSubtree(node restorePlanNode, path string, root bool) error {
 	if root {
 		return errors.New("restore cannot create a root object")
@@ -554,39 +536,6 @@ func (planner *restorePlanner) recordCreatedSubtree(node restorePlanNode, path s
 
 func (planner *restorePlanner) recordPreservedSubtree(node restorePlanNode, path string) error {
 	return planner.walkSubtree(node, path, func(string) { planner.preservedCurrentOnlyCount++ })
-}
-
-func (planner *restorePlanner) countDescendants(id, path string, depth int) (int64, error) {
-	if depth > planner.budget.maxDepth {
-		return 0, errors.New("restore planner exceeds directory depth budget")
-	}
-	if planner.activeWalk[id] {
-		return 0, errors.New("restore removed directory graph contains a cycle")
-	}
-	planner.activeWalk[id] = true
-	defer delete(planner.activeWalk, id)
-	directory, err := planner.loadDirectory(id)
-	if err != nil {
-		return 0, err
-	}
-	var count int64
-	for _, entry := range directory.Entries {
-		childPath := path + "/" + entry.Name
-		if err := planner.validateResultPath(childPath); err != nil {
-			return 0, err
-		}
-		count++
-		if entry.Type == "Directory" {
-			children, err := planner.countDescendants(entry.ID, childPath, depth+1)
-			if err != nil {
-				return 0, err
-			}
-			count += children
-		} else if _, err := planner.loadFile(entry.ID); err != nil {
-			return 0, err
-		}
-	}
-	return count, nil
 }
 
 func (planner *restorePlanner) walkSubtree(node restorePlanNode, path string, visit func(string)) error {

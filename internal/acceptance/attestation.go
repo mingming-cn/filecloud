@@ -10,7 +10,7 @@ import (
 // Prefix identifies a structured acceptance attestation in test output.
 const Prefix = "FILECLOUD_ATTESTATION "
 
-// Attestation records one platform convergence, isolation, readability, or filesystem primitive proof.
+// Attestation records one platform convergence, restore, isolation, readability, or filesystem primitive proof.
 type Attestation struct {
 	Kind                      string            `json:"kind"`
 	Scenario                  string            `json:"scenario"`
@@ -33,6 +33,22 @@ type Attestation struct {
 	OldHead                   string            `json:"oldHead,omitempty"`
 	CurrentHead               string            `json:"currentHead,omitempty"`
 	PreviousSyncBase          string            `json:"previousSyncBase,omitempty"`
+	SourceCommit              string            `json:"sourceCommit,omitempty"`
+	SourceRoot                string            `json:"sourceRoot,omitempty"`
+	SourcePath                string            `json:"sourcePath,omitempty"`
+	PreviousHead              string            `json:"previousHead,omitempty"`
+	ExpectedHead              string            `json:"expectedHead,omitempty"`
+	CandidateCommit           string            `json:"candidateCommit,omitempty"`
+	ResultRoot                string            `json:"resultRoot,omitempty"`
+	CreatedCount              *int64            `json:"createdCount,omitempty"`
+	UpdatedCount              *int64            `json:"updatedCount,omitempty"`
+	TypeReplacementCount      *int64            `json:"typeReplacementCount,omitempty"`
+	RemovedDescendantCount    *int64            `json:"removedDescendantCount,omitempty"`
+	PreservedCurrentOnlyCount *int64            `json:"preservedCurrentOnlyCount,omitempty"`
+	PendingPublicationRows    *int              `json:"pendingPublicationRows,omitempty"`
+	PendingCheckoutRows       *int              `json:"pendingCheckoutRows,omitempty"`
+	SourceReachable           bool              `json:"sourceReachable,omitempty"`
+	PreviousHeadReachable     bool              `json:"previousHeadReachable,omitempty"`
 	NoFollow                  bool              `json:"noFollow,omitempty"`
 	StableFileIdentity        bool              `json:"stableFileIdentity,omitempty"`
 	NoReplaceRename           bool              `json:"noReplaceRename,omitempty"`
