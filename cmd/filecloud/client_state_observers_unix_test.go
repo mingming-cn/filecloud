@@ -14,40 +14,42 @@ import (
 )
 
 func TestClientStateObserversCanonicalizeWorktreeAlias(t *testing.T) {
-	environment := newLibraryCLIEnvironment(t, libraryapi.Config{})
+	var config libraryapi.Config
+	environment := newLibraryCLIEnvironment(t, config)
 	realParent := t.TempDir()
 	realWorktree := filepath.Join(realParent, "worktree")
 	if err := os.Mkdir(realWorktree, 0o700); err != nil {
-		t.Fatal(err)
+		t.Fatalf("create real worktree: %v", err)
 	}
 	aliasParent := filepath.Join(t.TempDir(), "alias")
 	if err := os.Symlink(realParent, aliasParent); err != nil {
-		t.Fatal(err)
+		t.Fatalf("create worktree alias: %v", err)
 	}
 	aliasWorktree := filepath.Join(aliasParent, "worktree")
 	clientDir := t.TempDir()
 	if err := runTest(t.Context(), bindArgs(clientDir, environment.server.URL, testClientLibraryID,
 		aliasWorktree, testClientDeviceID), strings.NewReader(environment.token+"\n"), io.Discard, io.Discard); err != nil {
-		t.Fatal(err)
+		t.Fatalf("bind aliased worktree: %v", err)
 	}
 
 	if err := os.WriteFile(filepath.Join(aliasWorktree, "published.txt"), []byte("published"), 0o600); err != nil {
-		t.Fatal(err)
+		t.Fatalf("write published file through alias: %v", err)
 	}
 	if err := syncTestWorktree(t, clientDir, aliasWorktree); err != nil {
-		t.Fatal(err)
+		t.Fatalf("sync published file through alias: %v", err)
 	}
 	assertTestConverged(t, environment, clientDir, aliasWorktree)
 	captured := captureTestBinding(t, clientDir, aliasWorktree)
-	if captured.binding.Worktree != canonicalTestWorktree(t, aliasWorktree) {
-		t.Fatalf("captured binding worktree=%q does not match canonical alias", captured.binding.Worktree)
+	canonicalWorktree := canonicalTestWorktree(t, aliasWorktree)
+	if captured.binding.Worktree != canonicalWorktree {
+		t.Fatalf("captured binding worktree=%q, want %q", captured.binding.Worktree, canonicalWorktree)
 	}
 	if token := readTestAccessToken(t, clientDir, aliasWorktree); string(token) != environment.token {
-		t.Fatal("observed access token does not match the bound client")
+		t.Fatal("observed access token match=false, want true")
 	}
 
 	if err := os.WriteFile(filepath.Join(aliasWorktree, "pending.txt"), []byte("pending"), 0o600); err != nil {
-		t.Fatal(err)
+		t.Fatalf("write pending file through alias: %v", err)
 	}
 	stopErr := errors.New("stop before head publication")
 	err := runLibraryWithConfig(t.Context(), []string{"sync", "--client-dir", clientDir, "--worktree", aliasWorktree},
