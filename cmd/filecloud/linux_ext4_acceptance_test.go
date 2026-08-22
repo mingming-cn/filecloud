@@ -1119,8 +1119,8 @@ func assertPlatformConvergence(t *testing.T, scenario string, environment librar
 	registered := journalBindings[0]
 	if registered.worktree != binding.Worktree || registered.rootDevice != uint64(rootStat.Dev) ||
 		registered.rootInode != rootStat.Ino || registered.journalFormat != fsJournalFormat {
-		t.Fatalf("%s journal root registration=%+v root=%d/%d format=%d", scenario, registered,
-			uint64(rootStat.Dev), rootStat.Ino, fsJournalFormat)
+		t.Fatalf("%s journal root registration=%+v, want worktree=%q root=%d/%d format=%d", scenario, registered,
+			binding.Worktree, uint64(rootStat.Dev), rootStat.Ino, fsJournalFormat)
 	}
 	assertNoSyncInternalPaths(t, worktree)
 
