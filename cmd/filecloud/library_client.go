@@ -2186,6 +2186,45 @@ func migrateCheckoutCreateOrigins(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+func validateClientV22PendingRows(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT publications.worktree,publications.base_commit,publications.base_root,
+		publications.expected_head,publications.expected_etag,publications.candidate_commit,publications.candidate_root,
+		publications.candidate_data,publications.captured_commit,publications.captured_root,publications.captured_data,
+		publications.candidate_history,publications.deletion_count,publications.tracked_count,
+		publications.requires_delete_confirmation,publications.delete_confirmed,publications.legacy_revalidation_required,
+		bindings.worktree IS NOT NULL,COALESCE(bindings.user_id,''),COALESCE(bindings.device_id,''),
+		COALESCE(bindings.sync_base_commit,''),COALESCE(bindings.sync_base_root,'')
+		FROM pending_publications AS publications
+		LEFT JOIN bindings ON bindings.worktree=publications.worktree`)
+	if err != nil {
+		return fmt.Errorf("read v22 pending publication rows: %w", err)
+	}
+	for rows.Next() {
+		var worktree string
+		var value pendingPublication
+		var binding clientBinding
+		var hasBinding bool
+		if err := rows.Scan(&worktree, &value.BaseCommit, &value.BaseRoot, &value.ExpectedHead, &value.ExpectedETag,
+			&value.CandidateCommit, &value.CandidateRoot, &value.CandidateData, &value.CapturedCommit, &value.CapturedRoot,
+			&value.CapturedData, &value.CandidateHistory, &value.DeletionCount, &value.TrackedCount,
+			&value.RequiresDeleteConfirmation, &value.DeleteConfirmed, &value.LegacyRevalidationRequired, &hasBinding,
+			&binding.UserID, &binding.DeviceID, &binding.SyncBase, &binding.SyncBaseRoot); err != nil {
+			return errors.Join(fmt.Errorf("scan v22 pending publication row: %w", err), rows.Close())
+		}
+		if !hasBinding {
+			return errors.Join(errors.New("v22 pending publication has no matching binding"), rows.Close())
+		}
+		binding.Worktree = worktree
+		if err := verifyPendingPublication(value, binding); err != nil {
+			return errors.Join(fmt.Errorf("validate v22 pending publication for worktree %q: %w", worktree, err), rows.Close())
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("iterate v22 pending publication rows: %w", err)
+	}
+	return nil
+}
+
 func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 	if err := validateClientSchemaVersion(ctx, db); err != nil {
 		return fmt.Errorf("validate client schema before migration: %w", err)
@@ -2564,6 +2603,9 @@ func initializeClientSchema(ctx context.Context, db *sql.DB) error {
 		}
 		if invalidRows != 0 {
 			return fail(errors.New("legacy pending publication is invalid"))
+		}
+		if err := validateClientV22PendingRows(ctx, tx); err != nil {
+			return fail(fmt.Errorf("validate legacy pending publication semantics: %w", err))
 		}
 		if _, err := tx.ExecContext(ctx, `ALTER TABLE pending_publications RENAME TO old_pending_publications;
 			`+_clientV23PendingSQL+`;

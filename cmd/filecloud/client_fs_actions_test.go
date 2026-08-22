@@ -660,6 +660,17 @@ func TestPendingPublicationBlobLimits(t *testing.T) {
 }
 
 func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
+	const (
+		worktree      = "/work"
+		baseRoot      = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		candidateRoot = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	)
+	baseCommit := strings.Repeat("a", 64)
+	candidateData, candidateCommit, err := canonicalCommit(testClientUserID, testClientDeviceID, candidateRoot,
+		[]string{baseCommit}, func() time.Time { return time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC) })
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, version := range []int{18, 19, 20} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
@@ -667,14 +678,16 @@ func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
+			if _, err := db.Exec(`INSERT INTO bindings(server_url,library_id,worktree,user_id,device_id,sync_base_commit,
+				sync_base_root,head_etag,access_token) VALUES(?,?,?,?,?,?,?,?,?)`, "https://example.invalid", testClientLibraryID,
+				worktree, testClientUserID, testClientDeviceID, baseCommit, baseRoot, "etag", []byte("token")); err != nil {
+				t.Fatal(err)
+			}
 			createSQL := legacyClientV18PendingSQL
-			values := "'/work','base','root','etag','candidate','candidate-root',X'0102',0,0,0,0"
 			if version == 19 {
 				createSQL = clientV19PendingSQL
-				values += ",0"
 			} else if version == 20 {
 				createSQL = clientV20PendingSQL
-				values = "'/work','base','root','base','etag','candidate','candidate-root',X'0102',0,0,0,0,0"
 			}
 			if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO new_pending_publications`); err != nil {
 				t.Fatal(err)
@@ -682,8 +695,20 @@ func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
 			if _, err := db.Exec(createSQL); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.Exec("INSERT INTO pending_publications VALUES(" + values + ")"); err != nil {
-				t.Fatal(err)
+			var insertErr error
+			switch version {
+			case 18:
+				_, insertErr = db.Exec(`INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,0,0,0,0)`, worktree,
+					baseCommit, baseRoot, "etag", candidateCommit, candidateRoot, candidateData)
+			case 19:
+				_, insertErr = db.Exec(`INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,0,0,0,0,0)`, worktree,
+					baseCommit, baseRoot, "etag", candidateCommit, candidateRoot, candidateData)
+			case 20:
+				_, insertErr = db.Exec(`INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0)`, worktree,
+					baseCommit, baseRoot, baseCommit, "etag", candidateCommit, candidateRoot, candidateData)
+			}
+			if insertErr != nil {
+				t.Fatal(insertErr)
 			}
 			if _, err := db.Exec(`DROP TABLE new_pending_publications;
 				DELETE FROM client_schema_migrations WHERE version > ?`, version); err != nil {
@@ -694,76 +719,149 @@ func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
 			}
 			var kind PublicationKind
 			var expected, base string
-			if err := db.QueryRow(`SELECT publication_kind,expected_head,base_commit FROM pending_publications WHERE worktree='/work'`).Scan(
+			if err := db.QueryRow(`SELECT publication_kind,expected_head,base_commit FROM pending_publications WHERE worktree=?`, worktree).Scan(
 				&kind, &expected, &base); err != nil {
 				t.Fatal(err)
 			}
-			if kind != PublicationKindSync || expected != base || expected != "base" {
+			if kind != PublicationKindSync || expected != baseCommit || base != baseCommit {
 				t.Fatalf("v%d migration kind=%q expected=%q base=%q", version, kind, expected, base)
 			}
-			var capturedCommit, capturedRoot string
-			var candidateData, capturedData, history []byte
+			var migratedCommit, migratedRoot string
+			var migratedCandidateData, capturedData, history []byte
 			if err := db.QueryRow(`SELECT captured_commit,captured_root,candidate_data,captured_data,candidate_history
-				FROM pending_publications WHERE worktree='/work'`).Scan(&capturedCommit, &capturedRoot, &candidateData,
-				&capturedData, &history); err != nil || capturedCommit != "candidate" || capturedRoot != "candidate-root" ||
-				!bytes.Equal(candidateData, capturedData) || !bytes.Equal(capturedData, []byte{1, 2}) ||
+				FROM pending_publications WHERE worktree=?`, worktree).Scan(&migratedCommit, &migratedRoot, &migratedCandidateData,
+				&capturedData, &history); err != nil || migratedCommit != candidateCommit || migratedRoot != candidateRoot ||
+				!bytes.Equal(migratedCandidateData, candidateData) || !bytes.Equal(capturedData, candidateData) ||
 				!bytes.Equal(history, _emptyCandidateHistory) {
-				t.Fatalf("v%d migration captured=%q/%q data=%x/%x history=%x err=%v", version, capturedCommit,
-					capturedRoot, candidateData, capturedData, history, err)
+				t.Fatalf("v%d migration captured=%q/%q data=%x/%x history=%x err=%v", version, migratedCommit,
+					migratedRoot, migratedCandidateData, capturedData, history, err)
 			}
 		})
 	}
 }
 
 func TestClientV22PendingPublicationMigrationRejectsInvalidRowsAtomically(t *testing.T) {
-	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+	const (
+		worktree = "/work"
+		baseRoot = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		otherID  = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	)
+	baseCommit := strings.Repeat("a", 64)
+	now := func() time.Time { return time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC) }
+	candidateData, candidateCommit, err := canonicalCommit(testClientUserID, testClientDeviceID, baseRoot,
+		[]string{baseCommit}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	if _, err := db.Exec(`DROP TABLE pending_publications;
-		DELETE FROM client_schema_migrations WHERE version>=23`); err != nil {
+	wrongParentData, wrongParentCommit, err := canonicalCommit(testClientUserID, testClientDeviceID, baseRoot,
+		[]string{otherID}, now)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(_clientV21PendingSQL); err != nil {
+	wrongOwnerData, wrongOwnerCommit, err := canonicalCommit("11111111-2222-4333-8444-555555555555",
+		testClientDeviceID, baseRoot, []string{baseCommit}, now)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON;
-		INSERT INTO pending_publications VALUES('/work','base','root','base','etag','candidate','root',X'00',
-			'candidate','root',X'00',X'4643483100000000',1,20,0,1,0);
-		PRAGMA ignore_check_constraints=OFF`); err != nil {
+	wrongDeviceData, wrongDeviceCommit, err := canonicalCommit(testClientUserID,
+		"11111111-2222-4333-8444-555555555555", baseRoot, []string{baseCommit}, now)
+	if err != nil {
 		t.Fatal(err)
 	}
-	var beforeSchema, beforeData string
-	if err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='pending_publications'`).Scan(&beforeSchema); err != nil {
+	nonemptyHistory, err := _encodeCandidateHistory([][]byte{candidateData})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT quote(worktree)||'|'||tracked_count||'|'||delete_confirmed
-		FROM pending_publications`).Scan(&beforeData); err != nil {
-		t.Fatal(err)
+
+	readLegacy := func(t *testing.T, db *sql.DB) pendingPublication {
+		t.Helper()
+		var value pendingPublication
+		if err := db.QueryRow(`SELECT base_commit,base_root,expected_head,expected_etag,candidate_commit,candidate_root,
+			candidate_data,captured_commit,captured_root,captured_data,candidate_history,deletion_count,tracked_count,
+			requires_delete_confirmation,delete_confirmed,legacy_revalidation_required
+			FROM pending_publications WHERE worktree=?`, worktree).Scan(&value.BaseCommit, &value.BaseRoot, &value.ExpectedHead,
+			&value.ExpectedETag, &value.CandidateCommit, &value.CandidateRoot, &value.CandidateData, &value.CapturedCommit,
+			&value.CapturedRoot, &value.CapturedData, &value.CandidateHistory, &value.DeletionCount, &value.TrackedCount,
+			&value.RequiresDeleteConfirmation, &value.DeleteConfirmed, &value.LegacyRevalidationRequired); err != nil {
+			t.Fatal(err)
+		}
+		return value
 	}
-	if err := initializeClientSchema(t.Context(), db); err == nil {
-		t.Fatal("invalid v22 pending publication was migrated")
+	tests := []struct {
+		name      string
+		statement string
+		args      []any
+	}{
+		{name: "candidate id does not match body", statement: "UPDATE pending_publications SET candidate_commit=?", args: []any{otherID}},
+		{name: "captured id does not match body", statement: "UPDATE pending_publications SET captured_commit=?", args: []any{otherID}},
+		{name: "candidate root does not match body", statement: "UPDATE pending_publications SET candidate_root=?", args: []any{otherID}},
+		{name: "captured root does not match body", statement: "UPDATE pending_publications SET captured_root=?", args: []any{otherID}},
+		{name: "parent does not match binding", statement: `UPDATE pending_publications SET candidate_commit=?,candidate_data=?,
+			captured_commit=?,captured_data=?`, args: []any{wrongParentCommit, wrongParentData, wrongParentCommit, wrongParentData}},
+		{name: "expected head does not match parent", statement: "UPDATE pending_publications SET expected_head=?", args: []any{otherID}},
+		{name: "owner does not match binding", statement: `UPDATE pending_publications SET candidate_commit=?,candidate_data=?,
+			captured_commit=?,captured_data=?`, args: []any{wrongOwnerCommit, wrongOwnerData, wrongOwnerCommit, wrongOwnerData}},
+		{name: "device does not match binding", statement: `UPDATE pending_publications SET candidate_commit=?,candidate_data=?,
+			captured_commit=?,captured_data=?`, args: []any{wrongDeviceCommit, wrongDeviceData, wrongDeviceCommit, wrongDeviceData}},
+		{name: "candidate history does not match local candidate", statement: "UPDATE pending_publications SET candidate_history=?", args: []any{nonemptyHistory}},
 	}
-	var afterSchema, afterData string
-	if err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='pending_publications'`).Scan(&afterSchema); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.QueryRow(`SELECT quote(worktree)||'|'||tracked_count||'|'||delete_confirmed
-		FROM pending_publications`).Scan(&afterData); err != nil {
-		t.Fatal(err)
-	}
-	var version, kindColumns int
-	if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pending_publications')
-		WHERE name='publication_kind'`).Scan(&kindColumns); err != nil {
-		t.Fatal(err)
-	}
-	if beforeSchema != afterSchema || beforeData != afterData || version != 22 || kindColumns != 0 {
-		t.Fatalf("failed migration changed state: schema=%t data=%q/%q version=%d kind_columns=%d",
-			beforeSchema == afterSchema, beforeData, afterData, version, kindColumns)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec(`DROP TABLE pending_publications;
+				DELETE FROM client_schema_migrations WHERE version>=23`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(_clientV21PendingSQL); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO bindings(server_url,library_id,worktree,user_id,device_id,sync_base_commit,
+				sync_base_root,head_etag,access_token) VALUES(?,?,?,?,?,?,?,?,?)`, "https://example.invalid", testClientLibraryID,
+				worktree, testClientUserID, testClientDeviceID, baseCommit, baseRoot, "etag", []byte("token")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO pending_publications(worktree,base_commit,base_root,expected_head,expected_etag,
+				candidate_commit,candidate_root,candidate_data,captured_commit,captured_root,captured_data,candidate_history,
+				deletion_count,tracked_count,requires_delete_confirmation,delete_confirmed,legacy_revalidation_required)
+				VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,0)`, worktree, baseCommit, baseRoot, baseCommit, "etag",
+				candidateCommit, baseRoot, candidateData, candidateCommit, baseRoot, candidateData, _emptyCandidateHistory); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(test.statement, test.args...); err != nil {
+				t.Fatal(err)
+			}
+			before := readLegacy(t, db)
+			var beforeSchema string
+			if err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='pending_publications'`).Scan(&beforeSchema); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := initializeClientSchema(t.Context(), db); err == nil {
+				t.Fatal("invalid v22 pending publication was migrated")
+			}
+
+			after := readLegacy(t, db)
+			var afterSchema string
+			if err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='pending_publications'`).Scan(&afterSchema); err != nil {
+				t.Fatal(err)
+			}
+			var version, kindColumns int
+			if err := db.QueryRow(`SELECT MAX(version) FROM client_schema_migrations`).Scan(&version); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pending_publications')
+				WHERE name='publication_kind'`).Scan(&kindColumns); err != nil {
+				t.Fatal(err)
+			}
+			if beforeSchema != afterSchema || !reflect.DeepEqual(before, after) || version != 22 || kindColumns != 0 {
+				t.Fatalf("failed migration changed state: schema=%t row_equal=%t version=%d kind_columns=%d",
+					beforeSchema == afterSchema, reflect.DeepEqual(before, after), version, kindColumns)
+			}
+		})
 	}
 }
 
@@ -794,17 +892,38 @@ func TestClientV19PendingPublicationFingerprintBeforeMigration(t *testing.T) {
 }
 
 func TestPendingPublicationV17DeletionConfirmationMigration(t *testing.T) {
+	const (
+		worktree      = "/work"
+		baseRoot      = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		candidateRoot = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	)
+	baseCommit := strings.Repeat("a", 64)
+	candidateData, candidateCommit, err := canonicalCommit(testClientUserID, testClientDeviceID, candidateRoot,
+		[]string{baseCommit}, func() time.Time { return time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC) })
+	if err != nil {
+		t.Fatal(err)
+	}
 	db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO bindings(server_url,library_id,worktree,user_id,device_id,sync_base_commit,
+		sync_base_root,head_etag,access_token) VALUES(?,?,?,?,?,?,?,?,?)`, "https://example.invalid", testClientLibraryID,
+		worktree, testClientUserID, testClientDeviceID, baseCommit, baseRoot, "etag", []byte("token")); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO new_pending_publications;
 		CREATE TABLE pending_publications (worktree TEXT PRIMARY KEY NOT NULL, base_commit TEXT NOT NULL,
 		base_root TEXT NOT NULL, expected_etag TEXT NOT NULL, candidate_commit TEXT NOT NULL,
-		candidate_root TEXT NOT NULL, candidate_data BLOB NOT NULL);
-		INSERT INTO pending_publications VALUES('/work','base','root','etag','candidate','candidate-root',X'0102');
-		DROP TABLE new_pending_publications;
+		candidate_root TEXT NOT NULL, candidate_data BLOB NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?)`, worktree, baseCommit, baseRoot,
+		"etag", candidateCommit, candidateRoot, candidateData); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE new_pending_publications;
 		DELETE FROM client_schema_migrations WHERE version>=18`); err != nil {
 		t.Fatal(err)
 	}
