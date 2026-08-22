@@ -7504,6 +7504,7 @@ type testBindingSnapshot struct {
 
 func captureTestBinding(t *testing.T, clientDir, worktree string) testBindingSnapshot {
 	t.Helper()
+	worktree = canonicalTestWorktree(t, worktree)
 	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
 		t.Fatal(err)
@@ -7532,6 +7533,7 @@ type testJournalBindingRow struct {
 
 func captureTestJournalBindings(t *testing.T, clientDir, worktree string) []testJournalBindingRow {
 	t.Helper()
+	worktree = canonicalTestWorktree(t, worktree)
 	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
 		t.Fatal(err)
@@ -7559,6 +7561,7 @@ func captureTestJournalBindings(t *testing.T, clientDir, worktree string) []test
 
 func captureTestPathIndex(t *testing.T, clientDir, worktree string) []testPathIndexRow {
 	t.Helper()
+	worktree = canonicalTestWorktree(t, worktree)
 	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
 		t.Fatal(err)
@@ -7588,6 +7591,7 @@ func captureTestPathIndex(t *testing.T, clientDir, worktree string) []testPathIn
 func assertTestConverged(t *testing.T, environment libraryCLIEnvironment, clientDir, worktree string) clientBinding {
 	t.Helper()
 	binding := readTestBinding(t, clientDir, worktree)
+	canonicalWorktree := canonicalTestWorktree(t, worktree)
 	head, err := getRemoteHead(t.Context(), mustServerURL(t, environment.server.URL), testClientLibraryID, []byte(environment.token))
 	if err != nil || head.CommitID == nil || *head.CommitID != binding.SyncBase {
 		t.Fatalf("binding and Head differ: binding=%+v head=%+v err=%v", binding, head, err)
@@ -7610,7 +7614,7 @@ func assertTestConverged(t *testing.T, environment libraryCLIEnvironment, client
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := db.Query(`SELECT path,type,object_id,canonical_mtime,size FROM path_index WHERE worktree=? ORDER BY path`, worktree)
+	rows, err := db.Query(`SELECT path,type,object_id,canonical_mtime,size FROM path_index WHERE worktree=? ORDER BY path`, canonicalWorktree)
 	if err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -7647,6 +7651,7 @@ func readPendingCandidate(t *testing.T, clientDir, worktree string) string {
 
 func readTestPendingPublication(t *testing.T, clientDir, worktree string) pendingPublication {
 	t.Helper()
+	worktree = canonicalTestWorktree(t, worktree)
 	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
 		t.Fatal(err)
@@ -7708,6 +7713,7 @@ func downgradePendingPublicationToV17(t *testing.T, clientDir string) {
 
 func countClientRows(t *testing.T, clientDir, table, worktree string) int {
 	t.Helper()
+	worktree = canonicalTestWorktree(t, worktree)
 	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
 		t.Fatal(err)
@@ -7753,6 +7759,7 @@ func countSyncInternalPaths(t *testing.T, worktree string) int {
 
 func readPendingCheckoutState(t *testing.T, clientDir, worktree string) string {
 	t.Helper()
+	worktree = canonicalTestWorktree(t, worktree)
 	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
 		t.Fatal(err)
@@ -7767,6 +7774,7 @@ func readPendingCheckoutState(t *testing.T, clientDir, worktree string) string {
 
 func readPendingCheckoutTarget(t *testing.T, clientDir, worktree string) string {
 	t.Helper()
+	worktree = canonicalTestWorktree(t, worktree)
 	db, err := openClientDB(filepath.Join(clientDir, _clientDatabaseName), true)
 	if err != nil {
 		t.Fatal(err)

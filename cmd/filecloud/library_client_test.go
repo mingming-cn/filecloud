@@ -1625,6 +1625,15 @@ func readTestIntent(t *testing.T, clientDir string) bindIntent {
 	return intent
 }
 
+func canonicalTestWorktree(t *testing.T, worktree string) string {
+	t.Helper()
+	canonical, err := canonicalExistingPath(worktree)
+	if err != nil {
+		t.Fatalf("canonicalize test worktree %q: %v", worktree, err)
+	}
+	return canonical
+}
+
 func readTestBinding(t *testing.T, clientDir, worktree string) clientBinding {
 	t.Helper()
 	db, err := sql.Open("sqlite", filepath.Join(clientDir, _clientDatabaseName))
@@ -1632,10 +1641,7 @@ func readTestBinding(t *testing.T, clientDir, worktree string) clientBinding {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	canonical, err := canonicalExistingPath(worktree)
-	if err != nil {
-		t.Fatal(err)
-	}
+	canonical := canonicalTestWorktree(t, worktree)
 	var binding clientBinding
 	var accessToken []byte
 	err = db.QueryRow(`SELECT server_url, library_id, worktree, user_id, device_id, sync_base_commit, sync_base_root, head_etag, access_token FROM bindings WHERE worktree = ?`, canonical).
@@ -1648,6 +1654,7 @@ func readTestBinding(t *testing.T, clientDir, worktree string) clientBinding {
 
 func readTestAccessToken(t *testing.T, clientDir, worktree string) []byte {
 	t.Helper()
+	worktree = canonicalTestWorktree(t, worktree)
 	db, err := sql.Open("sqlite", filepath.Join(clientDir, _clientDatabaseName))
 	if err != nil {
 		t.Fatal(err)

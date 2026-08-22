@@ -333,7 +333,7 @@ func TestBuiltBinaryDirectoryRestoreAcceptance(t *testing.T) {
 		t.Fatalf("open built restore candidate for tampering: %v", err)
 	}
 	if _, err := db.ExecContext(t.Context(), "UPDATE pending_publications SET candidate_data = ? WHERE worktree = ?",
-		[]byte("{}"), worktreeB); err != nil {
+		[]byte("{}"), canonicalTestWorktree(t, worktreeB)); err != nil {
 		t.Fatalf("tamper built restore candidate: %v", errors.Join(err, db.Close()))
 	}
 	if err := db.Close(); err != nil {
