@@ -305,15 +305,15 @@ func runLibraryRestoreConfirm(ctx context.Context, clientDir, worktree, prefix s
 		return errors.New("restore --confirm must exactly match this worktree's pending restore candidate")
 	}
 	if err := verifyRestorePublication(*pending, state.binding); err != nil {
-		return fmt.Errorf("verify restore candidate: %w", err)
-	}
-	snapshot, err := scanWorktreeWithConfig(state.root, state.options.scanConfig)
-	if err != nil {
-		return fmt.Errorf("scan worktree: %w", err)
+		return discardStaleRestore(ctx, state, *pending)
 	}
 	head, err := getRemoteHead(ctx, state.options.base, state.binding.LibraryID, state.options.token)
 	if err != nil {
 		return err
+	}
+	snapshot, err := scanWorktreeWithConfig(state.root, state.options.scanConfig)
+	if err != nil {
+		return fmt.Errorf("scan worktree: %w", err)
 	}
 	if head.CommitID == nil {
 		return discardStaleRestore(ctx, state, *pending)
@@ -321,7 +321,7 @@ func runLibraryRestoreConfirm(ctx context.Context, clientDir, worktree, prefix s
 	published, err := restoreCandidatePublished(ctx, state.options, *head.CommitID, pending.CandidateCommit,
 		state.binding.UserID, _newReplayBudget())
 	if err != nil {
-		return err
+		return handleRestoreRevalidationFailure(ctx, state, *pending, err)
 	}
 	if published {
 		return dispatchPendingPublication(ctx, state.db, state.options, state.binding, snapshot, head, *pending,
@@ -333,18 +333,15 @@ func runLibraryRestoreConfirm(ctx context.Context, clientDir, worktree, prefix s
 	}
 	source, err := fetchRestoreSource(ctx, state, pending.SourceCommit)
 	if err != nil {
-		return err
+		return handleRestoreRevalidationFailure(ctx, state, *pending, err)
 	}
 	plan, err := planRestoreSnapshot(ctx, state, snapshot, source, pending.SourcePath)
-	if errors.Is(err, _errRestoreSourcePathNotFound) {
-		return discardStaleRestore(ctx, state, *pending)
-	}
 	if err != nil {
-		return err
+		return handleRestoreRevalidationFailure(ctx, state, *pending, err)
 	}
 	capturedData, captured, err := fetchRestoreHeadCommit(ctx, state, pending.ExpectedHead, pending.CapturedRoot)
 	if err != nil {
-		return err
+		return handleRestoreRevalidationFailure(ctx, state, *pending, err)
 	}
 	if !bytes.Equal(capturedData, pending.CapturedData) || captured.AuthorUserID != state.binding.UserID {
 		return discardStaleRestore(ctx, state, *pending)
@@ -360,11 +357,11 @@ func runLibraryRestoreConfirm(ctx context.Context, clientDir, worktree, prefix s
 	canonical, candidateID, err := canonicalRestoreCommit(state.binding.UserID, state.binding.DeviceID,
 		pending.CandidateRoot, pending.SourceCommit, pending.SourcePath, []string{pending.ExpectedHead}, createdAt)
 	if err != nil {
-		return err
+		return discardStaleRestore(ctx, state, *pending)
 	}
 	preview, err := _encodeRestorePreview(plan.changedPaths)
 	if err != nil {
-		return err
+		return discardStaleRestore(ctx, state, *pending)
 	}
 	if candidateID != pending.CandidateCommit || !bytes.Equal(canonical, pending.CandidateData) ||
 		candidate.AuthorUserID != state.binding.UserID || candidate.DeviceID != state.binding.DeviceID ||
@@ -402,6 +399,21 @@ func discardStaleRestore(ctx context.Context, state *restoreClientState, pending
 	return errors.New("stale restore candidate discarded; rerun restore")
 }
 
+func handleRestoreRevalidationFailure(ctx context.Context, state *restoreClientState,
+	pending pendingPublication, err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if _, transient := errors.AsType[*transientRemoteError](err); transient {
+		return err
+	}
+	if statusErr, remote := errors.AsType[*remoteStatusError](err); remote &&
+		statusErr.status != http.StatusNotFound && statusErr.status != http.StatusGone {
+		return err
+	}
+	return discardStaleRestore(ctx, state, pending)
+}
+
 func fetchRestoreSource(ctx context.Context, state *restoreClientState, sourceID string) (historyInspectCommit, error) {
 	return fetchRestoreSourceWithOptions(ctx, state.options, state.binding, sourceID)
 }
@@ -429,10 +441,12 @@ func fetchRestoreObject(ctx context.Context, options bindOptions, kind, id strin
 	}
 	status, data, _, err := doClientRequest(request)
 	if err != nil {
-		return nil, fmt.Errorf("read restore %s object: %w", kind, err)
+		message := fmt.Sprintf("read restore %s object", kind)
+		return nil, &transientRemoteError{message: message, cause: err}
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("read restore %s object failed: server returned %s", kind, http.StatusText(status))
+		message := fmt.Sprintf("read restore %s object failed: server returned %s", kind, http.StatusText(status))
+		return nil, remoteResponseError(message, status)
 	}
 	var verifyErr error
 	switch kind {

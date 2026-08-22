@@ -326,6 +326,41 @@ func TestBuiltBinaryDirectoryRestoreAcceptance(t *testing.T) {
 			t.Fatalf("built root preview=%q contains content=%q, want metadata only", rootPreview, content)
 		}
 	}
+
+	staleResultRoot := rootPending.CandidateRoot
+	db, err := openClientDB(filepath.Join(clientB, _clientDatabaseName), false)
+	if err != nil {
+		t.Fatalf("open built restore candidate for tampering: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), "UPDATE pending_publications SET candidate_data = ? WHERE worktree = ?",
+		[]byte("{}"), worktreeB); err != nil {
+		t.Fatalf("tamper built restore candidate: %v", errors.Join(err, db.Close()))
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close built restore candidate after tampering: %v", err)
+	}
+	beforeStaleConfirmation := captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken,
+		clientA, worktreeA, clientB, worktreeB)
+	staleStdout, staleStderr, staleErr := runBlackBoxCLIResult(t, binary, nil, "library", "restore",
+		"--client-dir", clientB, "--worktree", worktreeB,
+		"--confirm", rootPending.CandidateCommit[:deleteCandidatePrefixLen])
+	if staleErr == nil || len(staleStdout) != 0 || !bytes.Contains(staleStderr, []byte("stale restore candidate discarded")) {
+		t.Fatalf("built stale restore confirmation error=%v stdout=%q stderr=%q, want discarded pending", staleErr, staleStdout, staleStderr)
+	}
+	wantAfterStale := beforeStaleConfirmation
+	wantAfterStale.pendingPublicationB = 0
+	assertBlackBoxRestoreState(t, "stale restore confirmation", wantAfterStale,
+		captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken, clientA, worktreeA, clientB, worktreeB))
+
+	rereview := runBlackBoxCLI(t, binary, nil, "library", "restore", "--client-dir", clientB,
+		"--worktree", worktreeB, "--commit", sourceBinding.SyncBase, "--path", ".")
+	rootPending = readTestPendingPublication(t, clientB, worktreeB)
+	if rootPending.CandidateRoot != staleResultRoot ||
+		outputValue(string(rereview), "candidate: ") != rootPending.CandidateCommit[:deleteCandidatePrefixLen] {
+		t.Fatalf("built restore repreviews root=%s output=%q, want root=%s and current candidate prefix",
+			rootPending.CandidateRoot, rereview, staleResultRoot)
+	}
+
 	beforeWrongConfirmation := captureBlackBoxRestoreState(t, serverURL, login.Session.AccessToken,
 		clientA, worktreeA, clientB, worktreeB)
 	wrongPrefix := strings.Repeat("0", deleteCandidatePrefixLen)

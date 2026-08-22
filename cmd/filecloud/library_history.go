@@ -217,7 +217,8 @@ func historyGETWithRetry(ctx context.Context, target string, token []byte, opera
 		status, data, headers, err = doClientRequestWithHeaders(request)
 		if err != nil {
 			if attempt+1 == _historyReadAttempts {
-				return 0, nil, nil, fmt.Errorf("%s unavailable after %d attempts", operation, _historyReadAttempts)
+				return 0, nil, nil, &transientRemoteError{
+					message: fmt.Sprintf("%s unavailable after %d attempts", operation, _historyReadAttempts), cause: err}
 			}
 			if err := waitTransientRetry(ctx, "", time.Now()); err != nil {
 				return 0, nil, nil, fmt.Errorf("wait to retry %s: %w", operation, err)
@@ -228,7 +229,9 @@ func historyGETWithRetry(ctx context.Context, target string, token []byte, opera
 			return status, data, headers, nil
 		}
 		if attempt+1 == _historyReadAttempts {
-			return 0, nil, nil, fmt.Errorf("%s failed after %d attempts: server returned %s", operation, _historyReadAttempts, http.StatusText(status))
+			message := fmt.Sprintf("%s failed after %d attempts: server returned %s", operation,
+				_historyReadAttempts, http.StatusText(status))
+			return 0, nil, nil, remoteResponseError(message, status)
 		}
 		if err := waitTransientRetry(ctx, headers.Get("Retry-After"), time.Now()); err != nil {
 			return 0, nil, nil, fmt.Errorf("wait to retry %s: %w", operation, err)

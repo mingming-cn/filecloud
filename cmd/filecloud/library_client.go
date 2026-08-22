@@ -34,6 +34,32 @@ const (
 	_maximumTransientRetryDelay = 30 * time.Second
 )
 
+type transientRemoteError struct {
+	message string
+	cause   error
+}
+
+func (e *transientRemoteError) Error() string { return e.message }
+func (e *transientRemoteError) Unwrap() error { return e.cause }
+
+type remoteStatusError struct {
+	message string
+	status  int
+}
+
+func (e *remoteStatusError) Error() string { return e.message }
+
+func remoteResponseError(message string, status int) error {
+	if isTransientHTTPStatus(status) {
+		return &transientRemoteError{message: message}
+	}
+	return &remoteStatusError{message: message, status: status}
+}
+
+func isTransientHTTPStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500 && status <= 599
+}
+
 type libraryClientConfig struct {
 	checkFilesystem                 func(*os.File) error
 	now                             func() time.Time
@@ -2965,10 +2991,11 @@ func getRemoteCommit(ctx context.Context, base *url.URL, libraryID string, token
 	}
 	status, data, _, err := doClientRequest(request)
 	if err != nil {
-		return object.Commit{}, fmt.Errorf("get commit: %w", err)
+		return object.Commit{}, &transientRemoteError{message: "get commit", cause: err}
 	}
 	if status != http.StatusOK {
-		return object.Commit{}, fmt.Errorf("get commit failed: server returned %s", http.StatusText(status))
+		message := fmt.Sprintf("get commit failed: server returned %s", http.StatusText(status))
+		return object.Commit{}, remoteResponseError(message, status)
 	}
 	commit, err := object.VerifyCommit(data, commitID)
 	if err != nil {

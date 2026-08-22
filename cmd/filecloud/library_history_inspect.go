@@ -214,7 +214,8 @@ func (c *historyInspectClient) fetchCommit(ctx context.Context, commitID string)
 		return historyInspectCommit{}, err
 	}
 	if status != http.StatusOK {
-		return historyInspectCommit{}, fmt.Errorf("inspect library history failed: server returned %s", http.StatusText(status))
+		message := fmt.Sprintf("inspect library history failed: server returned %s", http.StatusText(status))
+		return historyInspectCommit{}, remoteResponseError(message, status)
 	}
 	var envelope struct {
 		RetCode       *int                  `json:"RetCode"`
