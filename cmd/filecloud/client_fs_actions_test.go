@@ -671,8 +671,23 @@ func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, version := range []int{18, 19, 20} {
-		t.Run(fmt.Sprint(version), func(t *testing.T) {
+	fixtures := []struct {
+		version              int
+		createSQL, insertSQL string
+		insertArgs           []any
+	}{
+		{version: 18, createSQL: legacyClientV18PendingSQL,
+			insertSQL:  `INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,0,0,0,0)`,
+			insertArgs: []any{worktree, baseCommit, baseRoot, "etag", candidateCommit, candidateRoot, candidateData}},
+		{version: 19, createSQL: clientV19PendingSQL,
+			insertSQL:  `INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,0,0,0,0,0)`,
+			insertArgs: []any{worktree, baseCommit, baseRoot, "etag", candidateCommit, candidateRoot, candidateData}},
+		{version: 20, createSQL: clientV20PendingSQL,
+			insertSQL:  `INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0)`,
+			insertArgs: []any{worktree, baseCommit, baseRoot, baseCommit, "etag", candidateCommit, candidateRoot, candidateData}},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fmt.Sprint(fixture.version), func(t *testing.T) {
 			db, err := initializeClientDB(t.Context(), t.TempDir(), syncDirectory)
 			if err != nil {
 				t.Fatal(err)
@@ -683,35 +698,17 @@ func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
 				worktree, testClientUserID, testClientDeviceID, baseCommit, baseRoot, "etag", []byte("token")); err != nil {
 				t.Fatal(err)
 			}
-			createSQL := legacyClientV18PendingSQL
-			if version == 19 {
-				createSQL = clientV19PendingSQL
-			} else if version == 20 {
-				createSQL = clientV20PendingSQL
-			}
 			if _, err := db.Exec(`ALTER TABLE pending_publications RENAME TO new_pending_publications`); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.Exec(createSQL); err != nil {
+			if _, err := db.Exec(fixture.createSQL); err != nil {
 				t.Fatal(err)
 			}
-			var insertErr error
-			switch version {
-			case 18:
-				_, insertErr = db.Exec(`INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,0,0,0,0)`, worktree,
-					baseCommit, baseRoot, "etag", candidateCommit, candidateRoot, candidateData)
-			case 19:
-				_, insertErr = db.Exec(`INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,0,0,0,0,0)`, worktree,
-					baseCommit, baseRoot, "etag", candidateCommit, candidateRoot, candidateData)
-			case 20:
-				_, insertErr = db.Exec(`INSERT INTO pending_publications VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0)`, worktree,
-					baseCommit, baseRoot, baseCommit, "etag", candidateCommit, candidateRoot, candidateData)
-			}
-			if insertErr != nil {
-				t.Fatal(insertErr)
+			if _, err := db.Exec(fixture.insertSQL, fixture.insertArgs...); err != nil {
+				t.Fatal(err)
 			}
 			if _, err := db.Exec(`DROP TABLE new_pending_publications;
-				DELETE FROM client_schema_migrations WHERE version > ?`, version); err != nil {
+				DELETE FROM client_schema_migrations WHERE version > ?`, fixture.version); err != nil {
 				t.Fatal(err)
 			}
 			if err := initializeClientSchema(t.Context(), db); err != nil {
@@ -724,7 +721,8 @@ func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
 				t.Fatal(err)
 			}
 			if kind != PublicationKindSync || expected != baseCommit || base != baseCommit {
-				t.Fatalf("v%d migration kind=%q expected=%q base=%q", version, kind, expected, base)
+				t.Fatalf("v%d migration got kind=%q expected=%q base=%q, want kind=%q expected=base=%q",
+					fixture.version, kind, expected, base, PublicationKindSync, baseCommit)
 			}
 			var migratedCommit, migratedRoot string
 			var migratedCandidateData, capturedData, history []byte
@@ -733,8 +731,9 @@ func TestPendingPublicationV18ThroughV20CapturedDataMigration(t *testing.T) {
 				&capturedData, &history); err != nil || migratedCommit != candidateCommit || migratedRoot != candidateRoot ||
 				!bytes.Equal(migratedCandidateData, candidateData) || !bytes.Equal(capturedData, candidateData) ||
 				!bytes.Equal(history, _emptyCandidateHistory) {
-				t.Fatalf("v%d migration captured=%q/%q data=%x/%x history=%x err=%v", version, migratedCommit,
-					migratedRoot, migratedCandidateData, capturedData, history, err)
+				t.Fatalf("v%d migration got captured=%q/%q data=%x/%x history=%x err=%v, want captured=%q/%q data=%x history=%x err=nil",
+					fixture.version, migratedCommit, migratedRoot, migratedCandidateData, capturedData, history, err,
+					candidateCommit, candidateRoot, candidateData, _emptyCandidateHistory)
 			}
 		})
 	}
@@ -804,6 +803,7 @@ func TestClientV22PendingPublicationMigrationRejectsInvalidRowsAtomically(t *tes
 		{name: "device does not match binding", statement: `UPDATE pending_publications SET candidate_commit=?,candidate_data=?,
 			captured_commit=?,captured_data=?`, args: []any{wrongDeviceCommit, wrongDeviceData, wrongDeviceCommit, wrongDeviceData}},
 		{name: "candidate history does not match local candidate", statement: "UPDATE pending_publications SET candidate_history=?", args: []any{nonemptyHistory}},
+		{name: "missing binding", statement: "DELETE FROM bindings WHERE worktree=?", args: []any{worktree}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -841,7 +841,7 @@ func TestClientV22PendingPublicationMigrationRejectsInvalidRowsAtomically(t *tes
 			}
 
 			if err := initializeClientSchema(t.Context(), db); err == nil {
-				t.Fatal("invalid v22 pending publication was migrated")
+				t.Fatalf("initializeClientSchema() error=nil for %q, want non-nil", test.name)
 			}
 
 			after := readLegacy(t, db)
@@ -857,9 +857,10 @@ func TestClientV22PendingPublicationMigrationRejectsInvalidRowsAtomically(t *tes
 				WHERE name='publication_kind'`).Scan(&kindColumns); err != nil {
 				t.Fatal(err)
 			}
-			if beforeSchema != afterSchema || !reflect.DeepEqual(before, after) || version != 22 || kindColumns != 0 {
-				t.Fatalf("failed migration changed state: schema=%t row_equal=%t version=%d kind_columns=%d",
-					beforeSchema == afterSchema, reflect.DeepEqual(before, after), version, kindColumns)
+			schemaEqual, rowEqual := beforeSchema == afterSchema, reflect.DeepEqual(before, after)
+			if !schemaEqual || !rowEqual || version != 22 || kindColumns != 0 {
+				t.Fatalf("rejected %q migration got schema_equal=%t row_equal=%t version=%d kind_columns=%d, want true true 22 0",
+					test.name, schemaEqual, rowEqual, version, kindColumns)
 			}
 		})
 	}
